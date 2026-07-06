@@ -28,3 +28,17 @@ _isaac_sim?
 docker/.isaac-lab-docker-history
 # ignore uv environment
 env_isaaclab
+
+# ignore recorded datasets and large local artifacts (SO-101 Bench)
+data/
+**/*.mp4
+plots/
+tasks/layouts/*_layouts_*.jsonl
+
+# USD/GLB meshes are fetched from Hugging Face at build/run (not from local copy)
+**/assets/usd/
+**/assets/glb/
+**/*.usd
+**/*.usda
+**/*.usdc
+**/*.usdz

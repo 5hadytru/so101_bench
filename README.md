@@ -34,6 +34,7 @@ This repository contains:
 - [What the project set out to accomplish](#what-the-project-set-out-to-accomplish)
 - [How this repository works](#how-this-repository-works)
 - [Environment and installation](#environment-and-installation)
+- [Running in Docker](#running-in-docker)
 - [Quickstart / smoke tests](#quickstart--smoke-tests)
 - [GR00T inference with `groot_eval.py`](#gr00t-inference-with-groot_evalpy)
 - [Downloading the USD assets](#downloading-the-usd-assets)
@@ -193,6 +194,60 @@ objects. Those meshes are **not** committed to git — see
 [Downloading the USD assets](#downloading-the-usd-assets) before running anything
 that renders the scene.
 
+> Setting the native environment up from a fresh clone (Isaac Lab 5.1 / Isaac Sim
+> 5.1) has a few sharp edges — version-drifted imports, numpy/lerobot pin conflicts,
+> and Blackwell GPU (`sm_120`) torch builds. [`SETUP_FIXES.md`](SETUP_FIXES.md) is a
+> worklog of every fix applied to get an end-to-end GR00T rollout running, and is the
+> place to look if a fresh install crashes. If you would rather skip the native env
+> dance entirely, use the Docker setup below.
+
+---
+
+## Running in Docker
+
+A containerized Isaac Lab + GR00T setup lives under [`docker/`](docker/) so the demo
+runs without the native environment setup. It bakes in the numpy/lerobot/ffmpeg
+fixes the native install needs, and splits into **two images** because their
+torch/transformers pins conflict:
+
+- **`so101-bench`** (`docker/Dockerfile`) — Isaac Lab sim + eval client (smoke tests,
+  teleop, replay, scoring, `groot_eval.py`).
+- **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) — the GR00T-N1.6 policy
+  server on `:5555` (reference image; the checkpoint is mounted, never baked).
+
+`docker/so101.sh` is a one-line dispatcher for the common actions:
+
+```bash
+./docker/so101.sh build          # build the sim image
+./docker/so101.sh test           # smoke test: boot Isaac Sim + list envs
+./docker/so101.sh eval           # run a GR00T eval (server must be up on :5555)
+./docker/so101.sh shell          # interactive shell in the container
+```
+
+Or bring up the full demo (policy server + sim, wired together) with compose:
+
+```bash
+export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k   # dir with checkpoint-52000/
+docker compose -f docker/compose.yaml up --build
+```
+
+`docker/pick.sh` is an interactive object picker that writes a task file and launches
+the eval. See [`docker/README.md`](docker/README.md) for prerequisites (NVIDIA
+Container Toolkit, NGC access) and the full build/run/eval reference.
+
+```
+docker/
+  Dockerfile              sim + eval image (base: nvcr.io/nvidia/isaac-lab)
+  entrypoint.sh           in-container setup: Isaac env, extension install, asset fetch
+  download_assets.sh      idempotent Hugging Face USD-asset download (~430 MB)
+  run.sh                  raw launcher: --gpus all, --network=host, X11, caches
+  so101.sh                dispatcher: build / test / eval / shell / run
+  pick.sh                 interactive object picker → task file → eval
+  compose.yaml            full demo: gr00t-server + sim wired together
+  gr00t-server/Dockerfile  GR00T policy server image (reference)
+  README.md               docker build / run / eval docs
+```
+
 ---
 
 ## Quickstart / smoke tests
@@ -241,9 +296,12 @@ huggingface-cli download 5hadytru/so101_GR00T_N1.6-3B_WM_v7_50k \
 ### 2. Start the GR00T policy server
 
 The server ships with NVIDIA's [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T)
-codebase. Start it in its own environment, pointing at the downloaded checkpoint:
+codebase. Run it **from the Isaac-GR00T repo root, in that repo's own Python
+environment** (the `gr00t/eval/run_gr00t_server.py` path is relative to it), pointing
+at the downloaded checkpoint:
 
 ```bash
+cd ~/Isaac-GR00T
 python gr00t/eval/run_gr00t_server.py \
   --model-path ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k/checkpoint-52000/ \
   --embodiment-tag NEW_EMBODIMENT \
@@ -252,17 +310,20 @@ python gr00t/eval/run_gr00t_server.py \
   --port 5555
 ```
 
+`--embodiment-tag NEW_EMBODIMENT` is the server default, so it can be omitted. The
+config is parsed with `tyro`, so any `ServerConfig` field is available as a flag.
+
 ### 3. Run the evaluator
 
-Pass a **task file** with `--episodes_jsonl`, an optional **layout file** with
-`--episode_layouts_jsonl`, and add `--record_dataset` to save a LeRobot dataset of
-the rollouts (this command uses a reduced subset of the real world tasks/ file):
+Pass a **task file** with `--episodes_jsonl` and add `--record_dataset` to save a
+LeRobot dataset of the rollouts. With no `--episode_layouts_jsonl`, the environment
+samples a feasible layout per episode and **saves it** to
+`tasks/layouts/real_gr00t_WM_combined_layouts_<timestamp>.jsonl`:
 
 ```bash
 ~/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
   --task So101Bench-Bin-v0 \
   --episodes_jsonl tasks/real_gr00t_WM_combined.jsonl \
-  --episode_layouts_jsonl tasks/layouts/real_gr00t_WM_combined_layouts.jsonl \
   --policy_host localhost \
   --policy_port 5555 \
   --action_horizon 16 \
@@ -272,12 +333,22 @@ the rollouts (this command uses a reduced subset of the real world tasks/ file):
   --headless
 ```
 
+To **reproduce an exact arrangement** on a later run, pass the layout file the
+previous run wrote back in with `--episode_layouts_jsonl` (only the meshes and the
+`real_gr00t_WM_combined.jsonl` task file ship with the repo; layout files are
+generated locally, or supplied from a real-world capture):
+
+```bash
+  --episode_layouts_jsonl tasks/layouts/real_gr00t_WM_combined_layouts_<timestamp>.jsonl
+```
+
 Notable flags:
 
 - `--episodes_jsonl` *(required)* — the task file; every row is validated against
   `OBJECT_SPLITS` before evaluation.
 - `--episode_layouts_jsonl` — apply exact recorded object/bin poses instead of
-  sampling new ones.
+  sampling new ones. When omitted, feasible layouts are sampled and saved to a
+  timestamped file under `tasks/layouts/` that you can pass back to reproduce a run.
 - `--num_episodes N` — evaluate only the first `N` rows (default: all).
 - `--action_horizon` — action steps executed per server query (16 matches the WM
   checkpoint above).
@@ -445,7 +516,7 @@ follower arm (`--leader follower`) or an **Xbox/gamepad virtual leader**
 ```bash
 ~/IsaacLab/isaaclab.sh -p scripts/so101_follower_teleop.py \
   --task So101Bench-Bin-v0 \
-  --episodes_jsonl tasks/real_gr00t_WM_seen_bin_1obj.jsonl \
+  --episodes_jsonl tasks/real_gr00t_WM_combined.jsonl \
   --xbox \
   --repo_root data/lerobot/so101_bench_sim_teleop \
   --repo_id 5hadytru/so101_bench_sim_2
@@ -571,7 +642,7 @@ Then evaluate it the same way as GR00T:
 ```bash
 ~/IsaacLab/isaaclab.sh -p scripts/molmoact2_eval.py \
   --task So101Bench-Bin-v0 \
-  --episodes_jsonl tasks/real_gr00t_WM_seen_bin_1obj.jsonl \
+  --episodes_jsonl tasks/real_gr00t_WM_combined.jsonl \
   --policy_host localhost \
   --policy_port 8000
 ```
@@ -591,6 +662,7 @@ source/so101_bench/        Isaac Lab extension (env cfg, MDP terms, layouts, ben
   so101_bench/benchmark.py   OBJECT_SPLITS, episode specs, failure taxonomy, footprint loading
   so101_bench/layouts.py     Footprint-aware layout sampler and spatial feasibility filters
   so101_bench/mdp/           Resets, observations, terminations (scoring rules)
+  so101_bench/utils/         LeRobot dataset recorder and MolmoAct2 client helpers
   so101_bench/assets/usd/    USD meshes (downloaded separately; gitignored)
   so101_bench/assets/objects/  Generated footprint polygons (committed)
 scripts/
@@ -603,8 +675,11 @@ scripts/
   generate_object_move_footprints.py  Footprint polygon generator
   check_object_usd_assets.py  Object USD structure validator
 tasks/                     Episode task JSONL files (and tasks/layouts/ pose files)
+                           incl. example files: custom_bin, custom_mixed, red_tape
+docker/                    Containerized Isaac Lab + GR00T setup (see docker/README.md)
 docs/                      Editable SVG/PNG diagrams of the evaluation and layout logic
 plots/                     Result figures, including the headline cvpr_two_column_figure.png
+SETUP_FIXES.md             Fresh-clone setup worklog (Isaac Lab 5.1 fixes, GR00T bring-up)
 ```
 
 ### Files you may need to customize

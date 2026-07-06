@@ -1,0 +1,52 @@
+# Docker Compose for the full SO-101 Bench demo: GR00T policy server + sim eval.
+#
+#   export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k
+#   docker compose -f docker/compose.yaml up --build
+#
+# The sim service reaches the server at localhost:5555 via host networking.
+# Set GR00T_MODEL to the directory that contains checkpoint-52000/.
+
+services:
+  gr00t-server:
+    build:
+      context: ..
+      dockerfile: docker/gr00t-server/Dockerfile
+    image: gr00t-server:latest
+    network_mode: host
+    gpus: all
+    volumes:
+      - ${GR00T_MODEL:?set GR00T_MODEL to the checkpoint parent dir}:/models:ro
+    command: >
+      --model-path /models/checkpoint-52000
+      --device cuda --host 0.0.0.0 --port 5555
+
+  sim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: so101-bench:latest
+    depends_on: [gr00t-server]
+    network_mode: host
+    gpus: all
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface:rw
+      - ../tasks:/workspace/so101_bench/tasks:rw
+      - ../data:/workspace/so101_bench/data:rw
+    # Wait for the server to load the checkpoint before starting the eval.
+    command: >
+      bash -lc '
+        until python -c "import socket,sys; s=socket.socket(); s.settimeout(2);
+        sys.exit(0 if s.connect_ex((\"127.0.0.1\",5555))==0 else 1)"; do
+          echo \"waiting for gr00t-server on :5555...\"; sleep 5; done;
+        cd /workspace/so101_bench &&
+        /workspace/isaaclab/isaaclab.sh -p scripts/groot_eval.py
+          --task So101Bench-Bin-v0
+          --episodes_jsonl tasks/custom_bin.jsonl
+          --policy_host localhost --policy_port 5555
+          --action_horizon 16 --use_overhead_init true
+          --num_episodes 5 --record_dataset
+          --repo_root data/lerobot/seen_bin_ah16 --headless'

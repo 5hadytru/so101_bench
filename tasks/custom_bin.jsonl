@@ -1,0 +1,5 @@
+{"objects": ["black pen"], "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape"], "instruction": "Place each object in the plastic bin"}
+{"objects": ["pink eraser"], "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors"], "instruction": "Place each object in the plastic bin"}
+{"objects": ["black pen", "red tape", "pink eraser", "blue scissors"], "instruction": "Place each object in the plastic bin"}

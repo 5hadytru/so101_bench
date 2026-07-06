@@ -16,7 +16,7 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, DeformableObject, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim import get_current_stage
-from isaaclab.sim.views import XformPrimView
+from isaacsim.core.prims import XFormPrim as XformPrimView
 
 from so101_bench.benchmark import (
     DIRECTIONS,

@@ -1,5 +1,6 @@
 # make_usd_deformable.py
-# /home/truman/IsaacLab/isaaclab.sh -p /home/truman/so101_bench/source/so101_bench/so101_bench/assets/make_usd_deformable.py
+# Usage: ~/IsaacLab/isaaclab.sh -p source/so101_bench/so101_bench/assets/make_usd_deformable.py [usd_path]
+# Defaults to the brown_stuffed_animal.usdc under this file's assets/usd/objects/ directory.
 
 # object_4 = DeformableObjectCfg(
 #     prim_path="{ENV_REGEX_NS}/Object_4",
@@ -13,6 +14,9 @@
 #     debug_vis=False,
 # )
 
+import sys
+from pathlib import Path
+
 from isaaclab.app import AppLauncher
 
 app_launcher = AppLauncher({"headless": True})
@@ -20,7 +24,6 @@ simulation_app = app_launcher.app
 
 import isaaclab.sim as sim_utils
 from isaaclab.sim.schemas import define_deformable_body_properties
-from isaaclab.sim.utils.prims import bind_physics_material
 from isaaclab.sim.utils.stage import (
     open_stage,
     get_current_stage,
@@ -28,7 +31,9 @@ from isaaclab.sim.utils.stage import (
 )
 from pxr import UsdGeom, PhysxSchema, UsdShade
 
-USD_PATH = "/home/truman/so101_bench/source/so101_bench/so101_bench/assets/usd/objects/brown_stuffed_animal.usdc"
+# Default to the mesh shipped alongside this script; allow an optional CLI override.
+DEFAULT_USD_PATH = Path(__file__).resolve().parent / "usd" / "objects" / "brown_stuffed_animal.usdc"
+USD_PATH = str(Path(sys.argv[1]).resolve()) if len(sys.argv) > 1 else str(DEFAULT_USD_PATH)
 
 # From your Isaac Sim tree:
 # root/defaultPrim -> node_0_001 Xform -> node_0_001 Mesh

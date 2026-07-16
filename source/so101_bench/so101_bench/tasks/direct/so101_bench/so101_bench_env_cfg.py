@@ -8,10 +8,10 @@ import os
 from isaacsim.core.utils.rotations import euler_angles_to_quat
 
 import numpy as np
-from pxr import Usd, UsdGeom
+from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -106,11 +106,12 @@ SO101_BOUNDING_BOX = [
 MIN_RESET_TIME_S = 0.5
 MIN_FAILURE_TIME_S = 0.5
 SUCCESS_CONFIRM_TIME_S = 3.0
-CONTACT_GRACE_TIME_S = 0.5
+FAILURE_CONFIRM_TIME_S = 5.0
+CONTACT_GRACE_TIME_S = 5.0
 PHYSICS_DT = 1.0 / 240.0
 CONTROL_DT = 1.0 / 30.0
 CONTROL_DECIMATION = int(round(CONTROL_DT / PHYSICS_DT))
-CONTACT_OFFSET = 0.004
+CONTACT_OFFSET = 0.002
 REST_OFFSET = 0.0
 CONTACT_SOLVER_POSITION_ITERATIONS = 64
 CONTACT_SOLVER_VELOCITY_ITERATIONS = 4
@@ -196,6 +197,42 @@ def _contact_collision_props() -> sim_utils.CollisionPropertiesCfg:
     )
 
 
+def _enable_body_ccd(root_prim: Usd.Prim) -> None:
+    """Enable sweep and speculative CCD on rigid bodies under the spawned asset."""
+
+    for prim in Usd.PrimRange(root_prim):
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            continue
+        physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        physx_rigid_body_api.CreateEnableCCDAttr().Set(True)
+        physx_rigid_body_api.CreateEnableSpeculativeCCDAttr().Set(True)
+
+
+def _spawn_ccd_usd(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn a rigid USD and enable CCD on all rigid bodies under it."""
+
+    prim = sim_utils.spawn_from_usd(
+        prim_path,
+        cfg,
+        translation=translation,
+        orientation=orientation,
+        **kwargs,
+    )
+
+    stage = sim_utils.get_current_stage()
+    for spawned_prim_path in sim_utils.find_matching_prim_paths(prim_path):
+        spawned_prim = stage.GetPrimAtPath(spawned_prim_path)
+        if spawned_prim.IsValid():
+            _enable_body_ccd(spawned_prim)
+    return prim
+
+
 def _physics_mesh_prims_below(body_prim: Usd.Prim) -> list[Usd.Prim]:
     physics_mesh_prims = []
     mesh_prims = []
@@ -279,6 +316,9 @@ def _spawn_split_rigid_body_usd(
             collision_props,
             mass_props,
         )
+        spawned_prim = sim_utils.get_current_stage().GetPrimAtPath(spawned_prim_path)
+        if spawned_prim.IsValid():
+            _enable_body_ccd(spawned_prim)
         if activate_contact_sensors:
             sim_utils.activate_contact_sensors(spawned_prim_path)
     return prim
@@ -321,6 +361,7 @@ def _spawn_sensor_safe_bin_usd(
         spawned_prim = stage.GetPrimAtPath(spawned_prim_path)
         if spawned_prim.IsValid():
             _patch_bin_visual_material(spawned_prim)
+            _enable_body_ccd(spawned_prim)
     return prim
 
 
@@ -392,18 +433,35 @@ def _object_initial_pose(object_id: int) -> tuple[tuple[float, float, float], fl
     return inactive_object_pos(object_id), 0.0
 
 
-def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | AssetBaseCfg:
+def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | AssetBaseCfg | DeformableObjectCfg:
     """Build one scene slot from the object registry and its USD filename convention."""
 
     metadata = object_metadata(object_name)
+    init_pos, init_yaw = _object_initial_pose(object_id)
+    usd_path = f"{ASSETS_PATH}/usd/objects/{object_usd_stem(object_name)}.usdc"
+    init_rot = euler_angles_to_quat(np.array([0.0, 0.0, init_yaw]), degrees=False)
+
+    if metadata.get("deformable", False):
+        if metadata["multiple_rigid_bodies"]:
+            raise ValueError(f"Object {object_name!r} cannot be both deformable and multi-rigid-body.")
+        return DeformableObjectCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/Object_{object_id + 1}",
+            spawn=sim_utils.UsdFileCfg(usd_path=usd_path),
+            init_state=DeformableObjectCfg.InitialStateCfg(
+                pos=init_pos,
+                rot=init_rot,
+            ),
+            debug_vis=False,
+        )
+
     cfg_type = AssetBaseCfg if metadata["multiple_rigid_bodies"] else RigidObjectCfg
     init_state_type = cfg_type.InitialStateCfg
-    init_pos, init_yaw = _object_initial_pose(object_id)
     spawn_kwargs = {
-        "usd_path": f"{ASSETS_PATH}/usd/objects/{object_usd_stem(object_name)}.usdc",
+        "usd_path": usd_path,
         "activate_contact_sensors": True,
         "rigid_props": _contact_rigid_props(MAX_OBJECT_LINEAR_VELOCITY, MAX_OBJECT_ANGULAR_VELOCITY),
         "collision_props": _contact_collision_props(),
+        "func": _spawn_ccd_usd,
     }
     if metadata["multiple_rigid_bodies"]:
         spawn_kwargs["func"] = _spawn_split_rigid_body_usd
@@ -412,7 +470,7 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
         spawn=sim_utils.UsdFileCfg(**spawn_kwargs),
         init_state=init_state_type(
             pos=init_pos,
-            rot=euler_angles_to_quat(np.array([0.0, 0.0, init_yaw]), degrees=False),
+            rot=init_rot,
         ),
     )
 
@@ -427,7 +485,10 @@ def _object_contact_sensor_cfgs(object_names: list[str] | tuple[str, ...]) -> di
     """Create per-body sensors filtered to contacts with other tabletop objects only."""
 
     body_paths_by_object = [
-        _object_body_prim_paths(object_id, object_name) for object_id, object_name in enumerate(object_names)
+        []
+        if object_metadata(object_name).get("deformable", False)
+        else _object_body_prim_paths(object_id, object_name)
+        for object_id, object_name in enumerate(object_names)
     ]
     sensor_cfgs = {}
     for object_id, body_paths in enumerate(body_paths_by_object):
@@ -470,7 +531,7 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
 
     env_spacing = 5.0
     num_envs = 1
-    replicate_physics = True
+    replicate_physics = False # False for deformables
 
     robot: ArticulationCfg = _robot_cfg()
 
@@ -792,20 +853,6 @@ class EventCfg:
 class TerminationsCfg:
     """Paper-derived success and measurable failure terms."""
 
-    success = DoneTerm(
-        func=mdp.task_success,
-        time_out=False,
-        params={
-            "object_asset_names": OBJECT_ASSET_NAMES,
-            "bin_name": "plastic_bin",
-            "table_bounds": TABLE_BOUNDS,
-            "min_episode_time_s": MIN_RESET_TIME_S,
-            "confirm_time_s": SUCCESS_CONFIRM_TIME_S,
-            "contact_grace_time_s": CONTACT_GRACE_TIME_S,
-            "move_straightness_tolerance": MOVE_STRAIGHTNESS_TOLERANCE_M,
-        },
-    )
-
     time_out = DoneTerm(
         func=mdp.task_time_out,
         time_out=True,
@@ -822,9 +869,31 @@ class TerminationsCfg:
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
             "min_episode_time_s": MIN_FAILURE_TIME_S,
             "displacement_baseline_time_s": MIN_FAILURE_TIME_S,
+            # Keep counting grasp attempts for diagnostics, but do not terminate on the cap.
+            # To restore the original cap, set this back to True.
+            "enforce_max_grasp_attempts": False,
+            "failure_confirm_time_s": FAILURE_CONFIRM_TIME_S,
+            "move_straightness_failure_confirm_time_s": FAILURE_CONFIRM_TIME_S,
+            "move_past_boundary_failure_confirm_time_s": FAILURE_CONFIRM_TIME_S,
             "move_straightness_tolerance": MOVE_STRAIGHTNESS_TOLERANCE_M,
             "contact_grace_time_s": CONTACT_GRACE_TIME_S,
             "table_bounds": TABLE_BOUNDS,
+        },
+    )
+
+    # Failure must run before success so the raw failure-condition mask blocks
+    # success while a five-second failure confirmation window is in progress.
+    success = DoneTerm(
+        func=mdp.task_success,
+        time_out=False,
+        params={
+            "object_asset_names": OBJECT_ASSET_NAMES,
+            "bin_name": "plastic_bin",
+            "table_bounds": TABLE_BOUNDS,
+            "min_episode_time_s": MIN_RESET_TIME_S,
+            "confirm_time_s": SUCCESS_CONFIRM_TIME_S,
+            "contact_grace_time_s": CONTACT_GRACE_TIME_S,
+            "move_straightness_tolerance": MOVE_STRAIGHTNESS_TOLERANCE_M,
         },
     )
 
@@ -848,9 +917,11 @@ class So101BenchEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = FOUR_OBJECT_BIN_EPISODE_LENGTH_S
         self.scene.num_envs = 1
         self.sim.dt = PHYSICS_DT
+        self.sim.physx.enable_ccd = True
         self.sim.render_interval = self.decimation
         self.sim.render.rendering_mode = "quality"
         if os.environ.get(UI_CPU_PHYSICS_ENV_VAR, "").lower() in {"1", "true", "yes", "on"}:
+            print("------- CPU SIM ENABLED")
             self.sim.device = "cpu"
             self.sim.use_fabric = False
         self.viewer.eye = (0.04, -0.72, 0.42)

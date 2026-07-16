@@ -25,11 +25,26 @@ TASK_MIXED = "mixed"
 TASK_FAMILIES = (TASK_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE)
 
 DIRECTIONS = ("left", "right", "forward", "backward")
+COLORS = {
+    "black",
+    "blue",
+    "brown",
+    "gray",
+    "green",
+    "grey",
+    "orange",
+    "pink",
+    "purple",
+    "red",
+    "silver",
+    "white",
+    "yellow",
+}
 
 MAX_GRASP_ATTEMPTS = 3
 GRASP_ATTEMPT_OBJECT_DISTANCE_M = 4.0 * INCH
-BIN_DISPLACEMENT_LIMIT_M = 1.0 * INCH
-NON_TARGET_DISPLACEMENT_LIMIT_M = 0.5 * INCH
+BIN_DISPLACEMENT_LIMIT_M = 0.5 * INCH
+NON_TARGET_DISPLACEMENT_LIMIT_M = 1.0 * INCH
 # A non-bin object only counts as "lifted off the ground" for postmortem failure
 # classification once its root rises this far above its settled resting height.
 LIFT_OFF_GROUND_LIMIT_M = 0.5 * INCH
@@ -42,13 +57,13 @@ MOVE_STRAIGHTNESS_TOLERANCE_M = 2.0 * INCH
 # Footprints come from collision meshes, so an object resting *against* a boundary
 # overlaps it by a few millimetres. Treat penetration up to this as "touching": it
 # keeps move success and the move_past_boundary failure complementary (no dead zone).
-MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.5 * INCH
+MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # A nearest object only counts as the move boundary if it blocks at least this fraction
 # of the target's lateral corridor. Below it the object is merely beside the path (a
 # glancing clip), so the move is scored on forward progress instead of "reaching" it.
 MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
-DEFAULT_EPISODE_LENGTH_S = 25.0
-FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 90.0
+DEFAULT_EPISODE_LENGTH_S = 20.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 60.0
 
 
 def episode_length_s(task_family: str, object_count: int) -> float:
@@ -62,64 +77,64 @@ def episode_length_s(task_family: str, object_count: int) -> float:
 # In that case, the object cannot be initialized with RigidObjectCfg and must use AssetBaseCfg instead
 OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
     "seen": {
-        "black glasses": {"multiple_rigid_bodies": False},
-        "silver glasses": {"multiple_rigid_bodies": False},
-        "white pen": {"multiple_rigid_bodies": False},
-        "black pen": {"multiple_rigid_bodies": False},
-        "altoids container": {"multiple_rigid_bodies": False},
-        # "brown stuffed animal": {"multiple_rigid_bodies": False},  # DO NOT REMOVE
-        "blue pliers": {"multiple_rigid_bodies": False},
-        "green clip": {"multiple_rigid_bodies": False},
-        "pink eraser": {"multiple_rigid_bodies": False},
-        "yellow wires": {"multiple_rigid_bodies": False},
-        "grey wires": {"multiple_rigid_bodies": False},
-        "black screwdriver": {"multiple_rigid_bodies": False},
-        "yellow screwdriver": {"multiple_rigid_bodies": False},
-        "red tape": {"multiple_rigid_bodies": False},
-        "black tape": {"multiple_rigid_bodies": False},
-        "cardboard box": {"multiple_rigid_bodies": False},
-        "flower pot": {"multiple_rigid_bodies": False},
-        "cooking spoon": {"multiple_rigid_bodies": False},
-        "yellow toy car": {"multiple_rigid_bodies": False},
-        "grey toy car": {"multiple_rigid_bodies": False},
-        "green shoes": {"multiple_rigid_bodies": True},
-        "black shoes": {"multiple_rigid_bodies": True},
-        "blue bowl": {"multiple_rigid_bodies": False},
-        "blue scissors": {"multiple_rigid_bodies": False},
+        "black glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "silver glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "white pen": {"multiple_rigid_bodies": False, "deformable": False},
+        "black pen": {"multiple_rigid_bodies": False, "deformable": False},
+        "altoids container": {"multiple_rigid_bodies": False, "deformable": False},
+        # "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False}, DO NOT REMOVE
+        "blue pliers": {"multiple_rigid_bodies": False, "deformable": False},
+        "green clip": {"multiple_rigid_bodies": False, "deformable": False},
+        "pink eraser": {"multiple_rigid_bodies": False, "deformable": False},
+        "yellow wires": {"multiple_rigid_bodies": False, "deformable": False},
+        "grey wires": {"multiple_rigid_bodies": False, "deformable": False},
+        "black screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
+        "yellow screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
+        "red tape": {"multiple_rigid_bodies": False, "deformable": False},
+        "black tape": {"multiple_rigid_bodies": False, "deformable": False},
+        "cardboard box": {"multiple_rigid_bodies": False, "deformable": False},
+        "flower pot": {"multiple_rigid_bodies": False, "deformable": False},
+        "cooking spoon": {"multiple_rigid_bodies": False, "deformable": False},
+        "yellow toy car": {"multiple_rigid_bodies": False, "deformable": False},
+        "grey toy car": {"multiple_rigid_bodies": False, "deformable": False},
+        "green shoes": {"multiple_rigid_bodies": True, "deformable": False},
+        "black shoes": {"multiple_rigid_bodies": True, "deformable": False},
+        "blue bowl": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue scissors": {"multiple_rigid_bodies": False, "deformable": False},
     },
     "unseen_seen_class": {
-        # "orange glasses": {"multiple_rigid_bodies": False},
-        "white glasses": {"multiple_rigid_bodies": False},
-        "blue clip": {"multiple_rigid_bodies": False},
-        "blue tape": {"multiple_rigid_bodies": False},
-        "yellow tape": {"multiple_rigid_bodies": False},
-        # "white stuffed animal", DO NOT REMOVE
-        "blue screwdriver": {"multiple_rigid_bodies": False},
-        "pink bowl": {"multiple_rigid_bodies": False},
-        "white bowl": {"multiple_rigid_bodies": False},
-        "black wires": {"multiple_rigid_bodies": False},
-        "brown wires": {"multiple_rigid_bodies": False},
-        "orange toy car": {"multiple_rigid_bodies": False},
-        "blue pen": {"multiple_rigid_bodies": False},
-        "red pen": {"multiple_rigid_bodies": False},
-        "white shoes": {"multiple_rigid_bodies": True},
+        "orange glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "white glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue clip": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue tape": {"multiple_rigid_bodies": False, "deformable": False},
+        "yellow tape": {"multiple_rigid_bodies": False, "deformable": False},
+        # "white stuffed animal": {"multiple_rigid_bodies": False, "deformable": False}, DO NOT REMOVE
+        "blue screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
+        "pink bowl": {"multiple_rigid_bodies": False, "deformable": False},
+        "white bowl": {"multiple_rigid_bodies": False, "deformable": False},
+        "black wires": {"multiple_rigid_bodies": False, "deformable": False},
+        "brown wires": {"multiple_rigid_bodies": False, "deformable": False},
+        "orange toy car": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue pen": {"multiple_rigid_bodies": False, "deformable": False},
+        "red pen": {"multiple_rigid_bodies": False, "deformable": False},
+        "white shoes": {"multiple_rigid_bodies": True, "deformable": False},
     },
     "unseen_unseen_class": {
-        # "blue headband", DO NOT REMOVE
-        "blue highlighter": {"multiple_rigid_bodies": False},
-        "purple toothbrush": {"multiple_rigid_bodies": False},
-        "blue controller": {"multiple_rigid_bodies": False},
-        "action figure": {"multiple_rigid_bodies": False},
-        "razor": {"multiple_rigid_bodies": False},
-        "silver tongs": {"multiple_rigid_bodies": False},
-        "playing cards": {"multiple_rigid_bodies": False},
-        "candy bar": {"multiple_rigid_bodies": False},
-        "toy fire truck": {"multiple_rigid_bodies": False},
-        "toy monster truck": {"multiple_rigid_bodies": False},
-        "toy dinosaur": {"multiple_rigid_bodies": False},
-        # "baby doll", DO NOT REMOVE
-        "sponge": {"multiple_rigid_bodies": False},
-        "yellow flashlight": {"multiple_rigid_bodies": False},
+        # "blue headband": {"multiple_rigid_bodies": False, "deformable": False}, too unpredictable; also expensive
+        "blue highlighter": {"multiple_rigid_bodies": False, "deformable": False},
+        "purple toothbrush": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue controller": {"multiple_rigid_bodies": False, "deformable": False},
+        "action figure": {"multiple_rigid_bodies": False, "deformable": False},
+        "razor": {"multiple_rigid_bodies": False, "deformable": False},
+        "silver tongs": {"multiple_rigid_bodies": False, "deformable": False},
+        "playing cards": {"multiple_rigid_bodies": False, "deformable": False},
+        "candy bar": {"multiple_rigid_bodies": False, "deformable": False},
+        "toy fire truck": {"multiple_rigid_bodies": False, "deformable": False},
+        "toy monster truck": {"multiple_rigid_bodies": False, "deformable": False},
+        "toy dinosaur": {"multiple_rigid_bodies": False, "deformable": False},
+        # "baby doll": {"multiple_rigid_bodies": False, "deformable": False}, # DO NOT REMOVE
+        "sponge": {"multiple_rigid_bodies": False, "deformable": False},
+        # "yellow flashlight": {"multiple_rigid_bodies": False}, ROLLED TOO MUCH
     },
 }
 
@@ -336,6 +351,21 @@ def _normalized_instruction(instruction: str) -> str:
     return " ".join(instruction.strip().lower().rstrip(".").split())
 
 
+def _normalized_object_label(label: str) -> str:
+    normalized = _normalized_instruction(label)
+    for determiner in ("the ", "a ", "an "):
+        if normalized.startswith(determiner):
+            return normalized[len(determiner) :]
+    return normalized
+
+
+def _colorless_label(object_name: str) -> str:
+    words = object_name.split()
+    if words and words[0] in COLORS:
+        return " ".join(words[1:])
+    return object_name
+
+
 def _canonical_direction(token: str) -> str:
     direction = token.lower()
     aliases = {"forwards": "forward", "backwards": "backward"}
@@ -371,6 +401,133 @@ def _object_mentions(instruction: str, objects: tuple[str, ...]) -> list[tuple[i
         if match is not None:
             mentions.append((match.start(), object_id))
     return sorted(mentions)
+
+
+def _resolve_instruction_object_label(
+    label: str,
+    objects: tuple[str, ...],
+    *,
+    source: str,
+) -> int:
+    normalized_label = _normalized_object_label(label)
+    exact_matches = [
+        object_id
+        for object_id, object_name in enumerate(objects)
+        if _normalized_object_label(object_name) == normalized_label
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        names = [objects[object_id] for object_id in exact_matches]
+        raise ValueError(f"{source}: object label {label!r} is ambiguous; it matches {names}.")
+
+    colorless_matches = [
+        object_id
+        for object_id, object_name in enumerate(objects)
+        if _normalized_object_label(_colorless_label(object_name)) == normalized_label
+    ]
+    if len(colorless_matches) == 1:
+        return colorless_matches[0]
+    if len(colorless_matches) > 1:
+        names = [objects[object_id] for object_id in colorless_matches]
+        raise ValueError(f"{source}: object label {label!r} is ambiguous; it matches {names}.")
+
+    raise ValueError(f"{source}: object label {label!r} does not match any row object: {list(objects)}.")
+
+
+def _parse_instruction_object_labels(instruction: str, task_family: str, *, source: str) -> tuple[str, ...]:
+    if task_family == TASK_BIN:
+        return ()
+    if task_family == TASK_NEXT_TO:
+        match = re.fullmatch(
+            r"\s*place\s+(?:the\s+)?(.+?)\s+next\s+to\s+(?:the\s+)?(.+?)\.?\s*",
+            instruction,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            return (match.group(1), match.group(2))
+        raise ValueError(f"{source}: next-to instruction must be phrased as 'Place the TARGET next to the REFERENT'.")
+    if task_family == TASK_BETWEEN:
+        match = re.fullmatch(
+            r"\s*place\s+(?:the\s+)?(.+?)\s+between\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\.?\s*",
+            instruction,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            return (match.group(1), match.group(2), match.group(3))
+        raise ValueError(
+            f"{source}: between instruction must be phrased as "
+            "'Place the TARGET between the REFERENT and the REFERENT'."
+        )
+    match = re.fullmatch(
+        r"\s*move\s+(?:the\s+)?(.+?)\s+(left|right|forwards?|backwards?)\.?\s*",
+        instruction,
+        flags=re.IGNORECASE,
+    )
+    if match is not None:
+        return (match.group(1), match.group(2))
+    raise ValueError(f"{source}: move instruction must be phrased as 'Move the TARGET DIRECTION'.")
+
+
+def row_with_canonical_instruction_metadata(
+    row: dict[str, Any],
+    *,
+    instruction: str | None = None,
+    source: str = "JSONL row",
+) -> dict[str, Any]:
+    """Return ``row`` with task metadata made consistent with its instruction.
+
+    Explicit ``target``, ``referents``, and ``direction`` fields override natural
+    language inference during normal loading.  This helper is for edit paths:
+    it reparses the new instruction, removes stale overrides that no longer
+    apply, and writes only the overrides required for that task family.
+    """
+
+    updated = dict(row)
+    if instruction is not None:
+        updated["instruction"] = instruction
+
+    raw_objects = updated.get("objects")
+    if not isinstance(raw_objects, list) or not raw_objects or not all(isinstance(name, str) for name in raw_objects):
+        raise ValueError(f"{source}: 'objects' must be a non-empty list of benchmark object names.")
+    objects = tuple(raw_objects)
+    instruction_value = updated.get("instruction")
+    if not isinstance(instruction_value, str) or not instruction_value.strip():
+        raise ValueError(f"{source}: 'instruction' must be a non-empty string.")
+    instruction_text = instruction_value.strip()
+    task_family = infer_task_family(instruction_text)
+
+    for key in ("target", "referents", "direction"):
+        updated.pop(key, None)
+    updated["instruction"] = instruction_text
+    if "task_family" in updated:
+        updated["task_family"] = task_family
+
+    labels = _parse_instruction_object_labels(instruction_text, task_family, source=source)
+    if task_family == TASK_NEXT_TO:
+        target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
+        referent_id = _resolve_instruction_object_label(labels[1], objects, source=source)
+        if referent_id == target_id:
+            raise ValueError(f"{source}: next-to episodes need distinct target and referent objects.")
+        updated["target"] = objects[target_id]
+        updated["referents"] = [objects[referent_id]]
+    elif task_family == TASK_BETWEEN:
+        target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
+        referent_ids = [
+            _resolve_instruction_object_label(label, objects, source=source)
+            for label in labels[1:]
+        ]
+        if len(set([target_id, *referent_ids])) != 3:
+            raise ValueError(f"{source}: between episodes need a target and two distinct referents.")
+        updated["target"] = objects[target_id]
+        updated["referents"] = [objects[object_id] for object_id in referent_ids]
+    elif task_family == TASK_MOVE:
+        target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
+        updated["target"] = objects[target_id]
+        updated["direction"] = _canonical_direction(labels[1])
+
+    episode_spec_from_json(updated, source=source)
+    return updated
 
 
 def _object_id_from_row_name(objects: tuple[str, ...], row: dict[str, Any], key: str) -> int | None:

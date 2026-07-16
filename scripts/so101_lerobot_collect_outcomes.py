@@ -1288,9 +1288,9 @@ def _manual_term_evals(
     failure_params: dict[str, Any],
 ) -> dict[int, TermEval]:
     with torch.inference_mode():
-        success_tensor = task_success(env.unwrapped, **success_params)
-        failure_tensor = benchmark_failure(env.unwrapped, **failure_params)
         timed_out_tensor = task_time_out(env.unwrapped)
+        failure_tensor = benchmark_failure(env.unwrapped, **failure_params)
+        success_tensor = task_success(env.unwrapped, **success_params)
 
     failure_reasons = getattr(env.unwrapped, "_so101_failure_reasons", None)
     evals = {}
@@ -1450,12 +1450,13 @@ def _final_condition_diagnostics(
         move_straightness_tolerance=success_params.get("move_straightness_tolerance", 0.04445),
         failure_min_episode_time_s=failure_params.get("min_episode_time_s", 5.0),
         max_grasp_attempts=failure_params.get("max_grasp_attempts", 3),
+        enforce_max_grasp_attempts=failure_params.get("enforce_max_grasp_attempts", True),
         bin_displacement_limit=failure_params.get("bin_displacement_limit", 0.0254),
         non_target_displacement_limit=failure_params.get("non_target_displacement_limit", 0.0127),
         boundary_displacement_limit=failure_params.get("boundary_displacement_limit", 0.0127),
         contact_grace_time_s=failure_params.get(
             "contact_grace_time_s",
-            success_params.get("contact_grace_time_s", 1.5),
+            success_params.get("contact_grace_time_s", 3.0),
         ),
     )
     return asdict(snapshots[env_id])

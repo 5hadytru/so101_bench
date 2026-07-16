@@ -57,9 +57,10 @@ POSTMORTEM_PLACEMENT = "placement"
 POSTMORTEM_FAILURE_TYPES = (POSTMORTEM_SEMANTIC, POSTMORTEM_FAILED_GRASP, POSTMORTEM_PLACEMENT)
 
 DEFAULT_SUCCESS_CONFIRM_TIME_S = 3.0
-DEFAULT_CONTACT_GRACE_TIME_S = 1.5
-DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S = 3.0
-DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S = 3.0
+DEFAULT_FAILURE_CONFIRM_TIME_S = 5.0
+DEFAULT_CONTACT_GRACE_TIME_S = 5.0
+DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S = 5.0
+DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S = 5.0
 
 
 @dataclass
@@ -522,7 +523,7 @@ def between_success(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
     centered_tolerance: float = BETWEEN_LINE_TOLERANCE_M,
-    min_segment_fraction: float = 0.15,
+    min_segment_fraction: float = 0.1,
     contact_grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
     confirm_steps: int | None = None,
     confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
@@ -1193,7 +1194,13 @@ def task_success(
     move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
     contact_grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
 ) -> torch.Tensor:
-    """Dispatch to the success condition for the active benchmark family."""
+    """Dispatch to the success condition for the active benchmark family.
+
+    ``benchmark_failure`` records raw failure-condition violations before its
+    five-second confirmation windows are applied.  A violation immediately
+    makes success ineligible, even though it only terminates the episode after
+    it has remained continuously true for its confirmation interval.
+    """
 
     step_state = _termination_step_state(env, object_asset_names)
     success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -1232,6 +1239,25 @@ def task_success(
             confirm_time_s=confirm_time_s,
             step_state=step_state,
         )
+
+    active_failure_conditions = getattr(env, "_so101_failure_conditions_active", None)
+    if active_failure_conditions is not None:
+        # Failure is evaluated before success by ``TerminationsCfg``.  Reset a
+        # pending success confirmation for affected environments so success
+        # also has to be continuously valid without a failure-condition
+        # violation.
+        for task_family, counter_name in (
+            (TASK_BIN, "_so101_bin_success_counter"),
+            (TASK_NEXT_TO, "_so101_next_to_success_counter"),
+            (TASK_BETWEEN, "_so101_between_success_counter"),
+            (TASK_MOVE, "_so101_move_success_counter"),
+        ):
+            counter = getattr(env, counter_name, None)
+            if counter is not None:
+                reset_counter = active_failure_conditions & _task_is(env, task_family)
+                setattr(env, counter_name, torch.where(reset_counter, torch.zeros_like(counter), counter))
+        success &= ~active_failure_conditions
+
     return success & _episode_age_at_least(env, min_episode_time_s)
 
 
@@ -1745,6 +1771,8 @@ def benchmark_failure(
     jaw_open_fraction: float = 0.5,
     grasp_attempt_object_distance: float = GRASP_ATTEMPT_OBJECT_DISTANCE_M,
     max_grasp_attempts: int = 3,
+    enforce_max_grasp_attempts: bool = True,
+    failure_confirm_time_s: float = DEFAULT_FAILURE_CONFIRM_TIME_S,
     bin_displacement_limit: float = BIN_DISPLACEMENT_LIMIT_M,
     non_target_displacement_limit: float = NON_TARGET_DISPLACEMENT_LIMIT_M,
     boundary_displacement_limit: float = BOUNDARY_DISPLACEMENT_LIMIT_M,
@@ -1803,7 +1831,12 @@ def benchmark_failure(
     active = _active_mask(env, object_asset_names)
     # The close that raises a target count to three is still a usable attempt.
     exhausted_attempts = env._so101_grasp_attempt_counts > max_grasp_attempts
-    attempt_failure = torch.any(exhausted_attempts & _attempt_object_mask(env, object_asset_names), dim=1)
+    instant_attempt_failure = torch.any(exhausted_attempts & _attempt_object_mask(env, object_asset_names), dim=1)
+    if not enforce_max_grasp_attempts:
+        instant_attempt_failure = torch.zeros_like(instant_attempt_failure)
+    attempt_failure = _held_failure(
+        env, "_so101_attempt_failure_counter", instant_attempt_failure, failure_confirm_time_s
+    )
 
     bin_asset: RigidObject = env.scene[bin_name]
     # Displacements are judged on the XY (tabletop) plane only: objects spawn slightly
@@ -1812,7 +1845,13 @@ def benchmark_failure(
     bin_displacement = torch.linalg.vector_norm(
         bin_asset.data.root_pos_w[..., :2] - env._so101_failure_bin_pos_w[..., :2], dim=1
     )
-    bin_failure = bin_displacement > bin_displacement_limit
+    instant_bin_failure = bin_displacement > bin_displacement_limit
+    bin_failure = _held_failure(
+        env,
+        "_so101_bin_failure_counter",
+        instant_bin_failure,
+        failure_confirm_time_s,
+    )
 
     object_displacement = torch.linalg.vector_norm(
         object_pos_w[..., :2] - env._so101_failure_object_pos_w[..., :2], dim=2
@@ -1821,12 +1860,21 @@ def benchmark_failure(
     target_mask = torch.zeros_like(active)
     target_mask[torch.arange(env.num_envs, device=env.device), target_ids] = True
     instruction_task = ~_task_is(env, TASK_BIN)
-    non_target_moved = torch.any((object_displacement > non_target_displacement_limit) & active & (~target_mask), dim=1)
-    non_target_moved = non_target_moved & instruction_task
+    instant_non_target_moved = torch.any(
+        (object_displacement > non_target_displacement_limit) & active & (~target_mask), dim=1
+    )
+    non_target_moved = _held_failure(
+        env,
+        "_so101_non_target_failure_counter",
+        instant_non_target_moved & instruction_task,
+        failure_confirm_time_s,
+    )
 
     boundary_moved = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     move_past_boundary = torch.zeros_like(boundary_moved)
     move_trajectory_not_straight_enough = torch.zeros_like(boundary_moved)
+    instant_move_past_boundary = torch.zeros_like(boundary_moved)
+    instant_move_trajectory_not_straight_enough = torch.zeros_like(boundary_moved)
     active_families = set(getattr(env, "_so101_task_family", ()))
     if TASK_MOVE in active_families:
         _ensure_move_boundary_cache(env, object_asset_names, table_bounds, step_state)
@@ -1888,13 +1936,36 @@ def benchmark_failure(
             env._so101_move_straightness_failure_counter.zero_()
         if hasattr(env, "_so101_move_past_boundary_failure_counter"):
             env._so101_move_past_boundary_failure_counter.zero_()
-    move_boundary_failure = boundary_moved & _task_is(env, TASK_MOVE)
+    instant_move_boundary_failure = boundary_moved & _task_is(env, TASK_MOVE)
+    move_boundary_failure = _held_failure(
+        env,
+        "_so101_move_boundary_failure_counter",
+        instant_move_boundary_failure,
+        failure_confirm_time_s,
+    )
 
     made_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     if active_families & {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
         made_contact = grasped_object_contact_exceeded_grace_period(
             env, object_asset_names, step_state, contact_grace_time_s
         ) & (~_task_is(env, TASK_BIN))
+
+    timeout_confirmation_failure = getattr(env, "_so101_timeout_success_confirmation_failed", None)
+    if timeout_confirmation_failure is None:
+        timeout_confirmation_failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # Keep this raw mask separate from the confirmed failure below.  Success
+    # must not win during the confirmation interval for any failure condition.
+    env._so101_failure_conditions_active = (
+        instant_attempt_failure
+        | instant_bin_failure
+        | (instant_non_target_moved & instruction_task)
+        | instant_move_boundary_failure
+        | instant_move_past_boundary
+        | instant_move_trajectory_not_straight_enough
+        | made_contact
+        | timeout_confirmation_failure
+    )
 
     failure = (
         attempt_failure
@@ -1905,9 +1976,6 @@ def benchmark_failure(
         | move_trajectory_not_straight_enough
         | made_contact
     )
-    timeout_confirmation_failure = getattr(env, "_so101_timeout_success_confirmation_failed", None)
-    if timeout_confirmation_failure is None:
-        timeout_confirmation_failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     aged_failure = (
         failure & _episode_age_at_least(env, min_episode_time_s) & baseline_recorded
     ) | timeout_confirmation_failure
@@ -1960,6 +2028,7 @@ def _failure_diagnostics(
     env_id: int,
     min_episode_time_s: float,
     max_grasp_attempts: int,
+    enforce_max_grasp_attempts: bool,
     bin_displacement_limit: float,
     non_target_displacement_limit: float,
     boundary_displacement_limit: float,
@@ -1975,11 +2044,16 @@ def _failure_diagnostics(
     attempt_ids = torch.nonzero(attempt_mask, as_tuple=False).flatten().tolist()
     attempt_counts = env._so101_grasp_attempt_counts[env_id]
     exhausted_attempts = attempt_counts > max_grasp_attempts
-    attempt_failure = bool(torch.any(exhausted_attempts & attempt_mask).item())
+    attempt_failure = bool(enforce_max_grasp_attempts and torch.any(exhausted_attempts & attempt_mask).item())
     attempt_details = ", ".join(
         f"{_debug_object_name(env, object_asset_names, env_id, object_id)}="
         f"{int(attempt_counts[object_id].item())}"
         for object_id in attempt_ids
+    )
+    attempt_rule = (
+        f"failure if any >{max_grasp_attempts}"
+        if enforce_max_grasp_attempts
+        else f"limit disabled; would fail if any >{max_grasp_attempts}"
     )
     conditions.append(
         _gated_failure_diagnostic(
@@ -1987,7 +2061,7 @@ def _failure_diagnostics(
             attempt_failure,
             age_ready,
             baseline_recorded,
-            f"attempt_counts=[{attempt_details}], allowed_attempts={max_grasp_attempts}",
+            f"attempt_counts=[{attempt_details}], allowed_attempts={max_grasp_attempts} ({attempt_rule})",
         )
     )
 
@@ -2156,6 +2230,7 @@ def task_condition_diagnostics(
     move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
     failure_min_episode_time_s: float = 5.0,
     max_grasp_attempts: int = 3,
+    enforce_max_grasp_attempts: bool = True,
     bin_displacement_limit: float = BIN_DISPLACEMENT_LIMIT_M,
     non_target_displacement_limit: float = NON_TARGET_DISPLACEMENT_LIMIT_M,
     boundary_displacement_limit: float = BOUNDARY_DISPLACEMENT_LIMIT_M,
@@ -2196,6 +2271,7 @@ def task_condition_diagnostics(
                 env_id,
                 failure_min_episode_time_s,
                 max_grasp_attempts,
+                enforce_max_grasp_attempts,
                 bin_displacement_limit,
                 non_target_displacement_limit,
                 boundary_displacement_limit,

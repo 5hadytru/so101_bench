@@ -4,9 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BENCHMARK_PATH = REPO_ROOT / "source" / "so101_bench" / "so101_bench" / "benchmark.py"
+BENCHMARK_SPEC = importlib.util.spec_from_file_location("so101_bench_benchmark_update_instruction", BENCHMARK_PATH)
+if BENCHMARK_SPEC is None or BENCHMARK_SPEC.loader is None:
+    raise RuntimeError(f"Could not load benchmark module from {BENCHMARK_PATH}.")
+BENCHMARK = importlib.util.module_from_spec(BENCHMARK_SPEC)
+sys.modules[BENCHMARK_SPEC.name] = BENCHMARK
+BENCHMARK_SPEC.loader.exec_module(BENCHMARK)
+row_with_canonical_instruction_metadata = BENCHMARK.row_with_canonical_instruction_metadata
 
 
 def _parse_args() -> argparse.Namespace:
@@ -71,6 +83,34 @@ def _matching_row_indices(rows: list[tuple[int, str, dict]], trial_id: str) -> l
     ]
 
 
+def _object_names(row: dict) -> list[str]:
+    objects = row.get("objects")
+    if not isinstance(objects, list) or not objects:
+        raise ValueError("'objects' must be a non-empty list.")
+    if all(isinstance(name, str) for name in objects):
+        return list(objects)
+    if all(isinstance(entry, dict) and "name" in entry for entry in objects):
+        return [str(entry["name"]) for entry in sorted(objects, key=lambda entry: int(entry.get("slot", 0)))]
+    raise ValueError("'objects' must contain either object names or layout object entries.")
+
+
+def _row_with_updated_instruction_metadata(row: dict, *, instruction: str, source: str) -> dict:
+    task_like_row = dict(row)
+    task_like_row["objects"] = _object_names(row)
+    canonical = row_with_canonical_instruction_metadata(task_like_row, instruction=instruction, source=source)
+
+    updated = dict(row)
+    for key in ("target", "referents", "direction"):
+        updated.pop(key, None)
+    updated["instruction"] = canonical["instruction"]
+    if "task_family" in updated and "task_family" in canonical:
+        updated["task_family"] = canonical["task_family"]
+    for key in ("target", "referents", "direction"):
+        if key in canonical:
+            updated[key] = canonical[key]
+    return updated
+
+
 def _prepare_instruction_replacement(
     path: Path,
     *,
@@ -91,8 +131,11 @@ def _prepare_instruction_replacement(
     if not isinstance(old_instruction, str):
         raise ValueError(f"{path}:{line_no}: matching row has no string 'instruction' field.")
 
-    updated_row = dict(row)
-    updated_row["instruction"] = instruction
+    updated_row = _row_with_updated_instruction_metadata(
+        row,
+        instruction=instruction,
+        source=f"{path}:{line_no}",
+    )
     updated_line = json.dumps(updated_row, separators=(",", ":")) + "\n"
 
     rows[match_index] = (line_no, updated_line, updated_row)
@@ -139,8 +182,9 @@ def main() -> None:
         print(f"  new: {updated_instruction}")
 
     print(
-        "\nNote: only the 'instruction' field is changed. "
-        "Task metadata such as target, referents, direction, objects, and all layout poses are left as-is."
+        "\nNote: the 'instruction' field and semantic task metadata "
+        "('target', 'referents', 'direction', and existing 'task_family') are updated together. "
+        "Objects and all layout poses are left as-is."
     )
 
 

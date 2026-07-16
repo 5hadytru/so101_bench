@@ -316,24 +316,17 @@ from so101_bench.benchmark import (
     BenchmarkEpisodeSpec,
     INCH,
     load_episode_jsonl,
-    object_metadata,
-    object_usd_stem,
 )
 from so101_bench.layouts import (
-    DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS,
-    DEFAULT_OBJECT_FOOTPRINT_HALF_EXTENTS,
     generate_episode_layout,
     normalize_layout_object_slots,
 )
 from so101_bench.mdp import benchmark_object_positions, mark_benchmark_robot_start
 from so101_bench.mdp.terminations import POSTMORTEM_FAILURE_TYPES, POSTMORTEM_NOT_APPLICABLE
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
-    ASSETS_PATH,
     BIN_RANDOM_POSES,
-    MOVE_STRAIGHTNESS_TOLERANCE_M,
     OBJECT_LABELS,
     SO101_BOUNDING_BOX,
-    TABLE_BOUNDS,
     TABLE_OBJECT_Z,
     VALID_OBJECT_SPAWN_REGIONS,
     configure_env_cfg_for_object_pool,
@@ -352,7 +345,6 @@ from so101_bench.utils.lerobot_dataset import (
 )
 
 ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
-MULTI_RIGID_BODY_BIN_CLEARANCE_MARGIN_M = 0.5 * INCH
 INITIAL_ROBOT_JOINT_POS = lerobot_pose_to_sim_joint_pos(LEROBOT_INITIAL_JOINT_POS)
 
 
@@ -759,90 +751,14 @@ def _load_episode_layouts(
     return episode_layouts
 
 
-def _usd_footprint(
-    usd_path: Path,
-    label: str,
-    fallback_half_extents: tuple[float, float],
-    *,
-    bin_clearance_margin_m: float = 0.0,
-) -> dict[str, Any]:
-    try:
-        from pxr import Usd, UsdGeom
-
-        stage = Usd.Stage.Open(str(usd_path))
-        if stage is None:
-            raise RuntimeError(f"could not open {usd_path}")
-        prim = stage.GetDefaultPrim()
-        if prim is None or not prim.IsValid():
-            prim = stage.GetPseudoRoot()
-        bbox_cache = UsdGeom.BBoxCache(
-            Usd.TimeCode.Default(),
-            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
-        )
-        bbox_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
-        minimum = bbox_range.GetMin()
-        maximum = bbox_range.GetMax()
-        half_extents = (
-            max(0.5 * abs(float(maximum[0] - minimum[0])), 0.002),
-            max(0.5 * abs(float(maximum[1] - minimum[1])), 0.002),
-        )
-        center_offset = (
-            0.5 * (float(minimum[0]) + float(maximum[0])),
-            0.5 * (float(minimum[1]) + float(maximum[1])),
-        )
-        if not all(math.isfinite(extent) for extent in half_extents):
-            raise RuntimeError(f"non-finite footprint extents for {usd_path}")
-        if not all(math.isfinite(offset) for offset in center_offset):
-            raise RuntimeError(f"non-finite footprint center offset for {usd_path}")
-        return {
-            "half_extents": [half_extents[0], half_extents[1]],
-            "center_offset": [center_offset[0], center_offset[1]],
-            "bin_clearance_margin_m": max(float(bin_clearance_margin_m), 0.0),
-        }
-    except Exception as exc:
-        print(
-            f"[WARN]: Could not read USD footprint for {label!r} ({usd_path}): {exc}. "
-            f"Using fallback half-extents {fallback_half_extents}."
-        )
-        return {
-            "half_extents": [fallback_half_extents[0], fallback_half_extents[1]],
-            "center_offset": [0.0, 0.0],
-            "bin_clearance_margin_m": max(float(bin_clearance_margin_m), 0.0),
-        }
-
-
-def _object_footprint_half_extents(object_name: str) -> dict[str, Any]:
-    usd_path = Path(ASSETS_PATH) / "usd" / "objects" / f"{object_usd_stem(object_name)}.usdc"
-    bin_clearance_margin_m = (
-        MULTI_RIGID_BODY_BIN_CLEARANCE_MARGIN_M
-        if object_metadata(object_name)["multiple_rigid_bodies"]
-        else 0.0
-    )
-    return _usd_footprint(
-        usd_path,
-        object_name,
-        DEFAULT_OBJECT_FOOTPRINT_HALF_EXTENTS,
-        bin_clearance_margin_m=bin_clearance_margin_m,
-    )
-
-
-def _bin_footprint_half_extents() -> dict[str, Any]:
-    usd_path = Path(ASSETS_PATH) / "usd" / "plastic_bin.usdc"
-    return _usd_footprint(usd_path, "plastic bin", DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS)
-
-
-def _episode_object_footprints(episode_plan: list[BenchmarkEpisodeSpec]) -> dict[str, dict[str, Any]]:
-    object_names = sorted({object_name for episode in episode_plan for object_name in episode.objects})
-    return {object_name: _object_footprint_half_extents(object_name) for object_name in object_names}
-
-
 def _generate_and_save_episode_layouts(
     episode_plan: list[BenchmarkEpisodeSpec],
 ) -> tuple[list[dict], Path]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     layout_rng = random.Random(args_cli.seed)
-    object_footprints = _episode_object_footprints(episode_plan)
-    bin_footprint = _bin_footprint_half_extents()
+    # Shared across the run so object roots spread away from recent episodes
+    # (high inter-episode placement variance).
+    placement_history: list[tuple[float, float]] = []
     layouts = [
         generate_episode_layout(
             episode,
@@ -850,15 +766,11 @@ def _generate_and_save_episode_layouts(
             rng=layout_rng,
             bin_random_poses=BIN_RANDOM_POSES,
             valid_spawn_regions=VALID_OBJECT_SPAWN_REGIONS,
-            object_footprint_half_extents=object_footprints,
             table_object_z=TABLE_OBJECT_Z,
             seed=args_cli.seed,
             generated_at=generated_at,
-            bin_footprint_half_extents=bin_footprint,
-            table_bounds=TABLE_BOUNDS,
-            move_straightness_tolerance_m=MOVE_STRAIGHTNESS_TOLERANCE_M,
             robot_bounding_box=SO101_BOUNDING_BOX,
-            sample_random_valid_spatial_layout=args_cli.sample_random_valid_spatial_layout,
+            placement_history=placement_history,
         )
         for episode_index, episode in tqdm(
             enumerate(episode_plan),

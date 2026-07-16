@@ -104,7 +104,7 @@ def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tens
 def benchmark_object_yaws(env, object_asset_names: list[str]) -> torch.Tensor:
     yaws = []
     multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
-    for name in object_asset_names:
+    for object_id, name in enumerate(object_asset_names):
         asset = env.scene[name]
         if isinstance(asset, XformPrimView):
             views = multi_info.get(name)
@@ -126,6 +126,12 @@ def benchmark_object_yaws(env, object_asset_names: list[str]) -> torch.Tensor:
                 if not isinstance(quat, torch.Tensor):
                     quat = torch.as_tensor(quat)
                 yaws.append(_quat_yaw(quat.to(env.device)))
+        elif isinstance(asset, DeformableObject):
+            initial_yaws = getattr(env, "_so101_initial_object_yaws", None)
+            if isinstance(initial_yaws, torch.Tensor) and initial_yaws.shape[1] > object_id:
+                yaws.append(initial_yaws[:, object_id].to(device=env.device, dtype=torch.float32))
+            else:
+                yaws.append(torch.zeros(env.num_envs, dtype=torch.float32, device=env.device))
         else:
             yaws.append(_quat_yaw(asset.data.root_quat_w))
     return torch.stack(yaws, dim=1)
@@ -707,16 +713,15 @@ def _write_pose(
 
     if isinstance(asset, DeformableObject):
         nodal_state = asset.data.default_nodal_state_w[env_ids].clone()
-        default_root_pos_w = nodal_state[..., :3].mean(dim=1)
-        translation = root_pos_w - default_root_pos_w
-        nodal_state[..., :3] = asset.transform_nodal_pos(
-            nodal_state[..., :3],
-            pos=translation,
-            quat=quat.to(asset.device).unsqueeze(0),
+        nodal_pos_in_default_root = _deformable_default_nodal_pos_in_root_frame(env, asset, env_ids)
+        target_quat_w = quat.to(asset.device).reshape(1, 4)
+        nodal_state[..., :3] = root_pos_w.unsqueeze(1) + math_utils.quat_apply(
+            target_quat_w.unsqueeze(1).expand(-1, nodal_state.shape[1], -1),
+            nodal_pos_in_default_root,
         )
         nodal_state[..., 3:] = 0.0
         asset.write_nodal_state_to_sim(nodal_state, env_ids=env_ids)
-        return root_pos_w[0]
+        return nodal_state[0, :, :3].mean(dim=0)
 
     root_pose = torch.zeros((1, 7), device=asset.device)
     root_pose[:, :3] = root_pos_w
@@ -726,11 +731,56 @@ def _write_pose(
     return root_pose[0, :3]
 
 
+def _deformable_default_root_pose_w(
+    env,
+    asset: DeformableObject,
+    env_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    root_pos_w = torch.tensor(
+        asset.cfg.init_state.pos,
+        dtype=torch.float32,
+        device=asset.device,
+    ).unsqueeze(0)
+    root_pos_w += env.scene.env_origins[env_ids]
+    root_quat_w = torch.as_tensor(
+        asset.cfg.init_state.rot,
+        dtype=torch.float32,
+        device=asset.device,
+    ).reshape(1, 4)
+    return root_pos_w, root_quat_w
+
+
+def _deformable_default_nodal_pos_in_root_frame(
+    env,
+    asset: DeformableObject,
+    env_ids: torch.Tensor,
+) -> torch.Tensor:
+    default_root_pos_w, default_root_quat_w = _deformable_default_root_pose_w(env, asset, env_ids)
+    default_nodal_pos_w = asset.data.default_nodal_state_w[env_ids, :, :3]
+    return math_utils.quat_apply_inverse(
+        default_root_quat_w.unsqueeze(1).expand(-1, default_nodal_pos_w.shape[1], -1),
+        default_nodal_pos_w - default_root_pos_w.unsqueeze(1),
+    )
+
+
+def _deformable_root_z_with_table_clearance(
+    env,
+    asset: DeformableObject,
+    env_id: int,
+    root_z: float,
+    min_world_z: float,
+) -> float:
+    env_ids = torch.tensor([env_id], dtype=torch.long, device=asset.device)
+    nodal_pos_in_root = _deformable_default_nodal_pos_in_root_frame(env, asset, env_ids)
+    local_min_z = float(nodal_pos_in_root[0, :, 2].min().item())
+    return max(root_z, min_world_z - local_min_z)
+
+
 def _default_root_z(asset: BenchmarkObject, env_id: int) -> float:
     if isinstance(asset, XformPrimView):
         return float(asset.get_world_poses(indices=[env_id])[0][0, 2].item())
     if isinstance(asset, DeformableObject):
-        return float(asset.data.default_nodal_state_w[env_id, :, 2].mean().item())
+        return float(asset.cfg.init_state.pos[2])
     return float(asset.data.default_root_state[env_id, 2].item())
 
 
@@ -936,6 +986,24 @@ def reset_benchmark_scene(
     )
     env._so101_move_straightness_failure_counter = _reset_tensor_rows(
         env, "_so101_move_straightness_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_attempt_failure_counter = _reset_tensor_rows(
+        env, "_so101_attempt_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_bin_failure_counter = _reset_tensor_rows(
+        env, "_so101_bin_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_non_target_failure_counter = _reset_tensor_rows(
+        env, "_so101_non_target_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_move_boundary_failure_counter = _reset_tensor_rows(
+        env, "_so101_move_boundary_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_move_past_boundary_failure_counter = _reset_tensor_rows(
+        env, "_so101_move_past_boundary_failure_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_failure_conditions_active = _reset_tensor_rows(
+        env, "_so101_failure_conditions_active", (num_envs,), torch.bool, env_ids, False
     )
     env._so101_timeout_success_confirmation_active = _reset_tensor_rows(
         env, "_so101_timeout_success_confirmation_active", (num_envs,), torch.bool, env_ids, False
@@ -1153,6 +1221,15 @@ def reset_benchmark_scene(
             else:
                 x, y, z = _inactive_position(inactive_object_base_pos, inactive_object_spacing, object_id)
                 yaw = 0.0
+
+            if is_active and isinstance(asset, DeformableObject):
+                z = _deformable_root_z_with_table_clearance(
+                    env,
+                    asset,
+                    env_id,
+                    z,
+                    table_top_z + 0.001,
+                )
 
             env._so101_initial_object_pos_w[env_id, object_id] = _write_pose(
                 env,

@@ -1,4 +1,4 @@
-"""Check object USD physics material bindings and visual color textures.
+"""Check object USD mesh material bindings and visual color textures.
 
 Run with:
 
@@ -11,7 +11,7 @@ import argparse
 from collections.abc import Iterable
 from pathlib import Path
 
-from pxr import Sdf, Usd, UsdGeom, UsdShade
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,9 +24,7 @@ NON_COLOR_INPUT_TERMS = ("clearcoat", "metal", "normal", "occlusion", "rough")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Verify object USD physics material bindings and visual color texture references."
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--objects-dir",
         type=Path,
@@ -39,15 +37,9 @@ def parse_args() -> argparse.Namespace:
 args_cli = parse_args()
 
 
-def mesh_prims_below(stage: Usd.Stage, ancestor_name: str) -> list[Usd.Prim]:
-    """Return mesh prims whose path has an ancestor named `ancestor_name`."""
-    ancestor_name = ancestor_name.lower()
-    return [
-        prim
-        for prim in stage.Traverse()
-        if prim.IsA(UsdGeom.Mesh)
-        and ancestor_name in (part.lower() for part in prim.GetPath().pathString.split("/")[:-1])
-    ]
+def mesh_prims(stage: Usd.Stage) -> list[Usd.Prim]:
+    """Return all Mesh prims in the stage."""
+    return [prim for prim in stage.Traverse() if prim.IsA(UsdGeom.Mesh)]
 
 
 def bound_material(prim: Usd.Prim, purposes: Iterable[str]) -> UsdShade.Material | None:
@@ -187,56 +179,49 @@ def check_object_usd(usd_path: Path, textures_dir: Path) -> bool:
         return False
 
     passes = True
-    physics_meshes = mesh_prims_below(stage, "physics")
-    if not physics_meshes:
-        print("  FAIL no Mesh prim found below a prim named 'physics'")
+    all_meshes = mesh_prims(stage)
+    if not all_meshes:
+        print("  FAIL no Mesh prim found")
+        passes = False
+
+    physics_bound_meshes: list[tuple[Usd.Prim, UsdShade.Material]] = []
+    for mesh_prim in all_meshes:
+        material = bound_material(mesh_prim, ("physics",))
+        if material is not None and material.GetPrim().HasAPI(UsdPhysics.MaterialAPI):
+            physics_bound_meshes.append((mesh_prim, material))
+
+    if not physics_bound_meshes:
+        print("  FAIL no Mesh prim has a physics-purpose material binding")
         passes = False
     else:
         print("  physics material bindings:")
-        for mesh_prim in physics_meshes:
-            material = bound_material(
-                mesh_prim,
-                ("physics", UsdShade.Tokens.allPurpose),
-            )
-            if material is None:
-                print(f"    FAIL {mesh_prim.GetPath()}: no bound material")
-                passes = False
-                continue
-            print(
-                f"    PASS {mesh_prim.GetPath()}: "
-                f"{material.GetPrim().GetName()} ({material.GetPath()})"
-            )
+        for mesh_prim, material in physics_bound_meshes:
+            print(f"    PASS {mesh_prim.GetPath()}: {material.GetPrim().GetName()} ({material.GetPath()})")
 
-    visual_meshes = mesh_prims_below(stage, "visual")
     visual_texture_paths: set[Path] = set()
-    if not visual_meshes:
-        print("  FAIL no Mesh prim found below a prim named 'visual'")
+    textured_meshes: list[tuple[Usd.Prim, UsdShade.Material, list[Path]]] = []
+    for mesh_prim in all_meshes:
+        material = bound_material(mesh_prim, (UsdShade.Tokens.allPurpose,))
+        if material is None:
+            continue
+
+        mesh_texture_paths = texture_paths_in_dir(
+            stage,
+            visual_color_asset_paths(material),
+            textures_dir,
+        )
+        if mesh_texture_paths:
+            textured_meshes.append((mesh_prim, material, mesh_texture_paths))
+            visual_texture_paths.update(mesh_texture_paths)
+
+    if not textured_meshes:
+        print(f"  FAIL no Mesh prim is connected to a color texture in {textures_dir}")
         passes = False
     else:
         print("  visual color textures:")
-        for mesh_prim in visual_meshes:
-            material = bound_material(mesh_prim, (UsdShade.Tokens.allPurpose,))
-            if material is None:
-                print(f"    FAIL {mesh_prim.GetPath()}: no visual material")
-                passes = False
-                continue
-
-            mesh_texture_paths = texture_paths_in_dir(
-                stage,
-                visual_color_asset_paths(material),
-                textures_dir,
-            )
-            if not mesh_texture_paths:
-                print(
-                    f"    FAIL {mesh_prim.GetPath()}: "
-                    f"no color texture from {material.GetPath()} found in {textures_dir}"
-                )
-                passes = False
-                continue
-
+        for mesh_prim, material, mesh_texture_paths in textured_meshes:
             print(f"    PASS {mesh_prim.GetPath()}: {material.GetPrim().GetName()}")
             print_paths("textures", mesh_texture_paths)
-            visual_texture_paths.update(mesh_texture_paths)
 
     if visual_texture_paths:
         print_paths("object color texture files", visual_texture_paths)

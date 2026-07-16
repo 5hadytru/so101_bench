@@ -1,4 +1,5 @@
-{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the pink eraser left", "target": "pink eraser"}
-{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the blue scissors right", "target": "blue scissors"}
-{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the grey toy car forwards", "target": "grey toy car"}
-{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the yellow screwdriver forwards", "target": "yellow screwdriver"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the pink eraser left", "target": "pink eraser"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the blue scissors right", "target": "blue scissors"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the grey toy car forwards", "target": "grey toy car"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 4, "n_objects": 4, "instruction": "Move the yellow screwdriver forwards", "target": "yellow screwdriver"}

@@ -396,6 +396,15 @@ parser.add_argument(
     help="Reset the first task, print/view initial poses, and exit only when the Isaac app closes.",
 )
 parser.add_argument(
+    "--render_warmup_frames",
+    type=int,
+    default=16,
+    help=(
+        "Number of render() passes after each reset before recomputing observations. RTX dome-light sampling "
+        "can be dark for the first few frames after a scene reset; lower this if reset latency matters."
+    ),
+)
+parser.add_argument(
     "--terminal_control_stdin",
     nargs="?",
     const=True,
@@ -424,24 +433,21 @@ from tqdm import tqdm
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
+from isaaclab.sim.utils.stage import get_current_stage
 
 import so101_bench.tasks  # noqa: F401
 from so101_bench.benchmark import (
     BenchmarkEpisodeSpec,
-    INCH,
     TASK_BETWEEN,
     TASK_BIN,
     TASK_MOVE,
     TASK_NEXT_TO,
     load_episode_jsonl,
-    object_metadata,
-    object_usd_stem,
 )
 from so101_bench.layouts import (
     DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS,
     DEFAULT_OBJECT_FOOTPRINT_HALF_EXTENTS,
     generate_episode_layout,
-    layout_task_feasibility,
     normalize_layout_object_slots,
 )
 from so101_bench.mdp import (
@@ -452,9 +458,7 @@ from so101_bench.mdp import (
     task_success,
 )
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
-    ASSETS_PATH,
     BIN_RANDOM_POSES,
-    MOVE_STRAIGHTNESS_TOLERANCE_M,
     OBJECT_LABELS,
     SO101_BOUNDING_BOX,
     TABLE_BOUNDS,
@@ -474,11 +478,16 @@ from so101_bench.utils.lerobot_dataset import (
     real_compatible_camera_sources as _real_compatible_camera_sources,
     recording_images as _recording_images,
 )
+from pxr import UsdGeom, UsdLux
 
 
 ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 GRIPPER_JOINT_INDEX = LEROBOT_JOINT_ORDER.index("gripper")
-MULTI_RIGID_BODY_BIN_CLEARANCE_MARGIN_M = 0.5 * INCH
+BEDROOM_DOME_LIGHT_PATH = "/World/BedroomDomeLight"
+BEDROOM_DOME_LIGHT_INTENSITY = 800.0
+BEDROOM_DOME_LIGHT_COLOR = (1.0, 0.96, 0.88)
+BEDROOM_DOME_LIGHT_TEMPERATURE_K = 6500.0
+OBSOLETE_EXTRA_LIGHT_PATHS = ("/World/BedroomKeyLight", "/World/BedroomFillLight")
 
 
 def _normalize_keyboard_key(key: str) -> str:
@@ -1283,7 +1292,7 @@ def _debug_object_placement_lines(
     if episode.task_family == TASK_BIN:
         lines.append("task_feasibility=not applicable for bin placement")
     elif task_feasibility is None:
-        lines.append("task_feasibility=REJECTED by current rules")
+        lines.append("task_feasibility=not evaluated (placement is task-agnostic)")
     else:
         lines.append("task_feasibility=accepted by current rules")
 
@@ -1471,20 +1480,12 @@ def _write_object_placement_debug_artifacts(
 ) -> Path:
     output_dir = _object_placement_debug_dir(layout_path)
     output_dir.mkdir(parents=True, exist_ok=True)
-    object_footprints = _episode_object_footprints(episode_plan)
-    bin_footprint = _bin_footprint_half_extents()
     summary_lines = []
     debug_records = []
     index_items = []
     for episode, layout in zip(episode_plan, episode_layouts, strict=True):
-        task_feasibility = layout_task_feasibility(
-            layout,
-            episode,
-            object_footprints,
-            bin_footprint,
-            TABLE_BOUNDS,
-            robot_bounding_box=SO101_BOUNDING_BOX,
-        )
+        # Placement is task-agnostic; per-task feasibility annotations are no longer computed.
+        task_feasibility = None
         trial_id = layout.get("trial_id", layout.get("episode_index"))
         svg_name = f"trial_{trial_id}_episode_{layout.get('episode_index', 'unknown')}.svg"
         (output_dir / svg_name).write_text(
@@ -1499,8 +1500,6 @@ def _write_object_placement_debug_artifacts(
                 "episode_index": layout.get("episode_index"),
                 "task_family": episode.task_family,
                 "instruction": episode.instruction,
-                "passes_current_task_feasibility": episode.task_family == TASK_BIN or task_feasibility is not None,
-                "task_feasibility": task_feasibility,
                 "placement": layout.get("placement", {}),
                 "visual": svg_name,
             }
@@ -1604,90 +1603,14 @@ def _load_episode_layouts(
     return normalized_layouts
 
 
-def _usd_footprint(
-    usd_path: Path,
-    label: str,
-    fallback_half_extents: tuple[float, float],
-    *,
-    bin_clearance_margin_m: float = 0.0,
-) -> dict[str, Any]:
-    try:
-        from pxr import Usd, UsdGeom
-
-        stage = Usd.Stage.Open(str(usd_path))
-        if stage is None:
-            raise RuntimeError(f"could not open {usd_path}")
-        prim = stage.GetDefaultPrim()
-        if prim is None or not prim.IsValid():
-            prim = stage.GetPseudoRoot()
-        bbox_cache = UsdGeom.BBoxCache(
-            Usd.TimeCode.Default(),
-            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
-        )
-        bbox_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
-        minimum = bbox_range.GetMin()
-        maximum = bbox_range.GetMax()
-        half_extents = (
-            max(0.5 * abs(float(maximum[0] - minimum[0])), 0.002),
-            max(0.5 * abs(float(maximum[1] - minimum[1])), 0.002),
-        )
-        center_offset = (
-            0.5 * (float(minimum[0]) + float(maximum[0])),
-            0.5 * (float(minimum[1]) + float(maximum[1])),
-        )
-        if not all(math.isfinite(extent) for extent in half_extents):
-            raise RuntimeError(f"non-finite footprint extents for {usd_path}")
-        if not all(math.isfinite(offset) for offset in center_offset):
-            raise RuntimeError(f"non-finite footprint center offset for {usd_path}")
-        return {
-            "half_extents": [half_extents[0], half_extents[1]],
-            "center_offset": [center_offset[0], center_offset[1]],
-            "bin_clearance_margin_m": max(float(bin_clearance_margin_m), 0.0),
-        }
-    except Exception as exc:
-        print(
-            f"[WARN]: Could not read USD footprint for {label!r} ({usd_path}): {exc}. "
-            f"Using fallback half-extents {fallback_half_extents}."
-        )
-        return {
-            "half_extents": [fallback_half_extents[0], fallback_half_extents[1]],
-            "center_offset": [0.0, 0.0],
-            "bin_clearance_margin_m": max(float(bin_clearance_margin_m), 0.0),
-        }
-
-
-def _object_footprint_half_extents(object_name: str) -> dict[str, Any]:
-    usd_path = Path(ASSETS_PATH) / "usd" / "objects" / f"{object_usd_stem(object_name)}.usdc"
-    bin_clearance_margin_m = (
-        MULTI_RIGID_BODY_BIN_CLEARANCE_MARGIN_M
-        if object_metadata(object_name)["multiple_rigid_bodies"]
-        else 0.0
-    )
-    return _usd_footprint(
-        usd_path,
-        object_name,
-        DEFAULT_OBJECT_FOOTPRINT_HALF_EXTENTS,
-        bin_clearance_margin_m=bin_clearance_margin_m,
-    )
-
-
-def _bin_footprint_half_extents() -> dict[str, Any]:
-    usd_path = Path(ASSETS_PATH) / "usd" / "plastic_bin.usdc"
-    return _usd_footprint(usd_path, "plastic bin", DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS)
-
-
-def _episode_object_footprints(episode_plan: list[BenchmarkEpisodeSpec]) -> dict[str, dict[str, Any]]:
-    object_names = sorted({object_name for episode in episode_plan for object_name in episode.objects})
-    return {object_name: _object_footprint_half_extents(object_name) for object_name in object_names}
-
-
 def _generate_and_save_episode_layouts(
     episode_plan: list[BenchmarkEpisodeSpec],
 ) -> tuple[list[dict], Path]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     layout_rng = random.Random(args_cli.seed)
-    object_footprints = _episode_object_footprints(episode_plan)
-    bin_footprint = _bin_footprint_half_extents()
+    # Shared across the run so object roots spread away from recent episodes
+    # (high inter-episode placement variance).
+    placement_history: list[tuple[float, float]] = []
     layouts = [
         generate_episode_layout(
             episode,
@@ -1695,15 +1618,11 @@ def _generate_and_save_episode_layouts(
             rng=layout_rng,
             bin_random_poses=BIN_RANDOM_POSES,
             valid_spawn_regions=VALID_OBJECT_SPAWN_REGIONS,
-            object_footprint_half_extents=object_footprints,
             table_object_z=TABLE_OBJECT_Z,
             seed=args_cli.seed,
             generated_at=generated_at,
-            bin_footprint_half_extents=bin_footprint,
-            table_bounds=TABLE_BOUNDS,
-            move_straightness_tolerance_m=MOVE_STRAIGHTNESS_TOLERANCE_M,
             robot_bounding_box=SO101_BOUNDING_BOX,
-            sample_random_valid_spatial_layout=args_cli.sample_random_valid_spatial_layout,
+            placement_history=placement_history,
         )
         for episode_index, episode in tqdm(
             enumerate(episode_plan),
@@ -1811,6 +1730,7 @@ def _make_env(
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.seed = args_cli.seed
+    env_cfg.num_rerenders_on_reset = max(0, int(args_cli.render_warmup_frames))
     object_asset_names = configure_env_cfg_for_object_pool(env_cfg, object_pool)
     success_term_params = dict(env_cfg.terminations.success.params)
     failure_term_params = dict(env_cfg.terminations.failure.params)
@@ -1869,6 +1789,7 @@ def _format_grasp_attempts(
     object_asset_names: list[str],
     env_id: int,
     max_grasp_attempts: int,
+    enforce_max_grasp_attempts: bool,
 ) -> str:
     """Read-only per-object grasp-attempt counts for one env, for terminal debugging only."""
     attempt_counts = getattr(unwrapped, "_so101_grasp_attempt_counts", None)
@@ -1890,7 +1811,12 @@ def _format_grasp_attempts(
         marker = " [target]" if object_id == target_id else ""
         parts.append(f"{asset_name}/{label}{marker}={count}")
     detail = ", ".join(parts) if parts else "no active objects"
-    return f"grasp_attempts (failure if any >{max_grasp_attempts}): {detail}"
+    rule = (
+        f"failure if any >{max_grasp_attempts}"
+        if enforce_max_grasp_attempts
+        else f"limit disabled; would fail if any >{max_grasp_attempts}"
+    )
+    return f"grasp_attempts ({rule}): {detail}"
 
 
 # A diagnostic line is treated as unchanged if its only differences from the last
@@ -1935,6 +1861,7 @@ def _print_task_diagnostics(
     unwrapped,
     object_asset_names: list[str],
     max_grasp_attempts: int,
+    enforce_max_grasp_attempts: bool,
     prev_lines: dict[int, dict[str, str]],
 ) -> None:
     for snapshot in diagnostics:
@@ -1942,11 +1869,15 @@ def _print_task_diagnostics(
         # the previous print for this env. The episode/age header is metadata and is
         # intentionally excluded from the diff so a constantly-changing age does not
         # force everything to reprint.
+        grasp_attempts = _format_grasp_attempts(
+            unwrapped,
+            object_asset_names,
+            snapshot.env_id,
+            max_grasp_attempts,
+            enforce_max_grasp_attempts,
+        )
         lines: dict[str, str] = {
-            "grasp": (
-                "[DEBUG TASKS]:   "
-                f"{_format_grasp_attempts(unwrapped, object_asset_names, snapshot.env_id, max_grasp_attempts)}"
-            )
+            "grasp": f"[DEBUG TASKS]:   {grasp_attempts}"
         }
         for condition in snapshot.conditions:
             key = f"{condition.kind} {condition.name}"
@@ -2010,8 +1941,32 @@ def _write_robot_action_pose(env, joint_action: torch.Tensor) -> None:
     robot.write_data_to_sim()
 
 
+def _ensure_scene_lighting() -> None:
+    """Repair the global dome light after reset before RTX sensors render."""
+
+    stage = get_current_stage()
+    for light_path in OBSOLETE_EXTRA_LIGHT_PATHS:
+        prim = stage.GetPrimAtPath(light_path)
+        if prim.IsValid():
+            stage.RemovePrim(prim.GetPath())
+
+    prim = stage.GetPrimAtPath(BEDROOM_DOME_LIGHT_PATH)
+    if prim.IsValid():
+        dome_light = UsdLux.DomeLight(prim)
+    else:
+        dome_light = UsdLux.DomeLight.Define(stage, BEDROOM_DOME_LIGHT_PATH)
+        prim = dome_light.GetPrim()
+
+    UsdGeom.Imageable(prim).MakeVisible()
+    dome_light.CreateIntensityAttr().Set(BEDROOM_DOME_LIGHT_INTENSITY)
+    dome_light.CreateColorAttr().Set(BEDROOM_DOME_LIGHT_COLOR)
+    dome_light.CreateEnableColorTemperatureAttr().Set(True)
+    dome_light.CreateColorTemperatureAttr().Set(BEDROOM_DOME_LIGHT_TEMPERATURE_K)
+
+
 def _reset_env(env, robot_action: torch.Tensor | None = None) -> tuple[dict, dict]:
     obs, info = env.reset()
+    _ensure_scene_lighting()
     if robot_action is not None:
         _write_robot_action_pose(env, robot_action)
     unwrapped = env.unwrapped
@@ -2482,10 +2437,10 @@ def main():
             return
 
         unwrapped = env.unwrapped
-        if not args_cli.end_on_success:
-            task_success(unwrapped, **success_term_params)
         if not args_cli.end_on_failure:
             benchmark_failure(unwrapped, **failure_term_params)
+        if not args_cli.end_on_success:
+            task_success(unwrapped, **success_term_params)
         now = time.monotonic()
         if now < next_task_debug_print_time:
             return
@@ -2493,6 +2448,7 @@ def main():
         while next_task_debug_print_time <= now:
             next_task_debug_print_time += DEBUG_TASKS_PRINT_INTERVAL_S
         max_grasp_attempts = failure_term_params.get("max_grasp_attempts", 3)
+        enforce_max_grasp_attempts = failure_term_params.get("enforce_max_grasp_attempts", True)
         _print_task_diagnostics(
             task_condition_diagnostics(
                 unwrapped,
@@ -2506,6 +2462,7 @@ def main():
                 ),
                 failure_min_episode_time_s=failure_term_params.get("min_episode_time_s", 5.0),
                 max_grasp_attempts=max_grasp_attempts,
+                enforce_max_grasp_attempts=enforce_max_grasp_attempts,
                 bin_displacement_limit=failure_term_params.get("bin_displacement_limit", 0.0254),
                 non_target_displacement_limit=failure_term_params.get(
                     "non_target_displacement_limit", 0.0127
@@ -2516,6 +2473,7 @@ def main():
             unwrapped,
             object_asset_names,
             max_grasp_attempts,
+            enforce_max_grasp_attempts,
             task_debug_prev_lines,
         )
 

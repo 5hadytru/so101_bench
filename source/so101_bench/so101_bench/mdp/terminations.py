@@ -13,6 +13,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from so101_bench.benchmark import (
+    BETWEEN_CENTER_FRACTION_MAX,
+    BETWEEN_CENTER_FRACTION_MIN,
     BETWEEN_LINE_TOLERANCE_M,
     BIN_DISPLACEMENT_LIMIT_M,
     BOUNDARY_DISPLACEMENT_LIMIT_M,
@@ -29,6 +31,7 @@ from so101_bench.benchmark import (
     TASK_BETWEEN,
     TASK_BIN,
     TASK_MOVE,
+    TASK_NAMED_BIN,
     TASK_NEXT_TO,
     episode_length_s,
 )
@@ -44,17 +47,70 @@ FAILURE_REASON_MOVE_TRAJECTORY_NOT_STRAIGHT_ENOUGH = "move_trajectory_not_straig
 FAILURE_REASON_MADE_CONTACT = "made_contact"
 FAILURE_REASON_SUCCESS_CONFIRMATION_BREACHED = "success_confirmation_breached"
 
-# Postmortem failure types: a single mutually-exclusive label assigned to every
-# non-bin episode at the end of the rollout, based on whether the target (and/or a
-# distractor) was ever lifted clear of the table. Unlike the live FAILURE_REASON_*
-# rules above, these are computed once at episode end and apply even when the
-# episode merely timed out without tripping a live failure term.
+# Legacy postmortem labels.  These are retained because older outcome files and
+# downstream analysis use them, but the evidence-based classifier below reports
+# them separately as ``legacy_failure_type``.  A maximum root-Z excursion is not
+# enough evidence to infer intent: an object can rise because it tipped, bounced,
+# or was hit by the object actually being manipulated.
 POSTMORTEM_NONE = "none"
 POSTMORTEM_NOT_APPLICABLE = "not_applicable"
 POSTMORTEM_SEMANTIC = "semantic"
 POSTMORTEM_FAILED_GRASP = "failed_grasp"
 POSTMORTEM_PLACEMENT = "placement"
-POSTMORTEM_FAILURE_TYPES = (POSTMORTEM_SEMANTIC, POSTMORTEM_FAILED_GRASP, POSTMORTEM_PLACEMENT)
+
+# Evidence-based primary failure stages.  These labels describe the last stage
+# reached with defensible simulator evidence rather than guessing policy intent
+# from lift alone.  ``wrong_object_targeted`` deliberately replaces the broader
+# and usually unverifiable claim that an episode was a "semantic" failure.
+POSTMORTEM_NO_MANIPULATION_ATTEMPT = "no_manipulation_attempt"
+POSTMORTEM_WRONG_OBJECT_TARGETED = "wrong_object_targeted"
+POSTMORTEM_TARGET_ACQUISITION_FAILED = "target_acquisition_failed"
+POSTMORTEM_OBJECT_ACQUISITION_FAILED = "object_acquisition_failed"
+POSTMORTEM_TARGET_DROPPED = "target_dropped"
+POSTMORTEM_TARGET_RELEASED_OUTSIDE_GOAL = "target_released_outside_goal"
+POSTMORTEM_TRANSPORT_FAILED = "transport_failed"
+POSTMORTEM_GOAL_NOT_REACHED = "goal_not_reached"
+POSTMORTEM_GOAL_REACHED_BUT_UNCONFIRMED = "goal_reached_but_unconfirmed"
+POSTMORTEM_GOAL_REACHED_BUT_UNSTABLE = "goal_reached_but_unstable"
+POSTMORTEM_GOAL_REACHED_WITH_RULE_VIOLATION = "goal_reached_with_rule_violation"
+POSTMORTEM_GOAL_OVERSHOT = "goal_overshot"
+POSTMORTEM_TIMEOUT_DURING_CONFIRMATION = "timeout_during_confirmation"
+POSTMORTEM_INCOMPLETE_MULTI_OBJECT_TASK = "incomplete_multi_object_task"
+POSTMORTEM_AMBIGUOUS = "ambiguous"
+POSTMORTEM_LEGACY_FAILURE_TYPES = (
+    POSTMORTEM_SEMANTIC,
+    POSTMORTEM_FAILED_GRASP,
+    POSTMORTEM_PLACEMENT,
+)
+POSTMORTEM_FAILURE_TYPES = POSTMORTEM_LEGACY_FAILURE_TYPES + (
+    POSTMORTEM_NO_MANIPULATION_ATTEMPT,
+    POSTMORTEM_WRONG_OBJECT_TARGETED,
+    POSTMORTEM_TARGET_ACQUISITION_FAILED,
+    POSTMORTEM_OBJECT_ACQUISITION_FAILED,
+    POSTMORTEM_TARGET_DROPPED,
+    POSTMORTEM_TARGET_RELEASED_OUTSIDE_GOAL,
+    POSTMORTEM_TRANSPORT_FAILED,
+    POSTMORTEM_GOAL_NOT_REACHED,
+    POSTMORTEM_GOAL_REACHED_BUT_UNCONFIRMED,
+    POSTMORTEM_GOAL_REACHED_BUT_UNSTABLE,
+    POSTMORTEM_GOAL_REACHED_WITH_RULE_VIOLATION,
+    POSTMORTEM_GOAL_OVERSHOT,
+    POSTMORTEM_TIMEOUT_DURING_CONFIRMATION,
+    POSTMORTEM_INCOMPLETE_MULTI_OBJECT_TASK,
+    POSTMORTEM_AMBIGUOUS,
+)
+
+POSTMORTEM_CLASSIFICATION_VERSION = 2
+
+# Conservative temporal-evidence thresholds.  A jaw-close merely associates an
+# attempt with a nearby object.  Acquisition/manipulation requires motion over
+# multiple samples, which avoids calling a one-frame bump a wrong-object grasp.
+POSTMORTEM_MIN_STEP_MOTION_M = 7.5e-4
+POSTMORTEM_MIN_ASSOCIATED_TRANSPORT_M = 0.01
+POSTMORTEM_ACQUISITION_TRANSPORT_M = 0.005
+POSTMORTEM_ACQUISITION_HOLD_STEPS = 2
+POSTMORTEM_DROP_HOLD_STEPS = 2
+POSTMORTEM_MEANINGFUL_GOAL_HOLD_TIME_S = 0.25
 
 DEFAULT_SUCCESS_CONFIRM_TIME_S = 3.0
 DEFAULT_FAILURE_CONFIRM_TIME_S = 5.0
@@ -68,6 +124,7 @@ class _TerminationStepState:
     positions: torch.Tensor
     yaws: torch.Tensor | None = None
     footprint_vertices: torch.Tensor | None = None
+    contact_by_object: torch.Tensor | None = None
     grasped_object_made_contact: torch.Tensor | None = None
 
 
@@ -213,23 +270,16 @@ def _state_footprint_vertices(
     return step_state.footprint_vertices
 
 
-def grasped_object_made_contact(
+def _object_contact_mask(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
-    step_state: _TerminationStepState | None = None,
+    step_state: _TerminationStepState,
     force_threshold: float = 0.0,
 ) -> torch.Tensor:
-    """Return whether each episode's currently grasped object contacts another tabletop object."""
+    """Return an env-by-object mask for contact with another tabletop object."""
 
-    if step_state is None:
-        step_state = _termination_step_state(env, object_asset_names)
-    if step_state.grasped_object_made_contact is not None:
-        return step_state.grasped_object_made_contact
-
-    override = getattr(env, "_so101_grasped_object_made_contact_override", None)
-    if override is not None:
-        step_state.grasped_object_made_contact = override.to(device=env.device, dtype=torch.bool)
-        return step_state.grasped_object_made_contact
+    if step_state.contact_by_object is not None:
+        return step_state.contact_by_object
 
     contact_by_object = torch.zeros(
         (env.num_envs, len(object_asset_names)),
@@ -253,6 +303,46 @@ def grasped_object_made_contact(
                 force_magnitudes > force_threshold,
                 dim=tuple(range(1, force_magnitudes.ndim)),
             )
+    step_state.contact_by_object = contact_by_object
+    return contact_by_object
+
+
+def target_object_made_contact(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState | None = None,
+    force_threshold: float = 0.0,
+) -> torch.Tensor:
+    """Return whether the instruction target contacts another tabletop object."""
+
+    if step_state is None:
+        step_state = _termination_step_state(env, object_asset_names)
+    override = getattr(env, "_so101_target_object_made_contact_override", None)
+    if override is not None:
+        return override.to(device=env.device, dtype=torch.bool)
+    return _gather_by_index(
+        _object_contact_mask(env, object_asset_names, step_state, force_threshold),
+        _target_indices(env),
+    )
+
+
+def grasped_object_made_contact(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState | None = None,
+    force_threshold: float = 0.0,
+) -> torch.Tensor:
+    """Return whether each episode's currently grasped object contacts another tabletop object."""
+
+    if step_state is None:
+        step_state = _termination_step_state(env, object_asset_names)
+    if step_state.grasped_object_made_contact is not None:
+        return step_state.grasped_object_made_contact
+
+    override = getattr(env, "_so101_grasped_object_made_contact_override", None)
+    if override is not None:
+        step_state.grasped_object_made_contact = override.to(device=env.device, dtype=torch.bool)
+        return step_state.grasped_object_made_contact
 
     grasped_object_ids = getattr(env, "_so101_grasped_object_ids", None)
     if grasped_object_ids is None:
@@ -262,7 +352,11 @@ def grasped_object_made_contact(
     has_grasped_object = grasped_object_ids >= 0
     safe_object_ids = torch.clamp(grasped_object_ids, min=0)
     step_state.grasped_object_made_contact = (
-        _gather_by_index(contact_by_object, safe_object_ids) & has_grasped_object
+        _gather_by_index(
+            _object_contact_mask(env, object_asset_names, step_state, force_threshold),
+            safe_object_ids,
+        )
+        & has_grasped_object
     )
     return step_state.grasped_object_made_contact
 
@@ -332,6 +426,7 @@ def _task_success_counters(env: ManagerBasedRLEnv) -> torch.Tensor:
     counters = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     for task_family, counter_name in (
         (TASK_BIN, "_so101_bin_success_counter"),
+        (TASK_NAMED_BIN, "_so101_bin_success_counter"),
         (TASK_NEXT_TO, "_so101_next_to_success_counter"),
         (TASK_BETWEEN, "_so101_between_success_counter"),
         (TASK_MOVE, "_so101_move_success_counter"),
@@ -425,10 +520,26 @@ def _grasped_object_contact_allows_success(
     step_state: _TerminationStepState,
     grace_time_s: float,
 ) -> torch.Tensor:
-    """Advance the contact timer while requiring separation for success."""
+    """Require no grasped contact and no target contact earlier in the episode."""
 
     grasped_object_contact_exceeded_grace_period(env, object_asset_names, step_state, grace_time_s)
-    return ~grasped_object_made_contact(env, object_asset_names, step_state)
+    target_contact = target_object_made_contact(env, object_asset_names, step_state)
+    target_contact_ever = getattr(env, "_so101_target_object_contact_ever", None)
+    if not isinstance(target_contact_ever, torch.Tensor) or tuple(target_contact_ever.shape) != (env.num_envs,):
+        target_contact_ever = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    non_bin_task = ~_task_is(env, TASK_BIN)
+    env._so101_target_object_contact_ever = target_contact_ever | (target_contact & non_bin_task)
+    return (
+        ~grasped_object_made_contact(env, object_asset_names, step_state)
+        & ~env._so101_target_object_contact_ever
+    )
+
+
+def _target_contact_ever_mask(env: ManagerBasedRLEnv) -> torch.Tensor:
+    contact_ever = getattr(env, "_so101_target_object_contact_ever", None)
+    if isinstance(contact_ever, torch.Tensor) and tuple(contact_ever.shape) == (env.num_envs,):
+        return contact_ever.to(device=env.device, dtype=torch.bool)
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
 
 def bin_success(
@@ -439,9 +550,11 @@ def bin_success(
     confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
     step_state: _TerminationStepState | None = None,
 ) -> torch.Tensor:
-    """Success when every active object's root sits inside the bin's outer XY footprint.
+    """Score all-object and named-target bin containment.
 
-    Containment is a pure XY test: each object's root position is transformed
+    All-object bin episodes require every active root inside. Named-bin episodes
+    require only the instructed target root inside. Containment is a pure XY test:
+    each relevant root position is transformed
     into the bin's frame (so the check stays correct even if the bin is yawed)
     and compared against the USD-derived bin footprint. The object's own
     footprint and height are intentionally ignored -- only the root center
@@ -467,7 +580,13 @@ def bin_success(
     rel_footprint = rel_local[..., :2] - footprint_center_offsets.unsqueeze(1)
     inside = torch.all(torch.abs(rel_footprint) <= footprint_half_extents.unsqueeze(1), dim=-1)
     all_active_inside = torch.all(torch.where(active, inside, torch.ones_like(inside)), dim=1)
-    success_now = all_active_inside & _task_is(env, TASK_BIN)
+    target_inside = inside[
+        torch.arange(env.num_envs, device=env.device),
+        _target_indices(env),
+    ]
+    success_now = (all_active_inside & _task_is(env, TASK_BIN)) | (
+        target_inside & _task_is(env, TASK_NAMED_BIN)
+    )
 
     if not hasattr(env, "_so101_bin_success_counter"):
         env._so101_bin_success_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -523,7 +642,7 @@ def between_success(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
     centered_tolerance: float = BETWEEN_LINE_TOLERANCE_M,
-    min_segment_fraction: float = 0.1,
+    min_segment_fraction: float = BETWEEN_CENTER_FRACTION_MIN,
     contact_grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
     confirm_steps: int | None = None,
     confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
@@ -539,10 +658,8 @@ def between_success(
     target_ids = _target_indices(env)
     refs = _referent_indices(env)
 
-    # Centeredness is judged purely from how the target's footprint surface distance to
-    # one referent compares with its distance to the other -- d1 / (d1 + d2), where 0.5
-    # is equidistant. The [min_segment_fraction, 1 - min_segment_fraction] band rejects a
-    # target that hugs one referent, so the referent-to-referent line is not used here.
+    # The fraction is retained as a diagnostic. With the configured [0.0, 1.0]
+    # band it does not restrict success; line alignment below does.
     distance_to_first = _pairwise_object_surface_distance(
         env, object_asset_names, positions, yaws, target_ids, refs[:, 0], is_between
     )
@@ -555,7 +672,7 @@ def between_success(
         distance_to_first / total_distance,
         torch.full_like(distance_to_first, 0.5),
     )
-    centered = (fraction >= min_segment_fraction) & (fraction <= 1.0 - min_segment_fraction)
+    centered = (fraction >= min_segment_fraction) & (fraction <= BETWEEN_CENTER_FRACTION_MAX)
 
     # The target must also lie on the line between the two referents, judged from the
     # target's root center (not its footprint surface).
@@ -1156,14 +1273,11 @@ def move_success(
     # gap is undefined (NaN). Treat that as "no boundary in the path" and fall back to the
     # plain forward-progress criterion instead of dead-locking the episode on a NaN gap.
     has_boundary = (env._so101_move_boundary_ids >= 0) & torch.isfinite(distance_to_boundary)
-    # Touching the boundary (a small negative clearance) still counts as "next to" it,
-    # and shares its lower bound with the move_past_boundary failure so the two tile the
-    # clearance axis with no dead zone. Straightness is judged on the current (settled)
-    # deviation -- the success confirmation window requires it to hold -- so a transient
-    # excursion that recovers no longer disqualifies the move.
-    close_to_boundary = (distance_to_boundary >= -past_boundary_tolerance) & (
-        distance_to_boundary <= boundary_distance
-    )
+    # The boundary criterion has only an upper bound. A negative signed gap (the target's
+    # leading edge has passed the boundary surface) remains below the two-inch maximum.
+    # Straightness is judged on the current (settled) deviation; the success confirmation
+    # window requires it to hold, so a transient excursion that recovers is permitted.
+    close_to_boundary = distance_to_boundary < boundary_distance
     reached_goal = torch.where(has_boundary, close_to_boundary, progress >= no_boundary_min_progress)
 
     success_now = (
@@ -1202,10 +1316,14 @@ def task_success(
     it has remained continuously true for its confirmation interval.
     """
 
+    # The postmortem tracker is advanced by ``benchmark_failure``, which runs
+    # before this term.  Persist the authoritative success-side tolerance so
+    # subsequent tracker steps (and offline overrides) use the same geometry.
+    env._so101_success_move_straightness_tolerance = float(move_straightness_tolerance)
     step_state = _termination_step_state(env, object_asset_names)
     success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     active_families = set(getattr(env, "_so101_task_family", ()))
-    if TASK_BIN in active_families:
+    if active_families & {TASK_BIN, TASK_NAMED_BIN}:
         success |= bin_success(
             env,
             object_asset_names,
@@ -1248,6 +1366,7 @@ def task_success(
         # violation.
         for task_family, counter_name in (
             (TASK_BIN, "_so101_bin_success_counter"),
+            (TASK_NAMED_BIN, "_so101_bin_success_counter"),
             (TASK_NEXT_TO, "_so101_next_to_success_counter"),
             (TASK_BETWEEN, "_so101_between_success_counter"),
             (TASK_MOVE, "_so101_move_success_counter"),
@@ -1258,7 +1377,57 @@ def task_success(
                 setattr(env, counter_name, torch.where(reset_counter, torch.zeros_like(counter), counter))
         success &= ~active_failure_conditions
 
-    return success & _episode_age_at_least(env, min_episode_time_s)
+    policy_control_active = getattr(env, "_so101_policy_control_active", None)
+    if isinstance(policy_control_active, torch.Tensor):
+        policy_control_active = policy_control_active.to(device=env.device, dtype=torch.bool)
+        for counter_name in (
+            "_so101_bin_success_counter",
+            "_so101_next_to_success_counter",
+            "_so101_between_success_counter",
+            "_so101_move_success_counter",
+        ):
+            counter = getattr(env, counter_name, None)
+            if isinstance(counter, torch.Tensor):
+                setattr(
+                    env,
+                    counter_name,
+                    torch.where(policy_control_active, counter, torch.zeros_like(counter)),
+                )
+        success &= policy_control_active
+
+    confirmed_success = success & _episode_age_at_least(env, min_episode_time_s)
+
+    # Persist the actual configured confirmation requirement and confirmed
+    # state for postmortem attribution.  The benchmark commonly uses a much
+    # shorter confirmation window than this function's default, so inferring
+    # it later from a hard-coded duration would silently mislabel successes.
+    required_steps = _confirmation_steps(env, confirm_time_s)
+    episode_steps = env.episode_length_buf.to(device=env.device, dtype=torch.long)
+    last_steps = getattr(env, "_so101_success_confirmation_last_episode_step", None)
+    if not isinstance(last_steps, torch.Tensor) or tuple(last_steps.shape) != (env.num_envs,):
+        last_steps = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+    ever_confirmed = getattr(env, "_so101_success_ever_confirmed", None)
+    if not isinstance(ever_confirmed, torch.Tensor) or tuple(ever_confirmed.shape) != (env.num_envs,):
+        ever_confirmed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    new_episode = (last_steps >= 0) & (episode_steps < last_steps)
+    ever_confirmed = torch.where(new_episode, torch.zeros_like(ever_confirmed), ever_confirmed)
+    env._so101_success_ever_confirmed = ever_confirmed | confirmed_success
+    env._so101_success_confirmed_current = confirmed_success.clone()
+    env._so101_success_confirmation_required_steps = torch.full(
+        (env.num_envs,), required_steps, dtype=torch.long, device=env.device
+    )
+    env._so101_success_confirmation_last_episode_step = episode_steps.clone()
+    if bool(getattr(env, "_so101_pm_tracker_available", False)):
+        # ``benchmark_failure`` runs first in the termination-manager pass.
+        # Refresh its serialization hook now that the actual success counter
+        # and configured confirmation threshold are known, before auto-reset
+        # can clear the episode tensors.
+        env._so101_postmortem_failure_diagnostics = benchmark_postmortem_failure_diagnostics(
+            env,
+            object_asset_names,
+            confirm_time_s=confirm_time_s,
+        )
+    return confirmed_success
 
 
 def _debug_object_name(
@@ -1327,23 +1496,28 @@ def _bin_task_diagnostic(
     footprint_center_offsets = _bin_footprint_center_offsets(env)
     rel_footprint = rel_local[..., :2] - footprint_center_offsets.unsqueeze(1)
     inside = torch.all(torch.abs(rel_footprint) <= footprint_half_extents.unsqueeze(1), dim=-1)
-    active_ids = torch.nonzero(active[env_id], as_tuple=False).flatten().tolist()
-    active_roots = ", ".join(
+    named_bin = env._so101_task_family[env_id] == TASK_NAMED_BIN
+    scored_ids = (
+        [int(_target_indices(env)[env_id].item())]
+        if named_bin
+        else torch.nonzero(active[env_id], as_tuple=False).flatten().tolist()
+    )
+    scored_roots = ", ".join(
         f"{_debug_object_name(env, object_asset_names, env_id, object_id)}: "
         f"inside={bool(inside[env_id, object_id].item())}, "
         f"footprint_xy=({float(rel_footprint[env_id, object_id, 0].item()):.4f}, "
         f"{float(rel_footprint[env_id, object_id, 1].item()):.4f})m"
-        for object_id in active_ids
+        for object_id in scored_ids
     )
-    instant = bool(torch.all(inside[env_id, active_ids]).item())
+    instant = bool(torch.all(inside[env_id, scored_ids]).item())
     return _confirmed_success_diagnostic(
-        "all_active_object_roots_in_bin",
+        "target_root_in_bin" if named_bin else "all_active_object_roots_in_bin",
         instant,
         int(env._so101_bin_success_counter[env_id].item()),
         _confirmation_steps(env, confirm_time_s),
         bool(_episode_age_at_least(env, min_episode_time_s)[env_id].item()),
         f"required |x|<={float(footprint_half_extents[env_id, 0].item()):.4f}m and "
-        f"|y|<={float(footprint_half_extents[env_id, 1].item()):.4f}m; {active_roots}",
+        f"|y|<={float(footprint_half_extents[env_id, 1].item()):.4f}m; {scored_roots}",
     )
 
 
@@ -1368,8 +1542,10 @@ def _next_to_task_diagnostic(
         ).item()
     )
     made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
-    instant = (surface_distance <= SPATIAL_SUCCESS_DISTANCE_M) and not bool(made_contact[env_id].item())
+    contact_rule_breached = bool((made_contact | target_contact_ever)[env_id].item())
+    instant = (surface_distance <= SPATIAL_SUCCESS_DISTANCE_M) and not contact_rule_breached
     return _confirmed_success_diagnostic(
         "target_next_to_referent",
         instant,
@@ -1381,6 +1557,7 @@ def _next_to_task_diagnostic(
         f"surface_distance={surface_distance:.4f}m "
         f"(required <={SPATIAL_SUCCESS_DISTANCE_M:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
 
@@ -1423,9 +1600,11 @@ def _between_task_diagnostic(
     projection = ref_a + line_fraction.unsqueeze(1) * segment
     perpendicular = float(torch.linalg.vector_norm(target - projection, dim=1)[env_id].item())
     made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
-    centered = 0.2 <= fraction <= 0.8
-    instant = centered and (perpendicular <= BETWEEN_LINE_TOLERANCE_M) and not bool(made_contact[env_id].item())
+    centered = BETWEEN_CENTER_FRACTION_MIN <= fraction <= BETWEEN_CENTER_FRACTION_MAX
+    contact_rule_breached = bool((made_contact | target_contact_ever)[env_id].item())
+    instant = centered and (perpendicular <= BETWEEN_LINE_TOLERANCE_M) and not contact_rule_breached
     return _confirmed_success_diagnostic(
         "target_between_referents",
         instant,
@@ -1435,11 +1614,12 @@ def _between_task_diagnostic(
         f"target={_debug_object_name(env, object_asset_names, env_id, target_id)}, "
         f"referents=({_debug_object_name(env, object_asset_names, env_id, ref_a_id)}, "
         f"{_debug_object_name(env, object_asset_names, env_id, ref_b_id)}), "
-        f"segment_fraction={fraction:.4f} (required 0.20..0.80; "
+        f"segment_fraction={fraction:.4f} (required 0.10..0.90; "
         f"surface_distances referent1={distance_to_first:.4f}m, referent2={distance_to_second:.4f}m), "
         f"perpendicular_distance={perpendicular:.4f}m "
         f"(required <={BETWEEN_LINE_TOLERANCE_M:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
 
@@ -1459,15 +1639,13 @@ def _move_task_diagnostic(
         env, object_asset_names, table_bounds, step_state
     )
     made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
     # Matches move_success: a boundary only applies while its directional gap is defined; an
     # undefined (NaN) gap falls back to the forward-progress criterion.
     boundary_gap_defined = bool(torch.isfinite(distance_to_boundary[env_id]).item())
     has_boundary = (env._so101_move_boundary_ids >= 0) & torch.isfinite(distance_to_boundary)
-    close_to_boundary = (
-        (distance_to_boundary >= -MOVE_PAST_BOUNDARY_TOLERANCE_M)
-        & (distance_to_boundary <= MOVE_BOUNDARY_SUCCESS_DISTANCE_M)
-    )
+    close_to_boundary = distance_to_boundary < MOVE_BOUNDARY_SUCCESS_DISTANCE_M
     reached_goal = torch.where(has_boundary, close_to_boundary, progress >= MOVE_NO_BOUNDARY_MIN_PROGRESS_M)
     instant = bool(
         (
@@ -1475,11 +1653,12 @@ def _move_task_diagnostic(
             & reached_goal
             & (lateral <= straightness_tolerance)
             & (~made_contact)
+            & (~target_contact_ever)
         )[env_id].item()
     )
     boundary_id = int(env._so101_move_boundary_ids[env_id].item())
     boundary_requirement = (
-        f"(object boundary requirement {-MOVE_PAST_BOUNDARY_TOLERANCE_M:.4f}..{MOVE_BOUNDARY_SUCCESS_DISTANCE_M:.4f}m)"
+        f"(object boundary requirement <{MOVE_BOUNDARY_SUCCESS_DISTANCE_M:.4f}m; no minimum)"
         if boundary_gap_defined
         else "(undefined: target no longer overlaps the boundary laterally; using no-boundary progress criterion)"
     )
@@ -1497,6 +1676,7 @@ def _move_task_diagnostic(
         f"current_lateral_error={float(lateral[env_id].item()):.4f}m "
         f"(required <={straightness_tolerance:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
 
@@ -1514,7 +1694,7 @@ def _task_success_diagnostic(
     contact_grace_time_s: float,
 ) -> TaskConditionDiagnostic:
     task_family = env._so101_task_family[env_id]
-    if task_family == TASK_BIN:
+    if task_family in {TASK_BIN, TASK_NAMED_BIN}:
         return _bin_task_diagnostic(
             env, object_asset_names, bin_name, step_state, env_id, min_episode_time_s, confirm_time_s
         )
@@ -1539,6 +1719,18 @@ def _task_success_diagnostic(
     )
 
 
+@dataclass(frozen=True)
+class _GraspStepEvidence:
+    """Raw jaw/EE evidence produced while updating the legacy attempt counter."""
+
+    ee_pos_w: torch.Tensor
+    jaw_is_open: torch.Tensor
+    close_cycle: torch.Tensor
+    grasp_started: torch.Tensor
+    nearest_active_object_ids: torch.Tensor
+    nearest_active_distance_m: torch.Tensor
+
+
 def _update_grasp_attempts(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
@@ -1549,7 +1741,7 @@ def _update_grasp_attempts(
     jaw_open_fraction: float,
     object_distance_threshold: float,
     object_pos_w: torch.Tensor | None = None,
-) -> None:
+) -> _GraspStepEvidence:
     """Track the nearest grasped object and count one eligible attempt per armed jaw-close cycle."""
 
     robot = env.scene[robot_cfg.name]
@@ -1614,6 +1806,14 @@ def _update_grasp_attempts(
     )
     env._so101_grasp_armed = (was_armed | jaw_is_open) & (~close_cycle)
     env._so101_grasp_arm_jaw_pos = arm_jaw_pos
+    return _GraspStepEvidence(
+        ee_pos_w=ee_pos_w,
+        jaw_is_open=jaw_is_open,
+        close_cycle=close_cycle,
+        grasp_started=grasp_started,
+        nearest_active_object_ids=nearest_active_object_ids,
+        nearest_active_distance_m=nearest_active_dist,
+    )
 
 
 def _ensure_failure_displacement_baseline(
@@ -1666,8 +1866,34 @@ def _update_max_object_lift(
 
 
 @dataclass(frozen=True)
+class ManipulationAttemptDiagnostic:
+    """Temporal evidence for one jaw-close cycle associated with a nearby object."""
+
+    attempt_id: int
+    object_id: int
+    object_name: str
+    is_target: bool
+    close_step: int
+    end_step: int | None
+    nearest_distance_m: float
+    acquired: bool
+    acquisition_step: int | None
+    released: bool
+    dropped: bool
+    associated_transport_m: float
+    max_comotion_steps: int
+    goal_met_during_attempt: bool
+
+
+@dataclass(frozen=True)
 class PostmortemFailureDiagnostic:
-    """End-of-episode failure classification for one environment."""
+    """Evidence-backed end-of-episode attribution for one environment.
+
+    The first eight fields are the version-1 schema and intentionally remain in
+    place.  ``failure_type`` is the evidence-based primary stage whenever the
+    online tracker is available; ``legacy_failure_type`` contains the old
+    lift-only result for consumers that still need to compare against it.
+    """
 
     env_id: int
     task_family: str
@@ -1677,28 +1903,798 @@ class PostmortemFailureDiagnostic:
     lifted_wrong_object: str
     max_non_target_lift_m: float
     lift_threshold_m: float
+    classification_version: int = POSTMORTEM_CLASSIFICATION_VERSION
+    legacy_failure_type: str = POSTMORTEM_NONE
+    confidence: float = 0.0
+    secondary_failure_types: tuple[str, ...] = ()
+    rationale: str = ""
+    target_semantics_applicable: bool = True
+    target_attempt_count: int = 0
+    wrong_object_attempt_count: int = 0
+    unassociated_attempt_count: int = 0
+    target_acquired: bool = False
+    wrong_object_acquired: bool = False
+    target_manipulated: bool = False
+    target_max_displacement_m: float = 0.0
+    target_associated_transport_m: float = 0.0
+    target_post_acquisition_transport_m: float = 0.0
+    target_drop_count: int = 0
+    target_release_count: int = 0
+    goal_ever_reached: bool = False
+    goal_ever_confirmed: bool = False
+    max_goal_hold_steps: int = 0
+    final_goal_met: bool = False
+    attempts: tuple[ManipulationAttemptDiagnostic, ...] = ()
+    evidence: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _PostmortemGoalStep:
+    met: torch.Tensor
+    overshot: torch.Tensor
+    inside_bin: torch.Tensor
+    metrics: list[dict[str, object]]
+
+
+def _postmortem_goal_step(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    bin_name: str,
+    table_bounds: dict[str, tuple[float, float]],
+    step_state: _TerminationStepState,
+    move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
+    move_past_boundary_tolerance: float = MOVE_PAST_BOUNDARY_TOLERANCE_M,
+) -> _PostmortemGoalStep:
+    """Compute task geometry without advancing any success/failure counter."""
+
+    active = _active_mask(env, object_asset_names)
+    met = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    overshot = torch.zeros_like(met)
+    inside_bin = torch.zeros_like(active)
+    metrics: list[dict[str, object]] = [{} for _ in range(env.num_envs)]
+
+    # Tests and offline diagnostics can supply exact task geometry when a full
+    # Isaac scene (notably quaternion helpers) is intentionally unavailable.
+    met_override = getattr(env, "_so101_postmortem_goal_met_override", None)
+    if met_override is not None:
+        met = met_override.to(device=env.device, dtype=torch.bool).clone()
+        overshot_override = getattr(env, "_so101_postmortem_goal_overshot_override", None)
+        if overshot_override is not None:
+            overshot = overshot_override.to(device=env.device, dtype=torch.bool).clone()
+        inside_override = getattr(env, "_so101_postmortem_inside_bin_override", None)
+        if inside_override is not None:
+            inside_bin = inside_override.to(device=env.device, dtype=torch.bool).clone()
+        for env_id in range(env.num_envs):
+            metrics[env_id] = {
+                "name": "task_goal_override",
+                "value": 1.0 if bool(met[env_id].item()) else 0.0,
+                "threshold": 1.0,
+                "margin": 0.0 if bool(met[env_id].item()) else -1.0,
+                "instant": bool(met[env_id].item()),
+            }
+        return _PostmortemGoalStep(met, overshot, inside_bin, metrics)
+
+    positions = step_state.positions
+    families = set(getattr(env, "_so101_task_family", ()))
+    yaws: torch.Tensor | None = None
+    if families & {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
+        yaws = _state_object_yaws(env, object_asset_names, step_state)
+
+    if families & {TASK_BIN, TASK_NAMED_BIN}:
+        bin_asset: RigidObject = env.scene[bin_name]
+        rel = positions - bin_asset.data.root_pos_w.unsqueeze(1)
+        bin_quat_inv = math_utils.quat_inv(bin_asset.data.root_quat_w)
+        rel_local = torch.stack(
+            [math_utils.quat_apply(bin_quat_inv, rel[:, object_id, :]) for object_id in range(rel.shape[1])],
+            dim=1,
+        )
+        rel_footprint = rel_local[..., :2] - _bin_footprint_center_offsets(env).unsqueeze(1)
+        inside_bin = torch.all(
+            torch.abs(rel_footprint) <= _bin_footprint_half_extents(env).unsqueeze(1), dim=-1
+        )
+        bin_tasks = _task_is(env, TASK_BIN)
+        named_bin_tasks = _task_is(env, TASK_NAMED_BIN)
+        met |= torch.all(torch.where(active, inside_bin, torch.ones_like(inside_bin)), dim=1) & bin_tasks
+        for env_id in torch.nonzero(bin_tasks, as_tuple=False).flatten().tolist():
+            active_count = int(active[env_id].sum().item())
+            inside_count = int((inside_bin[env_id] & active[env_id]).sum().item())
+            metrics[env_id] = {
+                "name": "objects_inside_bin",
+                "value": float(inside_count),
+                "threshold": float(active_count),
+                "margin": float(inside_count - active_count),
+                "instant": inside_count == active_count,
+            }
+        target_ids = _target_indices(env)
+        target_inside = inside_bin[
+            torch.arange(env.num_envs, device=env.device),
+            target_ids,
+        ]
+        met |= target_inside & named_bin_tasks
+        for env_id in torch.nonzero(named_bin_tasks, as_tuple=False).flatten().tolist():
+            is_inside = bool(target_inside[env_id].item())
+            metrics[env_id] = {
+                "name": "target_inside_bin",
+                "value": 1.0 if is_inside else 0.0,
+                "threshold": 1.0,
+                "margin": 0.0 if is_inside else -1.0,
+                "instant": is_inside,
+                "target_object_id": int(target_ids[env_id].item()),
+            }
+
+    if TASK_NEXT_TO in families:
+        next_tasks = _task_is(env, TASK_NEXT_TO)
+        distances = _pairwise_object_surface_distance(
+            env,
+            object_asset_names,
+            positions,
+            yaws,
+            _target_indices(env),
+            _referent_indices(env)[:, 0],
+            next_tasks,
+        )
+        met |= (distances <= SPATIAL_SUCCESS_DISTANCE_M) & next_tasks
+        for env_id in torch.nonzero(next_tasks, as_tuple=False).flatten().tolist():
+            value = float(distances[env_id].item())
+            metrics[env_id] = {
+                "name": "target_referent_surface_distance_m",
+                "value": value,
+                "threshold": SPATIAL_SUCCESS_DISTANCE_M,
+                "margin": SPATIAL_SUCCESS_DISTANCE_M - value,
+                "instant": value <= SPATIAL_SUCCESS_DISTANCE_M,
+            }
+
+    if TASK_BETWEEN in families:
+        between_tasks = _task_is(env, TASK_BETWEEN)
+        target_ids = _target_indices(env)
+        refs = _referent_indices(env)
+        distance_a = _pairwise_object_surface_distance(
+            env, object_asset_names, positions, yaws, target_ids, refs[:, 0], between_tasks
+        )
+        distance_b = _pairwise_object_surface_distance(
+            env, object_asset_names, positions, yaws, target_ids, refs[:, 1], between_tasks
+        )
+        total = distance_a + distance_b
+        fraction = torch.where(
+            torch.isfinite(total) & (total > 0.0), distance_a / total, torch.full_like(total, 0.5)
+        )
+        centered = (fraction >= BETWEEN_CENTER_FRACTION_MIN) & (fraction <= BETWEEN_CENTER_FRACTION_MAX)
+        target = _gather_by_index(positions, target_ids)[:, :2]
+        ref_a = _gather_by_index(positions, refs[:, 0])[:, :2]
+        ref_b = _gather_by_index(positions, refs[:, 1])[:, :2]
+        segment = ref_b - ref_a
+        segment_len_sq = torch.clamp(torch.sum(segment * segment, dim=1), min=1.0e-6)
+        projection_fraction = torch.sum((target - ref_a) * segment, dim=1) / segment_len_sq
+        projection = ref_a + projection_fraction.unsqueeze(1) * segment
+        perpendicular = torch.linalg.vector_norm(target - projection, dim=1)
+        between_met = centered & (perpendicular <= BETWEEN_LINE_TOLERANCE_M) & between_tasks
+        met |= between_met
+        for env_id in torch.nonzero(between_tasks, as_tuple=False).flatten().tolist():
+            value = float(perpendicular[env_id].item())
+            frac = float(fraction[env_id].item())
+            centered_margin = min(
+                frac - BETWEEN_CENTER_FRACTION_MIN,
+                BETWEEN_CENTER_FRACTION_MAX - frac,
+            )
+            line_margin = BETWEEN_LINE_TOLERANCE_M - value
+            metrics[env_id] = {
+                "name": "between_geometry",
+                "value": value,
+                "threshold": BETWEEN_LINE_TOLERANCE_M,
+                "margin": min(line_margin, centered_margin),
+                "instant": bool(between_met[env_id].item()),
+                "perpendicular_distance_m": value,
+                "center_fraction": frac,
+                "center_fraction_min": BETWEEN_CENTER_FRACTION_MIN,
+                "center_fraction_max": BETWEEN_CENTER_FRACTION_MAX,
+            }
+
+    if TASK_MOVE in families:
+        move_tasks = _task_is(env, TASK_MOVE)
+        gap, progress, lateral, _ = _move_boundary_distance(env, object_asset_names, table_bounds, step_state)
+        has_boundary = (env._so101_move_boundary_ids >= 0) & torch.isfinite(gap)
+        reached = torch.where(
+            has_boundary,
+            gap < MOVE_BOUNDARY_SUCCESS_DISTANCE_M,
+            progress >= MOVE_NO_BOUNDARY_MIN_PROGRESS_M,
+        )
+        move_met = (
+            (progress > 0.0) & reached & (lateral <= move_straightness_tolerance) & move_tasks
+        )
+        met |= move_met
+        for env_id in torch.nonzero(move_tasks, as_tuple=False).flatten().tolist():
+            boundary = bool(has_boundary[env_id].item())
+            value = float(gap[env_id].item()) if boundary else float(progress[env_id].item())
+            threshold = MOVE_BOUNDARY_SUCCESS_DISTANCE_M if boundary else MOVE_NO_BOUNDARY_MIN_PROGRESS_M
+            goal_margin = (
+                MOVE_BOUNDARY_SUCCESS_DISTANCE_M - value
+                if boundary
+                else value - MOVE_NO_BOUNDARY_MIN_PROGRESS_M
+            )
+            lateral_margin = move_straightness_tolerance - float(lateral[env_id].item())
+            metrics[env_id] = {
+                "name": "move_boundary_gap_m" if boundary else "move_directional_progress_m",
+                "value": value,
+                "threshold": threshold,
+                "margin": min(goal_margin, lateral_margin),
+                "instant": bool(move_met[env_id].item()),
+                "directional_progress_m": float(progress[env_id].item()),
+                "lateral_error_m": float(lateral[env_id].item()),
+                "boundary_gap_m": float(gap[env_id].item()),
+                "has_boundary": boundary,
+                "overshot": bool(overshot[env_id].item()),
+            }
+
+    return _PostmortemGoalStep(met, overshot, inside_bin, metrics)
+
+
+def task_condition_metrics(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    bin_name: str,
+    table_bounds: dict[str, tuple[float, float]] | None = None,
+    step_state: _TerminationStepState | None = None,
+    confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
+    move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
+    move_past_boundary_tolerance: float = MOVE_PAST_BOUNDARY_TOLERANCE_M,
+    **_ignored: object,
+) -> list[dict[str, object]]:
+    """Return typed current goal metrics without advancing confirmation counters.
+
+    This is the numeric counterpart to :class:`TaskConditionDiagnostic`; it is
+    intended for outcome collection and offline rescoring.  Geometry caches may
+    be populated, but success/failure/contact counters are never mutated.
+    """
+
+    if table_bounds is None:
+        table_bounds = {"x": (0.08, 0.45), "y": (-0.20, 0.20)}
+    if step_state is None:
+        step_state = _termination_step_state(env, object_asset_names)
+    goal = _postmortem_goal_step(
+        env,
+        object_asset_names,
+        bin_name,
+        table_bounds,
+        step_state,
+        move_straightness_tolerance=move_straightness_tolerance,
+        move_past_boundary_tolerance=move_past_boundary_tolerance,
+    )
+    counters = _task_success_counters(env)
+    configured_required = getattr(env, "_so101_success_confirmation_required_steps", None)
+    confirmed_current = getattr(env, "_so101_success_confirmed_current", None)
+    active = _active_mask(env, object_asset_names)
+    task_families = getattr(env, "_so101_task_family", [TASK_BIN] * env.num_envs)
+    records: list[dict[str, object]] = []
+    for env_id in range(env.num_envs):
+        if isinstance(configured_required, torch.Tensor):
+            required_steps = int(configured_required[env_id].item())
+        elif isinstance(configured_required, int):
+            required_steps = configured_required
+        else:
+            required_steps = _confirmation_steps(env, confirm_time_s)
+        metric = dict(goal.metrics[env_id])
+        for key, value in tuple(metric.items()):
+            if isinstance(value, float) and not math.isfinite(value):
+                metric[key] = None
+        counter = int(counters[env_id].item())
+        actual_confirmed = bool(
+            isinstance(confirmed_current, torch.Tensor)
+            and bool(confirmed_current[env_id].item())
+        )
+        metric.update(
+            {
+                "instant": bool(goal.met[env_id].item()),
+                "counter": counter,
+                "required_steps": required_steps,
+                "geometry_confirmed": bool(goal.met[env_id].item()) and counter >= required_steps,
+                "success_confirmed_current": actual_confirmed,
+            }
+        )
+        records.append(
+            {
+                "env_id": env_id,
+                "task_family": task_families[env_id],
+                "goal": metric,
+                "overshot": bool(goal.overshot[env_id].item()),
+                "inside_bin_object_ids": tuple(
+                    object_id
+                    for object_id in torch.nonzero(
+                        goal.inside_bin[env_id] & active[env_id], as_tuple=False
+                    ).flatten().tolist()
+                ),
+            }
+        )
+    return records
+
+
+def _ensure_postmortem_buffers(env: ManagerBasedRLEnv, num_objects: int) -> None:
+    """Create tracker buffers without requiring reset-event changes."""
+
+    specs = {
+        "_so101_pm_last_episode_step": ((env.num_envs,), torch.long, -1),
+        "_so101_pm_has_prev_sample": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_prev_object_pos_w": ((env.num_envs, num_objects, 3), torch.float32, 0.0),
+        "_so101_pm_prev_ee_pos_w": ((env.num_envs, 3), torch.float32, 0.0),
+        "_so101_pm_attempt_counts_all": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_unassociated_attempt_counts": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_acquisition_counts": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_acquired_objects": ((env.num_envs, num_objects), torch.bool, False),
+        "_so101_pm_manipulated_objects": ((env.num_envs, num_objects), torch.bool, False),
+        "_so101_pm_interaction_steps": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_max_interaction_steps": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_interaction_segment_transport_m": (
+            (env.num_envs, num_objects),
+            torch.float32,
+            0.0,
+        ),
+        "_so101_pm_max_interaction_segment_transport_m": (
+            (env.num_envs, num_objects),
+            torch.float32,
+            0.0,
+        ),
+        "_so101_pm_associated_transport_m": ((env.num_envs, num_objects), torch.float32, 0.0),
+        "_so101_pm_post_acquisition_transport_m": (
+            (env.num_envs, num_objects),
+            torch.float32,
+            0.0,
+        ),
+        "_so101_pm_max_object_displacement_m": ((env.num_envs, num_objects), torch.float32, 0.0),
+        "_so101_pm_lift_hold_steps": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_max_lift_hold_steps": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_candidate_object_ids": ((env.num_envs,), torch.long, -1),
+        "_so101_pm_candidate_transport_m": ((env.num_envs,), torch.float32, 0.0),
+        "_so101_pm_candidate_segment_transport_m": ((env.num_envs,), torch.float32, 0.0),
+        "_so101_pm_candidate_comotion_steps": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_candidate_max_comotion_steps": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_candidate_acquired": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_candidate_loss_steps": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_drop_counts": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_release_counts": ((env.num_envs, num_objects), torch.long, 0),
+        "_so101_pm_goal_hold_steps": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_max_goal_hold_steps": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_goal_ever_reached": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_final_goal_met": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_max_success_counter": ((env.num_envs,), torch.long, 0),
+        "_so101_pm_ever_overshot": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_final_overshot": ((env.num_envs,), torch.bool, False),
+        "_so101_pm_ever_inside_bin": ((env.num_envs, num_objects), torch.bool, False),
+        "_so101_pm_best_goal_margin": ((env.num_envs,), torch.float32, float("-inf")),
+        "_so101_pm_best_goal_step": ((env.num_envs,), torch.long, -1),
+    }
+    for name, (shape, dtype, fill) in specs.items():
+        value = getattr(env, name, None)
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+            setattr(env, name, torch.full(shape, fill, dtype=dtype, device=env.device))
+    attempts = getattr(env, "_so101_pm_attempt_history", None)
+    if not isinstance(attempts, list) or len(attempts) != env.num_envs:
+        env._so101_pm_attempt_history = [[] for _ in range(env.num_envs)]
+    metrics = getattr(env, "_so101_postmortem_goal_metrics", None)
+    if not isinstance(metrics, list) or len(metrics) != env.num_envs:
+        env._so101_postmortem_goal_metrics = [{} for _ in range(env.num_envs)]
+
+
+def _reset_postmortem_rows(env: ManagerBasedRLEnv, reset: torch.Tensor) -> None:
+    """Reset evidence rows when an environment's episode counter rolls back."""
+
+    if not torch.any(reset):
+        return
+    for name, value in vars(env).items():
+        if not name.startswith("_so101_pm_") or not isinstance(value, torch.Tensor):
+            continue
+        if value.shape[0] != env.num_envs or name == "_so101_pm_last_episode_step":
+            continue
+        if value.dtype == torch.bool:
+            value[reset] = False
+        elif value.dtype.is_floating_point:
+            value[reset] = float("-inf") if name == "_so101_pm_best_goal_margin" else 0.0
+        else:
+            value[reset] = -1 if name in {"_so101_pm_candidate_object_ids", "_so101_pm_best_goal_step"} else 0
+    for env_id in torch.nonzero(reset, as_tuple=False).flatten().tolist():
+        env._so101_pm_attempt_history[env_id] = []
+        env._so101_postmortem_goal_metrics[env_id] = {}
+    for name in ("_so101_success_ever_confirmed", "_so101_success_confirmed_current"):
+        value = getattr(env, name, None)
+        if isinstance(value, torch.Tensor) and tuple(value.shape) == (env.num_envs,):
+            value[reset] = False
+
+
+def _finish_postmortem_attempt(
+    env: ManagerBasedRLEnv,
+    env_id: int,
+    episode_step: int,
+    *,
+    released: bool = False,
+    dropped: bool = False,
+) -> None:
+    candidate_id = int(env._so101_pm_candidate_object_ids[env_id].item())
+    if candidate_id < 0:
+        return
+    history = env._so101_pm_attempt_history[env_id]
+    if history:
+        attempt = history[-1]
+        attempt["end_step"] = episode_step
+        attempt["released"] = released
+        attempt["dropped"] = dropped
+        attempt["associated_transport_m"] = float(env._so101_pm_candidate_transport_m[env_id].item())
+        attempt["max_comotion_steps"] = int(env._so101_pm_candidate_max_comotion_steps[env_id].item())
+    if released and bool(env._so101_pm_candidate_acquired[env_id].item()):
+        env._so101_pm_release_counts[env_id, candidate_id] += 1
+    env._so101_pm_candidate_object_ids[env_id] = -1
+    env._so101_pm_candidate_transport_m[env_id] = 0.0
+    env._so101_pm_candidate_segment_transport_m[env_id] = 0.0
+    env._so101_pm_candidate_comotion_steps[env_id] = 0
+    env._so101_pm_candidate_max_comotion_steps[env_id] = 0
+    env._so101_pm_candidate_acquired[env_id] = False
+    env._so101_pm_candidate_loss_steps[env_id] = 0
+
+
+def _update_postmortem_evidence(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    bin_name: str,
+    table_bounds: dict[str, tuple[float, float]],
+    step_state: _TerminationStepState,
+    grasp_step: _GraspStepEvidence,
+    baseline_recorded: torch.Tensor,
+    object_distance_threshold: float,
+    move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
+    move_past_boundary_tolerance: float = MOVE_PAST_BOUNDARY_TOLERANCE_M,
+) -> None:
+    """Accumulate idempotent temporal evidence for postmortem attribution.
+
+    Object acquisition requires sustained near-EE co-motion (or sustained lift
+    while associated with a jaw-close).  Open-jaw pushing is still recognized
+    through the same co-motion test, so valid move/next-to/between strategies do
+    not become ``failed_grasp`` merely because the object was never lifted.
+    """
+
+    num_objects = len(object_asset_names)
+    _ensure_postmortem_buffers(env, num_objects)
+    previous_steps = env._so101_pm_last_episode_step
+    episode_buf = getattr(env, "episode_length_buf", None)
+    if isinstance(episode_buf, torch.Tensor):
+        episode_steps = episode_buf.to(device=env.device, dtype=torch.long)
+        reset = (previous_steps >= 0) & (episode_steps < previous_steps)
+        needs_update = episode_steps != previous_steps
+    else:
+        episode_steps = previous_steps + 1
+        reset = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        needs_update = torch.ones_like(reset)
+    _reset_postmortem_rows(env, reset)
+    if not torch.any(needs_update):
+        return
+
+    configured_success_straightness = float(
+        getattr(
+            env,
+            "_so101_success_move_straightness_tolerance",
+            move_straightness_tolerance,
+        )
+    )
+    goal = _postmortem_goal_step(
+        env,
+        object_asset_names,
+        bin_name,
+        table_bounds,
+        step_state,
+        move_straightness_tolerance=configured_success_straightness,
+        move_past_boundary_tolerance=move_past_boundary_tolerance,
+    )
+    active = _active_mask(env, object_asset_names)
+    policy_control_active = getattr(env, "_so101_policy_control_active", None)
+    robot_started = getattr(env, "_so101_robot_started_moving", None)
+    attribution_active = (
+        policy_control_active.to(device=env.device, dtype=torch.bool)
+        if isinstance(policy_control_active, torch.Tensor)
+        else robot_started.to(device=env.device, dtype=torch.bool)
+        if isinstance(robot_started, torch.Tensor)
+        else baseline_recorded
+    )
+    attribution_update = needs_update & attribution_active
+    object_pos_w = step_state.positions
+    ee_pos_w = grasp_step.ee_pos_w
+    has_prev = env._so101_pm_has_prev_sample & needs_update
+    object_delta = object_pos_w - env._so101_pm_prev_object_pos_w
+    ee_delta = ee_pos_w - env._so101_pm_prev_ee_pos_w
+    object_step_m = torch.linalg.vector_norm(object_delta, dim=2)
+    ee_step_m = torch.linalg.vector_norm(ee_delta, dim=1)
+    object_ee_distance = torch.linalg.vector_norm(object_pos_w - ee_pos_w.unsqueeze(1), dim=2)
+    dot = torch.sum(object_delta * ee_delta.unsqueeze(1), dim=2)
+    denom = torch.clamp(object_step_m * ee_step_m.unsqueeze(1), min=1.0e-9)
+    cosine = dot / denom
+    motion_ratio = object_step_m / torch.clamp(ee_step_m.unsqueeze(1), min=1.0e-9)
+    co_motion = (
+        has_prev.unsqueeze(1)
+        & baseline_recorded.unsqueeze(1)
+        & attribution_active.unsqueeze(1)
+        & active
+        & (object_ee_distance <= object_distance_threshold * 1.5)
+        & (object_step_m >= POSTMORTEM_MIN_STEP_MOTION_M)
+        & (ee_step_m.unsqueeze(1) >= POSTMORTEM_MIN_STEP_MOTION_M)
+        & (cosine >= 0.5)
+        & (motion_ratio >= 0.1)
+        & (motion_ratio <= 3.0)
+    )
+
+    env._so101_pm_interaction_steps = torch.where(
+        needs_update.unsqueeze(1) & co_motion,
+        env._so101_pm_interaction_steps + 1,
+        torch.where(
+            needs_update.unsqueeze(1),
+            torch.zeros_like(env._so101_pm_interaction_steps),
+            env._so101_pm_interaction_steps,
+        ),
+    )
+    env._so101_pm_max_interaction_steps = torch.maximum(
+        env._so101_pm_max_interaction_steps, env._so101_pm_interaction_steps
+    )
+    env._so101_pm_interaction_segment_transport_m = torch.where(
+        needs_update.unsqueeze(1) & co_motion,
+        env._so101_pm_interaction_segment_transport_m + object_step_m,
+        torch.where(
+            needs_update.unsqueeze(1),
+            torch.zeros_like(env._so101_pm_interaction_segment_transport_m),
+            env._so101_pm_interaction_segment_transport_m,
+        ),
+    )
+    env._so101_pm_max_interaction_segment_transport_m = torch.maximum(
+        env._so101_pm_max_interaction_segment_transport_m,
+        env._so101_pm_interaction_segment_transport_m,
+    )
+    env._so101_pm_associated_transport_m += torch.where(
+        needs_update.unsqueeze(1) & co_motion, object_step_m, torch.zeros_like(object_step_m)
+    )
+    meaningfully_manipulated = (
+        (env._so101_pm_max_interaction_steps >= POSTMORTEM_ACQUISITION_HOLD_STEPS)
+        & (
+            env._so101_pm_max_interaction_segment_transport_m
+            >= POSTMORTEM_MIN_ASSOCIATED_TRANSPORT_M
+        )
+    )
+    env._so101_pm_manipulated_objects |= meaningfully_manipulated
+
+    if hasattr(env, "_so101_failure_object_pos_w"):
+        displacement = torch.linalg.vector_norm(
+            object_pos_w[..., :2] - env._so101_failure_object_pos_w[..., :2], dim=2
+        )
+        env._so101_pm_max_object_displacement_m = torch.where(
+            baseline_recorded.unsqueeze(1) & attribution_active.unsqueeze(1) & active,
+            torch.maximum(env._so101_pm_max_object_displacement_m, displacement),
+            env._so101_pm_max_object_displacement_m,
+        )
+        lift_now = object_pos_w[..., 2] - env._so101_failure_object_pos_w[..., 2]
+        lifted = (
+            baseline_recorded.unsqueeze(1)
+            & attribution_active.unsqueeze(1)
+            & active
+            & (lift_now >= LIFT_OFF_GROUND_LIMIT_M)
+        )
+        env._so101_pm_lift_hold_steps = torch.where(
+            needs_update.unsqueeze(1) & lifted,
+            env._so101_pm_lift_hold_steps + 1,
+            torch.where(
+                needs_update.unsqueeze(1),
+                torch.zeros_like(env._so101_pm_lift_hold_steps),
+                env._so101_pm_lift_hold_steps,
+            ),
+        )
+        env._so101_pm_max_lift_hold_steps = torch.maximum(
+            env._so101_pm_max_lift_hold_steps, env._so101_pm_lift_hold_steps
+        )
+
+    current_success_counter = _task_success_counters(env)
+    env._so101_pm_max_success_counter = torch.maximum(
+        env._so101_pm_max_success_counter, current_success_counter
+    )
+    env._so101_pm_goal_hold_steps = torch.where(
+        attribution_update & goal.met,
+        env._so101_pm_goal_hold_steps + 1,
+        torch.where(
+            attribution_update,
+            torch.zeros_like(env._so101_pm_goal_hold_steps),
+            env._so101_pm_goal_hold_steps,
+        ),
+    )
+    env._so101_pm_max_goal_hold_steps = torch.maximum(
+        env._so101_pm_max_goal_hold_steps, env._so101_pm_goal_hold_steps
+    )
+    env._so101_pm_goal_ever_reached |= attribution_update & goal.met
+    env._so101_pm_final_goal_met = torch.where(
+        attribution_update, goal.met, env._so101_pm_final_goal_met
+    )
+    env._so101_pm_ever_overshot |= attribution_update & goal.overshot
+    env._so101_pm_final_overshot = torch.where(
+        attribution_update, goal.overshot, env._so101_pm_final_overshot
+    )
+    env._so101_pm_ever_inside_bin |= attribution_update.unsqueeze(1) & goal.inside_bin & active
+    for env_id in torch.nonzero(attribution_update, as_tuple=False).flatten().tolist():
+        metric = dict(goal.metrics[env_id])
+        for key, value in tuple(metric.items()):
+            if isinstance(value, float) and not math.isfinite(value):
+                metric[key] = None
+        metric["counter"] = int(current_success_counter[env_id].item())
+        env._so101_postmortem_goal_metrics[env_id] = metric
+        margin = metric.get("margin")
+        if isinstance(margin, (int, float)) and math.isfinite(float(margin)):
+            if float(margin) > float(env._so101_pm_best_goal_margin[env_id].item()):
+                env._so101_pm_best_goal_margin[env_id] = float(margin)
+                env._so101_pm_best_goal_step[env_id] = int(episode_steps[env_id].item())
+
+    # Start attempts on any active object, not only the instructed target.  The
+    # legacy max-attempt rule deliberately continues to count only eligible
+    # task objects; this all-object history is diagnostic evidence only.
+    for env_id in torch.nonzero(
+        attribution_update & grasp_step.close_cycle, as_tuple=False
+    ).flatten().tolist():
+        step = int(episode_steps[env_id].item())
+        _finish_postmortem_attempt(env, env_id, step)
+        if not bool(grasp_step.grasp_started[env_id].item()):
+            env._so101_pm_unassociated_attempt_counts[env_id] += 1
+            continue
+        object_id = int(grasp_step.nearest_active_object_ids[env_id].item())
+        env._so101_pm_attempt_counts_all[env_id, object_id] += 1
+        env._so101_pm_candidate_object_ids[env_id] = object_id
+        env._so101_pm_attempt_history[env_id].append(
+            {
+                "attempt_id": len(env._so101_pm_attempt_history[env_id]),
+                "object_id": object_id,
+                "close_step": step,
+                "end_step": None,
+                "nearest_distance_m": float(grasp_step.nearest_active_distance_m[env_id].item()),
+                "acquired": False,
+                "acquisition_step": None,
+                "released": False,
+                "dropped": False,
+                "associated_transport_m": 0.0,
+                "max_comotion_steps": 0,
+                "goal_met_during_attempt": bool(goal.met[env_id].item()),
+            }
+        )
+
+    for env_id in torch.nonzero(attribution_update, as_tuple=False).flatten().tolist():
+        step = int(episode_steps[env_id].item())
+        candidate_id = int(env._so101_pm_candidate_object_ids[env_id].item())
+        if candidate_id < 0:
+            continue
+        if bool(grasp_step.jaw_is_open[env_id].item()):
+            _finish_postmortem_attempt(env, env_id, step, released=True)
+            continue
+
+        candidate_comoving = bool(co_motion[env_id, candidate_id].item()) and not bool(
+            grasp_step.close_cycle[env_id].item()
+        )
+        if candidate_comoving:
+            env._so101_pm_candidate_comotion_steps[env_id] += 1
+            env._so101_pm_candidate_transport_m[env_id] += object_step_m[env_id, candidate_id]
+            env._so101_pm_candidate_segment_transport_m[env_id] += object_step_m[
+                env_id, candidate_id
+            ]
+        else:
+            env._so101_pm_candidate_comotion_steps[env_id] = 0
+            env._so101_pm_candidate_segment_transport_m[env_id] = 0.0
+        env._so101_pm_candidate_max_comotion_steps[env_id] = torch.maximum(
+            env._so101_pm_candidate_max_comotion_steps[env_id],
+            env._so101_pm_candidate_comotion_steps[env_id],
+        )
+        sustained_comotion = (
+            int(env._so101_pm_candidate_comotion_steps[env_id].item())
+            >= POSTMORTEM_ACQUISITION_HOLD_STEPS
+            and float(env._so101_pm_candidate_segment_transport_m[env_id].item())
+            >= POSTMORTEM_ACQUISITION_TRANSPORT_M
+        )
+        sustained_associated_lift = (
+            int(env._so101_pm_lift_hold_steps[env_id, candidate_id].item())
+            >= POSTMORTEM_ACQUISITION_HOLD_STEPS
+            and float(object_ee_distance[env_id, candidate_id].item()) <= object_distance_threshold * 1.5
+        )
+        newly_acquired = (sustained_comotion or sustained_associated_lift) and not bool(
+            env._so101_pm_candidate_acquired[env_id].item()
+        )
+        if newly_acquired:
+            env._so101_pm_candidate_acquired[env_id] = True
+            env._so101_pm_acquired_objects[env_id, candidate_id] = True
+            env._so101_pm_manipulated_objects[env_id, candidate_id] = True
+            env._so101_pm_acquisition_counts[env_id, candidate_id] += 1
+            attempt = env._so101_pm_attempt_history[env_id][-1]
+            attempt["acquired"] = True
+            attempt["acquisition_step"] = step
+        if bool(env._so101_pm_candidate_acquired[env_id].item()) and candidate_comoving:
+            env._so101_pm_post_acquisition_transport_m[env_id, candidate_id] += object_step_m[
+                env_id, candidate_id
+            ]
+
+        attempt = env._so101_pm_attempt_history[env_id][-1]
+        attempt["goal_met_during_attempt"] |= bool(goal.met[env_id].item())
+        attempt["associated_transport_m"] = float(env._so101_pm_candidate_transport_m[env_id].item())
+        attempt["max_comotion_steps"] = int(env._so101_pm_candidate_max_comotion_steps[env_id].item())
+
+        # World-frame relative-vector drift is not a reliable grasp-loss test:
+        # coordinated wrist/object rotation changes that vector even for a
+        # rigid grasp.  Require sustained spatial separation corroborated by
+        # loss of co-motion.
+        association_lost = (
+            float(object_ee_distance[env_id, candidate_id].item())
+            > object_distance_threshold * 2.0
+            and not candidate_comoving
+        )
+        if bool(env._so101_pm_candidate_acquired[env_id].item()) and association_lost:
+            env._so101_pm_candidate_loss_steps[env_id] += 1
+        else:
+            env._so101_pm_candidate_loss_steps[env_id] = 0
+        if int(env._so101_pm_candidate_loss_steps[env_id].item()) >= POSTMORTEM_DROP_HOLD_STEPS:
+            env._so101_pm_drop_counts[env_id, candidate_id] += 1
+            _finish_postmortem_attempt(env, env_id, step, dropped=True)
+
+    env._so101_pm_prev_object_pos_w = torch.where(
+        needs_update.view(-1, 1, 1), object_pos_w, env._so101_pm_prev_object_pos_w
+    )
+    env._so101_pm_prev_ee_pos_w = torch.where(
+        needs_update.unsqueeze(1), ee_pos_w, env._so101_pm_prev_ee_pos_w
+    )
+    env._so101_pm_has_prev_sample |= needs_update
+    env._so101_pm_last_episode_step = torch.where(needs_update, episode_steps, previous_steps)
+    env._so101_pm_tracker_available = True
+
+
+def _legacy_postmortem_type(
+    task_family: str,
+    target_lift: float,
+    max_non_target_lift: float,
+    lift_threshold: float,
+) -> str:
+    if task_family == TASK_BIN:
+        return POSTMORTEM_NOT_APPLICABLE
+    if target_lift >= lift_threshold:
+        return POSTMORTEM_PLACEMENT
+    if max_non_target_lift >= lift_threshold:
+        return POSTMORTEM_SEMANTIC
+    return POSTMORTEM_FAILED_GRASP
+
+
+def _attempt_diagnostics(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    env_id: int,
+    target_id: int,
+) -> tuple[ManipulationAttemptDiagnostic, ...]:
+    result = []
+    for attempt in getattr(env, "_so101_pm_attempt_history", [[] for _ in range(env.num_envs)])[env_id]:
+        object_id = int(attempt["object_id"])
+        result.append(
+            ManipulationAttemptDiagnostic(
+                attempt_id=int(attempt["attempt_id"]),
+                object_id=object_id,
+                object_name=_debug_object_name(env, object_asset_names, env_id, object_id),
+                is_target=object_id == target_id,
+                close_step=int(attempt["close_step"]),
+                end_step=None if attempt["end_step"] is None else int(attempt["end_step"]),
+                nearest_distance_m=float(attempt["nearest_distance_m"]),
+                acquired=bool(attempt["acquired"]),
+                acquisition_step=(
+                    None if attempt["acquisition_step"] is None else int(attempt["acquisition_step"])
+                ),
+                released=bool(attempt["released"]),
+                dropped=bool(attempt["dropped"]),
+                associated_transport_m=float(attempt["associated_transport_m"]),
+                max_comotion_steps=int(attempt["max_comotion_steps"]),
+                goal_met_during_attempt=bool(attempt["goal_met_during_attempt"]),
+            )
+        )
+    return tuple(result)
 
 
 def benchmark_postmortem_failure_diagnostics(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
     lift_threshold: float = LIFT_OFF_GROUND_LIMIT_M,
+    confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
 ) -> list[PostmortemFailureDiagnostic]:
-    """Classify each non-bin episode into exactly one postmortem failure type.
+    """Attribute outcomes from attempts, acquisition, co-motion, progress, and goal history.
 
-    The classification is a decision tree over how far each active object was lifted
-    clear of the table during the episode (tracked by :func:`_update_max_object_lift`):
-
-    * the target was lifted >= ``lift_threshold`` -> ``placement`` (the robot grasped
-      the correct object but settled it in the wrong place);
-    * the target was not lifted but some distractor was -> ``semantic`` (the robot
-      lifted the wrong object);
-    * nothing was lifted high enough -> ``failed_grasp``.
-
-    Bin episodes return ``not_applicable`` (the three types are defined for the
-    instruction-following families only). Callers decide whether to keep the label --
-    a confirmed success is not a failure, so the label is only meaningful for episodes
-    that did not succeed.
+    The classifier uses lift only as supporting evidence.  If called on an old
+    environment/log that has no version-2 tracker, it returns the historical
+    lift-only ``failure_type`` with low confidence so existing consumers remain
+    functional and can identify the fallback from ``classification_version``.
     """
 
     diagnostics: list[PostmortemFailureDiagnostic] = []
@@ -1706,45 +2702,359 @@ def benchmark_postmortem_failure_diagnostics(
     max_lift = getattr(env, "_so101_max_object_lift", None)
     active = _active_mask(env, object_asset_names)
     target_ids = _target_indices(env)
+    tracker_available = bool(getattr(env, "_so101_pm_tracker_available", False))
+    success_counters = _task_success_counters(env)
+    default_required_success_steps = _confirmation_steps(env, confirm_time_s) if tracker_available else 0
+    configured_required_steps = getattr(env, "_so101_success_confirmation_required_steps", None)
+    confirmed_current_state = getattr(env, "_so101_success_confirmed_current", None)
+    ever_confirmed_state = getattr(env, "_so101_success_ever_confirmed", None)
+
     for env_id in range(env.num_envs):
         task_family = task_families[env_id] if task_families is not None else TASK_BIN
         target_id = int(target_ids[env_id].item())
         target_object = _debug_object_name(env, object_asset_names, env_id, target_id)
-        if task_family == TASK_BIN or max_lift is None:
-            diagnostics.append(
-                PostmortemFailureDiagnostic(
-                    env_id=env_id,
-                    task_family=task_family,
-                    failure_type=POSTMORTEM_NOT_APPLICABLE if task_family == TASK_BIN else POSTMORTEM_NONE,
-                    target_object=target_object,
-                    target_lift_m=0.0,
-                    lifted_wrong_object="none",
-                    max_non_target_lift_m=0.0,
-                    lift_threshold_m=lift_threshold,
-                )
-            )
-            continue
-
-        target_lift = float(max_lift[env_id, target_id].item())
+        target_lift = 0.0 if max_lift is None else float(max_lift[env_id, target_id].item())
         max_non_target_lift = 0.0
         lifted_wrong_object = "none"
         for object_id in torch.nonzero(active[env_id], as_tuple=False).flatten().tolist():
             if object_id == target_id:
                 continue
-            object_lift = float(max_lift[env_id, object_id].item())
+            object_lift = 0.0 if max_lift is None else float(max_lift[env_id, object_id].item())
             if object_lift > max_non_target_lift:
                 max_non_target_lift = object_lift
-                if object_lift >= lift_threshold:
-                    lifted_wrong_object = _debug_object_name(env, object_asset_names, env_id, object_id)
+                lifted_wrong_object = (
+                    _debug_object_name(env, object_asset_names, env_id, object_id)
+                    if object_lift >= lift_threshold
+                    else "none"
+                )
+        legacy_type = _legacy_postmortem_type(
+            task_family, target_lift, max_non_target_lift, lift_threshold
+        )
 
-        if target_lift >= lift_threshold:
-            failure_type = POSTMORTEM_PLACEMENT
-        elif max_non_target_lift >= lift_threshold:
-            failure_type = POSTMORTEM_SEMANTIC
+        if not tracker_available:
+            diagnostics.append(
+                PostmortemFailureDiagnostic(
+                    env_id=env_id,
+                    task_family=task_family,
+                    failure_type=legacy_type,
+                    target_object=target_object,
+                    target_lift_m=target_lift,
+                    lifted_wrong_object=lifted_wrong_object,
+                    max_non_target_lift_m=max_non_target_lift,
+                    lift_threshold_m=lift_threshold,
+                    classification_version=1,
+                    legacy_failure_type=legacy_type,
+                    confidence=0.25,
+                    rationale="Legacy fallback: temporal manipulation evidence was unavailable.",
+                    target_semantics_applicable=task_family != TASK_BIN,
+                    evidence={"temporal_evidence_available": False},
+                )
+            )
+            continue
+
+        attempts_all = env._so101_pm_attempt_counts_all[env_id]
+        acquired_all = env._so101_pm_acquired_objects[env_id]
+        manipulated_all = env._so101_pm_manipulated_objects[env_id]
+        target_attempts = int(attempts_all[target_id].item())
+        wrong_mask = active[env_id].clone()
+        if task_family == TASK_BIN:
+            # Every active bin object is an intended target.  Treating the
+            # arbitrary metadata target slot as the only correct one produced
+            # spurious ``wrong_object_targeted`` evidence for valid bin work.
+            wrong_mask.zero_()
+            associated_attempts = int(attempts_all[active[env_id]].sum().item())
         else:
-            failure_type = POSTMORTEM_FAILED_GRASP
-            lifted_wrong_object = "none"
+            wrong_mask[target_id] = False
+            associated_attempts = target_attempts + int(attempts_all[wrong_mask].sum().item())
+        wrong_attempts = int(attempts_all[wrong_mask].sum().item())
+        unassociated_attempts = int(env._so101_pm_unassociated_attempt_counts[env_id].item())
+        target_acquired = bool(acquired_all[target_id].item())
+        wrong_acquired = bool(torch.any(acquired_all & wrong_mask).item())
+        target_manipulated = bool(manipulated_all[target_id].item())
+        wrong_manipulated = bool(torch.any(manipulated_all & wrong_mask).item())
+        target_displacement = float(env._so101_pm_max_object_displacement_m[env_id, target_id].item())
+        target_transport = float(env._so101_pm_associated_transport_m[env_id, target_id].item())
+        target_post_acquisition_transport = float(
+            env._so101_pm_post_acquisition_transport_m[env_id, target_id].item()
+        )
+        target_drop_count = int(env._so101_pm_drop_counts[env_id, target_id].item())
+        target_release_count = int(env._so101_pm_release_counts[env_id, target_id].item())
+        goal_ever_reached = bool(env._so101_pm_goal_ever_reached[env_id].item())
+        max_goal_hold = int(env._so101_pm_max_goal_hold_steps[env_id].item())
+        final_goal_met = bool(env._so101_pm_final_goal_met[env_id].item())
+        if isinstance(configured_required_steps, torch.Tensor):
+            required_success_steps = int(configured_required_steps[env_id].item())
+        elif isinstance(configured_required_steps, int):
+            required_success_steps = configured_required_steps
+        else:
+            required_success_steps = default_required_success_steps
+        max_success_counter = max(
+            int(env._so101_pm_max_success_counter[env_id].item()),
+            int(success_counters[env_id].item()),
+        )
+        # Once task_success has persisted its age/failure-gated result, that is
+        # authoritative.  Raw counters alone can cross the threshold while an
+        # age gate or live failure rule still makes success false.
+        if isinstance(ever_confirmed_state, torch.Tensor):
+            goal_ever_confirmed = bool(ever_confirmed_state[env_id].item())
+        else:
+            goal_ever_confirmed = max_success_counter >= required_success_steps
+        if isinstance(confirmed_current_state, torch.Tensor):
+            goal_confirmed_current = bool(confirmed_current_state[env_id].item())
+        else:
+            goal_confirmed_current = int(success_counters[env_id].item()) >= required_success_steps
+        meaningful_goal_steps = max(
+            2, math.ceil(POSTMORTEM_MEANINGFUL_GOAL_HOLD_TIME_S / _env_step_dt(env))
+        )
+        meaningful_goal_reached = max_goal_hold >= meaningful_goal_steps
+        ever_overshot = bool(env._so101_pm_ever_overshot[env_id].item())
+        final_overshot = bool(env._so101_pm_final_overshot[env_id].item())
+        timeout_confirmation = bool(
+            getattr(
+                env,
+                "_so101_timeout_success_confirmation_failed",
+                torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            )[env_id].item()
+        )
+        failure_reason = (
+            getattr(env, "_so101_failure_reasons", [FAILURE_REASON_NONE] * env.num_envs)[env_id]
+        )
+        raw_failure_state = getattr(env, "_so101_failure_conditions_active", None)
+        raw_failure_active = bool(
+            raw_failure_state[env_id].item()
+            if isinstance(raw_failure_state, torch.Tensor)
+            else False
+        )
+        raw_failure_reasons_state = getattr(
+            env,
+            "_so101_failure_conditions_active_reasons",
+            [tuple() for _ in range(env.num_envs)],
+        )
+        raw_failure_reasons = tuple(raw_failure_reasons_state[env_id])
+        live_overshot = FAILURE_REASON_MOVE_PAST_BOUNDARY in str(failure_reason).split("+")
 
+        secondary: list[str] = []
+        if wrong_acquired:
+            secondary.append("wrong_object_acquired")
+        elif wrong_manipulated:
+            secondary.append("distractor_manipulated")
+        if task_family != TASK_BIN and max_non_target_lift >= lift_threshold:
+            secondary.append("wrong_object_lifted_or_disturbed")
+        if task_family != TASK_BIN and target_drop_count:
+            secondary.append("target_dropped")
+        if task_family != TASK_BIN and target_release_count:
+            secondary.append("target_released")
+        if meaningful_goal_reached and not final_goal_met:
+            secondary.append("goal_was_transient")
+        if target_lift >= lift_threshold:
+            secondary.append("target_lifted")
+        if ever_overshot and not final_overshot:
+            secondary.append("transient_overshoot_recovered")
+        for reason in str(failure_reason).split("+"):
+            if reason and reason != FAILURE_REASON_NONE:
+                secondary.append(f"live_rule:{reason}")
+        confirmed_failure_reasons = set(str(failure_reason).split("+"))
+        for reason in raw_failure_reasons:
+            if reason and reason not in confirmed_failure_reasons:
+                secondary.append(f"raw_live_rule:{reason}")
+
+        any_attempts = associated_attempts + unassociated_attempts
+        live_rule_violation = failure_reason != FAILURE_REASON_NONE or raw_failure_active
+        if goal_confirmed_current and final_goal_met and not live_rule_violation:
+            failure_type = POSTMORTEM_NONE
+            confidence = 1.0
+            rationale = "The task goal reached its confirmation threshold and remained met."
+        elif task_family == TASK_MOVE and (final_overshot or live_overshot):
+            failure_type = POSTMORTEM_GOAL_OVERSHOT
+            confidence = 0.99
+            rationale = "The target crossed beyond the assigned move boundary."
+        elif timeout_confirmation:
+            failure_type = POSTMORTEM_TIMEOUT_DURING_CONFIRMATION
+            confidence = 0.98
+            rationale = "A goal confirmation was in progress at timeout and then breached."
+        elif final_goal_met and live_rule_violation:
+            failure_type = POSTMORTEM_GOAL_REACHED_WITH_RULE_VIOLATION
+            confidence = 0.98
+            active_rule_names = raw_failure_reasons or tuple(
+                reason
+                for reason in str(failure_reason).split("+")
+                if reason and reason != FAILURE_REASON_NONE
+            )
+            active_rule_text = ", ".join(active_rule_names) if active_rule_names else "unknown rule"
+            rationale = (
+                "Final goal geometry was met, but an active benchmark rule made the state "
+                f"ineligible for success: {active_rule_text}."
+            )
+        elif final_goal_met and not goal_confirmed_current:
+            failure_type = POSTMORTEM_GOAL_REACHED_BUT_UNCONFIRMED
+            confidence = 0.98
+            rationale = (
+                f"Final goal geometry was met, but confirmation held for only "
+                f"{max_success_counter}/{required_success_steps} required steps."
+            )
+        elif task_family != TASK_BIN and target_drop_count > 0 and not final_goal_met:
+            failure_type = POSTMORTEM_TARGET_DROPPED
+            confidence = 0.88
+            rationale = (
+                "The acquired target became spatially separated from the end effector and lost sustained "
+                "co-motion before reaching a stable goal."
+            )
+        elif task_family != TASK_BIN and target_release_count > 0 and not final_goal_met:
+            failure_type = POSTMORTEM_TARGET_RELEASED_OUTSIDE_GOAL
+            confidence = 0.9
+            rationale = (
+                "The acquired target was released, but the task goal was not met at the final state."
+            )
+        elif (
+            goal_ever_confirmed
+            and not goal_confirmed_current
+        ) or (meaningful_goal_reached and not final_goal_met):
+            failure_type = POSTMORTEM_GOAL_REACHED_BUT_UNSTABLE
+            confidence = 0.95 if goal_ever_confirmed else 0.85
+            rationale = "Goal geometry was sustained during the episode but was not preserved."
+        elif task_family == TASK_BIN:
+            active_count = int(active[env_id].sum().item())
+            manipulated_count = int((manipulated_all & active[env_id]).sum().item())
+            acquired_count = int((acquired_all & active[env_id]).sum().item())
+            ever_inside_count = int(env._so101_pm_ever_inside_bin[env_id, active[env_id]].sum().item())
+            if any_attempts == 0 and manipulated_count == 0:
+                failure_type = POSTMORTEM_NO_MANIPULATION_ATTEMPT
+                confidence = 0.92
+                rationale = "No active object had a jaw-close attempt or sustained near-EE co-motion."
+            elif manipulated_count == 0 and acquired_count == 0:
+                failure_type = POSTMORTEM_OBJECT_ACQUISITION_FAILED
+                confidence = min(0.9, 0.66 + 0.06 * any_attempts)
+                rationale = (
+                    f"{any_attempts} object-associated attempt(s) occurred, but no active bin object had "
+                    "sustained acquisition or manipulation evidence."
+                )
+            elif active_count == 1:
+                failure_type = POSTMORTEM_GOAL_NOT_REACHED
+                confidence = 0.9
+                rationale = "The required bin object was manipulated but never reached a confirmed bin goal."
+            else:
+                failure_type = POSTMORTEM_INCOMPLETE_MULTI_OBJECT_TASK
+                confidence = 0.92
+                rationale = (
+                    f"Multi-object bin progress was incomplete: manipulated {manipulated_count}/{active_count}, "
+                    f"acquired {acquired_count}/{active_count}, and ever inside {ever_inside_count}/{active_count}."
+                )
+        elif (wrong_acquired or wrong_manipulated) and not (target_acquired or target_manipulated):
+            failure_type = POSTMORTEM_WRONG_OBJECT_TARGETED
+            confidence = 0.86 if wrong_acquired else 0.76
+            rationale = (
+                "A non-target object had sustained gripper-associated motion while the target was never acquired "
+                "or meaningfully manipulated."
+            )
+        elif target_attempts > 0 and not (target_acquired or target_manipulated):
+            failure_type = POSTMORTEM_TARGET_ACQUISITION_FAILED
+            confidence = min(0.92, 0.68 + 0.08 * target_attempts)
+            rationale = "The gripper closed near the target, but no sustained target/EE co-motion followed."
+        elif (
+            target_acquired
+            and target_post_acquisition_transport < POSTMORTEM_MIN_ASSOCIATED_TRANSPORT_M
+        ):
+            failure_type = POSTMORTEM_TRANSPORT_FAILED
+            confidence = 0.86
+            rationale = "The target was acquired but had less than 1 cm of post-acquisition co-motion."
+        elif target_acquired or target_manipulated:
+            failure_type = POSTMORTEM_GOAL_NOT_REACHED
+            confidence = 0.88
+            rationale = "The target was meaningfully manipulated, but task geometry never held at the goal."
+        elif any_attempts == 0:
+            failure_type = POSTMORTEM_NO_MANIPULATION_ATTEMPT
+            confidence = 0.92
+            rationale = "No jaw-close attempt or sustained near-EE object motion was observed."
+        else:
+            failure_type = POSTMORTEM_AMBIGUOUS
+            confidence = 0.35
+            rationale = "The available attempt and motion evidence conflicts or is too weak for a precise stage label."
+
+        wrong_object_ids = torch.nonzero(wrong_mask, as_tuple=False).flatten().tolist()
+        strongest_wrong_id = None
+        if wrong_object_ids:
+            strongest_wrong_id = max(
+                wrong_object_ids,
+                key=lambda object_id: (
+                    int(acquired_all[object_id].item()),
+                    float(env._so101_pm_associated_transport_m[env_id, object_id].item()),
+                    int(attempts_all[object_id].item()),
+                ),
+            )
+        active_ids = torch.nonzero(active[env_id], as_tuple=False).flatten().tolist()
+        ever_inside_ids = [
+            object_id for object_id in active_ids if bool(env._so101_pm_ever_inside_bin[env_id, object_id].item())
+        ]
+        never_manipulated_ids = [
+            object_id for object_id in active_ids if not bool(manipulated_all[object_id].item())
+        ]
+        best_goal_margin = float(env._so101_pm_best_goal_margin[env_id].item())
+        policy_control_state = getattr(env, "_so101_policy_control_active", None)
+        if not isinstance(policy_control_state, torch.Tensor):
+            policy_control_state = getattr(env, "_so101_robot_started_moving", None)
+        evidence = {
+            "temporal_evidence_available": True,
+            "policy_control_active_at_classification": (
+                bool(policy_control_state[env_id].item())
+                if isinstance(policy_control_state, torch.Tensor)
+                else None
+            ),
+            "policy_control_start_step": int(
+                getattr(
+                    env,
+                    "_so101_robot_start_step",
+                    torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
+                )[env_id].item()
+            ),
+            "attempt_count_by_object": tuple(int(value) for value in attempts_all.tolist()),
+            "active_object_attempt_count": associated_attempts,
+            "unassociated_attempt_count": unassociated_attempts,
+            "acquisition_count_by_object": tuple(
+                int(value) for value in env._so101_pm_acquisition_counts[env_id].tolist()
+            ),
+            "manipulated_object_ids": tuple(
+                object_id for object_id in active_ids if bool(manipulated_all[object_id].item())
+            ),
+            "max_displacement_m_by_object": tuple(
+                float(value) for value in env._so101_pm_max_object_displacement_m[env_id].tolist()
+            ),
+            "associated_transport_m_by_object": tuple(
+                float(value) for value in env._so101_pm_associated_transport_m[env_id].tolist()
+            ),
+            "maximum_contiguous_interaction_transport_m_by_object": tuple(
+                float(value)
+                for value in env._so101_pm_max_interaction_segment_transport_m[env_id].tolist()
+            ),
+            "post_acquisition_transport_m_by_object": tuple(
+                float(value)
+                for value in env._so101_pm_post_acquisition_transport_m[env_id].tolist()
+            ),
+            "max_lift_hold_steps_by_object": tuple(
+                int(value) for value in env._so101_pm_max_lift_hold_steps[env_id].tolist()
+            ),
+            "drop_count_by_object": tuple(int(value) for value in env._so101_pm_drop_counts[env_id].tolist()),
+            "release_count_by_object": tuple(
+                int(value) for value in env._so101_pm_release_counts[env_id].tolist()
+            ),
+            "strongest_wrong_object_id": strongest_wrong_id,
+            "strongest_wrong_object": (
+                "none"
+                if strongest_wrong_id is None
+                else _debug_object_name(env, object_asset_names, env_id, strongest_wrong_id)
+            ),
+            "goal_required_confirmation_steps": required_success_steps,
+            "goal_meaningful_hold_steps": meaningful_goal_steps,
+            "max_success_counter": max_success_counter,
+            "best_goal_margin": best_goal_margin if math.isfinite(best_goal_margin) else None,
+            "best_goal_step": int(env._so101_pm_best_goal_step[env_id].item()),
+            "current_goal_metric": dict(env._so101_postmortem_goal_metrics[env_id]),
+            "ever_inside_bin_object_ids": tuple(ever_inside_ids),
+            "never_manipulated_object_ids": tuple(never_manipulated_ids),
+            "target_vs_wrong_semantics_applicable": task_family != TASK_BIN,
+            "live_failure_reason": str(failure_reason),
+            "raw_live_failure_active": raw_failure_active,
+            "raw_live_failure_reasons": raw_failure_reasons,
+        }
         diagnostics.append(
             PostmortemFailureDiagnostic(
                 env_id=env_id,
@@ -1755,6 +3065,28 @@ def benchmark_postmortem_failure_diagnostics(
                 lifted_wrong_object=lifted_wrong_object,
                 max_non_target_lift_m=max_non_target_lift,
                 lift_threshold_m=lift_threshold,
+                legacy_failure_type=legacy_type,
+                confidence=confidence,
+                secondary_failure_types=tuple(dict.fromkeys(secondary)),
+                rationale=rationale,
+                target_semantics_applicable=task_family != TASK_BIN,
+                target_attempt_count=target_attempts,
+                wrong_object_attempt_count=wrong_attempts,
+                unassociated_attempt_count=unassociated_attempts,
+                target_acquired=target_acquired,
+                wrong_object_acquired=wrong_acquired,
+                target_manipulated=target_manipulated,
+                target_max_displacement_m=target_displacement,
+                target_associated_transport_m=target_transport,
+                target_post_acquisition_transport_m=target_post_acquisition_transport,
+                target_drop_count=target_drop_count,
+                target_release_count=target_release_count,
+                goal_ever_reached=goal_ever_reached,
+                goal_ever_confirmed=goal_ever_confirmed,
+                max_goal_hold_steps=max_goal_hold,
+                final_goal_met=final_goal_met,
+                attempts=_attempt_diagnostics(env, object_asset_names, env_id, target_id),
+                evidence=evidence,
             )
         )
     return diagnostics
@@ -1790,9 +3122,10 @@ def benchmark_failure(
     The term covers the measurable simulator-side rules: max grasp attempts,
     bin displacement, non-target object displacement, moved move-boundaries,
     move trajectory straightness, and contact between the currently grasped
-    object and another tabletop object.
-    Qualitative labels such as semantic error and bad grasp strategy remain
-    annotation categories rather than automatic simulator events.
+    object and another tabletop object. Passing a Move boundary is permitted;
+    the boundary goal now has only a strict two-inch maximum signed gap.
+    These live rules remain separate from the evidence-based postmortem stage
+    attribution, which is diagnostic only and never terminates an episode.
     """
 
     if not hasattr(env, "_so101_initial_object_pos_w"):
@@ -1804,7 +3137,7 @@ def benchmark_failure(
 
     step_state = _termination_step_state(env, object_asset_names)
     object_pos_w = step_state.positions
-    _update_grasp_attempts(
+    grasp_step = _update_grasp_attempts(
         env,
         object_asset_names=object_asset_names,
         robot_cfg=robot_cfg,
@@ -1823,10 +3156,19 @@ def benchmark_failure(
         baseline_time_s=displacement_baseline_time_s,
     )
     _update_max_object_lift(env, object_asset_names, object_pos_w, baseline_recorded)
-    # Recomputed every step from the running max lift so that, on the step an episode
-    # ends, the latest classification is already stored before the env auto-resets and
-    # zeros the lift buffer -- mirroring how _so101_failure_reasons survives reset.
-    env._so101_postmortem_failure_diagnostics = benchmark_postmortem_failure_diagnostics(env, object_asset_names)
+    if grasp_step is not None:
+        _update_postmortem_evidence(
+            env,
+            object_asset_names=object_asset_names,
+            bin_name=bin_name,
+            table_bounds=table_bounds,
+            step_state=step_state,
+            grasp_step=grasp_step,
+            baseline_recorded=baseline_recorded,
+            object_distance_threshold=grasp_attempt_object_distance,
+            move_straightness_tolerance=move_straightness_tolerance,
+            move_past_boundary_tolerance=move_past_boundary_tolerance,
+        )
 
     active = _active_mask(env, object_asset_names)
     # The close that raises a target count to three is still a usable attempt.
@@ -1901,24 +3243,14 @@ def benchmark_failure(
                     abs(current_surface_coord - float(env._so101_move_boundary_coords[env_id].item()))
                     > boundary_displacement_limit
                 )
-        distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
+        _distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
             env, object_asset_names, table_bounds, step_state
         )
         move_task = _task_is(env, TASK_MOVE)
-        # A target driven past its boundary must settle there for the confirmation window
-        # rather than glancing past in mid-flight: only a held, settled overshoot counts as
-        # a failure, mirroring the straightness confirmation below.
-        instant_move_past_boundary = (
-            (env._so101_move_boundary_ids >= 0)
-            & (distance_to_boundary < -move_past_boundary_tolerance)
-            & move_task
-        )
-        move_past_boundary = _held_failure(
-            env,
-            "_so101_move_past_boundary_failure_counter",
-            instant_move_past_boundary,
-            move_past_boundary_failure_confirm_time_s,
-        )
+        # Passing the boundary is no longer a failure; the Move goal has only a maximum
+        # signed gap. Keep the legacy counter cleared for outcome-schema compatibility.
+        if hasattr(env, "_so101_move_past_boundary_failure_counter"):
+            env._so101_move_past_boundary_failure_counter.zero_()
         # Current (not running-max) deviation: a transient swing that recovers no longer
         # latches a permanent straightness failure. It must be held long enough to
         # count as a settled bad final position rather than an in-flight detour.
@@ -1945,7 +3277,7 @@ def benchmark_failure(
     )
 
     made_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if active_families & {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
+    if active_families & {TASK_NAMED_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
         made_contact = grasped_object_contact_exceeded_grace_period(
             env, object_asset_names, step_state, contact_grace_time_s
         ) & (~_task_is(env, TASK_BIN))
@@ -1966,6 +3298,27 @@ def benchmark_failure(
         | made_contact
         | timeout_confirmation_failure
     )
+    raw_reason_masks = (
+        (FAILURE_REASON_MAX_GRASP_ATTEMPTS, instant_attempt_failure),
+        (FAILURE_REASON_BIN_DISPLACED, instant_bin_failure),
+        (FAILURE_REASON_NON_TARGET_MOVED, instant_non_target_moved & instruction_task),
+        (FAILURE_REASON_MOVE_BOUNDARY_MOVED, instant_move_boundary_failure),
+        (FAILURE_REASON_MOVE_PAST_BOUNDARY, instant_move_past_boundary),
+        (
+            FAILURE_REASON_MOVE_TRAJECTORY_NOT_STRAIGHT_ENOUGH,
+            instant_move_trajectory_not_straight_enough,
+        ),
+        (FAILURE_REASON_MADE_CONTACT, made_contact),
+        (FAILURE_REASON_SUCCESS_CONFIRMATION_BREACHED, timeout_confirmation_failure),
+    )
+    env._so101_failure_conditions_active_reasons = [
+        tuple(
+            reason
+            for reason, mask in raw_reason_masks
+            if bool(mask[env_id].item())
+        )
+        for env_id in range(env.num_envs)
+    ]
 
     failure = (
         attempt_failure
@@ -2000,6 +3353,13 @@ def benchmark_failure(
         if bool(timeout_confirmation_failure[env_id].item()):
             reasons.append(FAILURE_REASON_SUCCESS_CONFIRMATION_BREACHED)
         env._so101_failure_reasons[env_id] = "+".join(reasons)
+
+    # Recompute after live reasons are known.  The temporal updater is guarded by
+    # ``episode_length_buf``, so collector/rescorer calls on the same final step
+    # may safely refresh this diagnostic without duplicating any evidence.
+    env._so101_postmortem_failure_diagnostics = benchmark_postmortem_failure_diagnostics(
+        env, object_asset_names
+    )
 
     return aged_failure
 
@@ -2144,31 +3504,8 @@ def _failure_diagnostics(
                 f"(failure if >{boundary_displacement_limit:.4f}m)",
             )
         )
-        distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
+        _distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
             env, object_asset_names, table_bounds, step_state
-        )
-        past_boundary_counter = getattr(env, "_so101_move_past_boundary_failure_counter", None)
-        if past_boundary_counter is None:
-            past_boundary_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-        past_boundary_required_steps = _confirmation_steps(
-            env,
-            DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S,
-        )
-        past_boundary_instant = boundary_id >= 0 and bool(
-            (distance_to_boundary[env_id] < -MOVE_PAST_BOUNDARY_TOLERANCE_M).item()
-        )
-        conditions.append(
-            _gated_failure_diagnostic(
-                "move_past_boundary",
-                past_boundary_instant
-                and int(past_boundary_counter[env_id].item()) >= past_boundary_required_steps,
-                age_ready,
-                baseline_recorded,
-                f"boundary={_debug_boundary_name(env, object_asset_names, env_id, boundary_id)}, "
-                f"distance_to_boundary={float(distance_to_boundary[env_id].item()):.4f}m "
-                f"(failure if <{-MOVE_PAST_BOUNDARY_TOLERANCE_M:.4f}m), "
-                f"held={int(past_boundary_counter[env_id].item())}/{past_boundary_required_steps} steps",
-            )
         )
         straightness_counter = getattr(env, "_so101_move_straightness_failure_counter", None)
         if straightness_counter is None:
@@ -2191,7 +3528,7 @@ def _failure_diagnostics(
             )
         )
 
-    if env._so101_task_family[env_id] in {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
+    if env._so101_task_family[env_id] in {TASK_NAMED_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
         made_contact = bool(grasped_object_made_contact(env, object_asset_names, step_state)[env_id].item())
         contact_step_counts = getattr(env, "_so101_grasped_object_contact_steps", None)
         if contact_step_counts is None:
@@ -2235,6 +3572,7 @@ def task_condition_diagnostics(
     non_target_displacement_limit: float = NON_TARGET_DISPLACEMENT_LIMIT_M,
     boundary_displacement_limit: float = BOUNDARY_DISPLACEMENT_LIMIT_M,
     contact_grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
+    move_past_boundary_tolerance: float = MOVE_PAST_BOUNDARY_TOLERANCE_M,
 ) -> list[TaskDiagnostics]:
     """Return current success and failure statuses without advancing task state."""
 

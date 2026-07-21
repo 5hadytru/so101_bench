@@ -30,9 +30,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 import types
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -154,7 +155,11 @@ _bootstrap_offline_isaaclab()
 
 from isaaclab.managers import SceneEntityCfg
 
-from so101_bench.benchmark import load_object_move_footprint_boxes
+from so101_bench.benchmark import (
+    episode_spec_from_json,
+    infer_task_family,
+    load_object_move_footprint_boxes,
+)
 from so101_bench.mdp.terminations import (
     benchmark_failure,
     task_condition_diagnostics,
@@ -163,7 +168,11 @@ from so101_bench.mdp.terminations import (
 )
 
 
-SCHEMA_VERSION = 1
+# Version of the *rescore annotation*, not the source collection record.  The
+# collector's top-level ``schema_version`` is intentionally preserved when a
+# record is copied below so schema-v1 and schema-v2 collections remain
+# distinguishable after rescoring.
+RESCORE_SCHEMA_VERSION = 2
 SUCCESS_LABEL_FIELDS = ("success", "failure_reason", "reason", "eval")
 
 
@@ -176,9 +185,16 @@ SUCCESS_LABEL_FIELDS = ("success", "failure_reason", "reason", "eval")
 class _Data:
     root_pos_w: torch.Tensor | None = None
     root_quat_w: torch.Tensor | None = None
+    root_lin_vel_w: torch.Tensor | None = None
+    root_ang_vel_w: torch.Tensor | None = None
     joint_pos: torch.Tensor | None = None
+    joint_vel: torch.Tensor | None = None
+    applied_torque: torch.Tensor | None = None
     joint_pos_limits: torch.Tensor | None = None
     target_pos_w: torch.Tensor | None = None
+    target_quat_w: torch.Tensor | None = None
+    target_lin_vel_w: torch.Tensor | None = None
+    target_ang_vel_w: torch.Tensor | None = None
 
 
 class _Asset:
@@ -363,6 +379,201 @@ def _now_stamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _jsonable(value: Any) -> Any:
+    """Recursively convert scorer state into plain JSON-compatible values.
+
+    Failure diagnostics are dataclasses today, but keeping this conversion
+    deliberately permissive lets a richer classifier add tensors, NumPy
+    scalars, mappings, or nested dataclasses without coupling this script to a
+    particular diagnostic schema.
+    """
+
+    if value.__class__.__name__ == "SceneEntityCfg" and hasattr(value, "name"):
+        payload = {"__scene_entity_cfg__": True, "name": str(value.name)}
+        for field_name in ("joint_names", "body_names"):
+            field_value = getattr(value, field_name, None)
+            if field_value is not None:
+                payload[field_name] = _jsonable(field_value)
+        return payload
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return [_jsonable(item) for item in sorted(value, key=repr)]
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, torch.Tensor):
+        return _jsonable(value.detach().cpu().tolist())
+    if isinstance(value, np.ndarray):
+        return _jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return _jsonable(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _postmortem_failure_diagnostics(env: StubEnv) -> list[dict[str, Any]]:
+    """Return the latest diagnostics produced by ``benchmark_failure``.
+
+    Old rule implementations and episodes lacking sufficient evidence may not
+    create the attribute.  Treat that as an empty result rather than making
+    schema-v1 trajectories unrescorable.
+    """
+
+    raw = getattr(env, "_so101_postmortem_failure_diagnostics", None)
+    if raw is None:
+        return []
+    converted = _jsonable(raw)
+    if isinstance(converted, list):
+        return converted
+    return [converted]
+
+
+def _postmortem_failure_type(value: Any) -> str | None:
+    """Extract either the legacy or richer classifier's primary label."""
+
+    if isinstance(value, list):
+        value = value[0] if len(value) == 1 else None
+    if not isinstance(value, dict):
+        return None
+    for field in ("primary_failure", "failure_type", "primary_failure_type"):
+        label = value.get(field)
+        if label:
+            return str(label)
+    return None
+
+
+def _single_env_postmortem_raw(diagnostics: list[dict[str, Any]]) -> Any:
+    """Match the collector's single-environment postmortem extraction."""
+
+    if not diagnostics:
+        return None
+    if len(diagnostics) == 1:
+        return diagnostics[0]
+    return diagnostics
+
+
+def _failure_attribution_from_raw(
+    raw: Any,
+    *,
+    label: dict[str, Any],
+    basis: str,
+) -> dict[str, Any]:
+    """Gate behavioral attribution against the label whose state it explains."""
+
+    raw = _jsonable(raw)
+    raw_type = _postmortem_failure_type(raw)
+    applicable = bool(
+        not label["success"]
+        and raw is not None
+        and raw_type not in {"none", "not_applicable"}
+    )
+    return {
+        "basis": basis,
+        "live_failure_reason": label["failure_reason"],
+        "applicable": applicable,
+        "postmortem": raw if applicable else None,
+        "postmortem_raw": raw,
+        "suppressed_reason": (
+            "episode_succeeded"
+            if label["success"]
+            else "classifier_not_applicable"
+            if not applicable
+            else None
+        ),
+    }
+
+
+def _optional_trajectory_frame(
+    trajectory: np.lib.npyio.NpzFile,
+    frame: int,
+    *field_names: str,
+) -> np.ndarray | None:
+    """Read the first available optional schema-v2 field for one frame."""
+
+    available = set(trajectory.files)
+    for field_name in field_names:
+        if field_name in available:
+            return trajectory[field_name][frame]
+    return None
+
+
+def _optional_finite_trajectory_frame(
+    trajectory: np.lib.npyio.NpzFile,
+    frame: int,
+    *field_names: str,
+) -> np.ndarray | None:
+    """Read the first available all-finite field, allowing saved fallbacks."""
+
+    available = set(trajectory.files)
+    for field_name in field_names:
+        if field_name not in available:
+            continue
+        value = trajectory[field_name][frame]
+        try:
+            if np.all(np.isfinite(value)):
+                return value
+        except TypeError:
+            continue
+    return None
+
+
+def _trajectory_action_phase(
+    trajectory: np.lib.npyio.NpzFile,
+    frame: int,
+) -> str | None:
+    """Return a schema-v2 sample phase, preserving schema-v1 behavior.
+
+    Schema-v2 collections include a reset snapshot for telemetry only.  It was
+    never passed through the collector's live termination functions, so the
+    rescorer must not treat it as a real evaluation step.  Schema-v1 files do
+    not have ``action_phase`` and intentionally retain their original replay
+    semantics.
+    """
+
+    if "action_phase" not in trajectory.files:
+        return None
+    value: Any = np.asarray(trajectory["action_phase"][frame]).reshape(-1)[0]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _trajectory_termination_evaluation_applied(
+    trajectory: np.lib.npyio.NpzFile,
+    frame: int,
+    *,
+    source_schema_version: int,
+    action_phase: str | None,
+) -> bool:
+    """Whether the collector ran termination rules for this saved frame.
+
+    New schema-v2 traces state this directly.  Early schema-v2 traces identify
+    the telemetry-only reset snapshot by phase; the step-zero fallback covers
+    transitional traces that predate both flags.  Schema v1 is never inferred
+    from step number, preserving its historical replay behavior.
+    """
+
+    if "termination_evaluation_applied" in trajectory.files:
+        value = np.asarray(trajectory["termination_evaluation_applied"][frame]).reshape(-1)[0]
+        return bool(value)
+    if "is_reset_sample" in trajectory.files:
+        value = np.asarray(trajectory["is_reset_sample"][frame]).reshape(-1)[0]
+        return not bool(value)
+    if action_phase is not None:
+        return action_phase != "reset"
+    if source_schema_version >= 2:
+        step = int(np.asarray(trajectory["step"][frame]).reshape(-1)[0])
+        return not (frame == 0 and step == 0)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Per-episode rescoring
 # ---------------------------------------------------------------------------
@@ -440,7 +651,11 @@ def _initialize_env_state(
     )
 
     # Task family / target / referent / direction
-    env._so101_task_family = [str(initial_scene["task_family"])]
+    recorded_task_family = str(initial_scene["task_family"])
+    instruction = str(initial_scene.get("instruction", "")).strip()
+    env._so101_task_family = [
+        infer_task_family(instruction) if instruction else recorded_task_family
+    ]
     env._so101_target_object_ids = _tensor(
         [int(initial_scene["target_object_id"])], dtype=torch.long, device=device
     )
@@ -479,6 +694,9 @@ def _initialize_env_state(
     env._so101_initial_object_yaws = init_object_yaws
     env._so101_initial_bin_pos_w = init_bin_pos
     env._so101_initial_bin_yaws = init_bin_yaws
+    env._so101_failure_object_pos_w = init_object_pos.clone()
+    env._so101_failure_bin_pos_w = init_bin_pos.clone()
+    env._so101_failure_baseline_recorded = torch.zeros(1, dtype=torch.bool, device=device)
 
 
 def _set_scene_state_for_step(
@@ -487,12 +705,22 @@ def _set_scene_state_for_step(
     step_index: int,
     object_pos_w: np.ndarray,
     object_yaw: np.ndarray,
+    object_quat_wxyz: np.ndarray | None,
+    object_lin_vel_w: np.ndarray | None,
+    object_ang_vel_w: np.ndarray | None,
     bin_pos_w: np.ndarray,
     bin_quat_wxyz: np.ndarray | None,
+    bin_lin_vel_w: np.ndarray | None,
+    bin_ang_vel_w: np.ndarray | None,
     bin_yaw: float,
     grasped_object_made_contact: bool,
     joint_pos: np.ndarray,
+    joint_vel: np.ndarray | None,
+    joint_effort: np.ndarray | None,
     ee_pos_w: np.ndarray,
+    ee_quat_wxyz: np.ndarray | None,
+    ee_lin_vel_w: np.ndarray | None,
+    ee_ang_vel_w: np.ndarray | None,
     object_asset_names: list[str],
     bin_name: str,
     device: torch.device,
@@ -504,8 +732,25 @@ def _set_scene_state_for_step(
         asset.data.root_pos_w = torch.tensor(
             object_pos_w[object_id], dtype=torch.float32, device=device
         ).unsqueeze(0)
-        yaw_tensor = torch.tensor(float(object_yaw[object_id]), dtype=torch.float32, device=device)
-        asset.data.root_quat_w = _yaw_to_quat_wxyz(yaw_tensor).unsqueeze(0)
+        if object_quat_wxyz is not None and np.all(np.isfinite(object_quat_wxyz[object_id])):
+            asset.data.root_quat_w = torch.tensor(
+                object_quat_wxyz[object_id], dtype=torch.float32, device=device
+            ).unsqueeze(0)
+        else:
+            yaw_tensor = torch.tensor(float(object_yaw[object_id]), dtype=torch.float32, device=device)
+            asset.data.root_quat_w = _yaw_to_quat_wxyz(yaw_tensor).unsqueeze(0)
+        if object_lin_vel_w is not None and np.all(np.isfinite(object_lin_vel_w[object_id])):
+            asset.data.root_lin_vel_w = torch.tensor(
+                object_lin_vel_w[object_id], dtype=torch.float32, device=device
+            ).unsqueeze(0)
+        else:
+            asset.data.root_lin_vel_w = None
+        if object_ang_vel_w is not None and np.all(np.isfinite(object_ang_vel_w[object_id])):
+            asset.data.root_ang_vel_w = torch.tensor(
+                object_ang_vel_w[object_id], dtype=torch.float32, device=device
+            ).unsqueeze(0)
+        else:
+            asset.data.root_ang_vel_w = None
 
     bin_asset = env.scene[bin_name]
     bin_asset.data.root_pos_w = torch.tensor(bin_pos_w, dtype=torch.float32, device=device).unsqueeze(0)
@@ -516,6 +761,18 @@ def _set_scene_state_for_step(
             torch.tensor(float(bin_yaw), dtype=torch.float32, device=device)
         ).unsqueeze(0)
     bin_asset.data.root_quat_w = bin_quat_tensor
+    if bin_lin_vel_w is not None and np.all(np.isfinite(bin_lin_vel_w)):
+        bin_asset.data.root_lin_vel_w = torch.tensor(
+            bin_lin_vel_w, dtype=torch.float32, device=device
+        ).unsqueeze(0)
+    else:
+        bin_asset.data.root_lin_vel_w = None
+    if bin_ang_vel_w is not None and np.all(np.isfinite(bin_ang_vel_w)):
+        bin_asset.data.root_ang_vel_w = torch.tensor(
+            bin_ang_vel_w, dtype=torch.float32, device=device
+        ).unsqueeze(0)
+    else:
+        bin_asset.data.root_ang_vel_w = None
     env._so101_grasped_object_made_contact_override = torch.tensor(
         [grasped_object_made_contact],
         dtype=torch.bool,
@@ -524,11 +781,39 @@ def _set_scene_state_for_step(
 
     robot = env.scene["robot"]
     robot.data.joint_pos = torch.tensor(joint_pos, dtype=torch.float32, device=device).unsqueeze(0)
+    if joint_vel is not None and np.all(np.isfinite(joint_vel)):
+        robot.data.joint_vel = torch.tensor(joint_vel, dtype=torch.float32, device=device).unsqueeze(0)
+    else:
+        robot.data.joint_vel = None
+    if joint_effort is not None and np.all(np.isfinite(joint_effort)):
+        robot.data.applied_torque = torch.tensor(
+            joint_effort, dtype=torch.float32, device=device
+        ).unsqueeze(0)
+    else:
+        robot.data.applied_torque = None
 
     ee_frame = env.scene["ee_frame"]
     ee_frame.data.target_pos_w = (
         torch.tensor(ee_pos_w, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
     )
+    if ee_quat_wxyz is not None and np.all(np.isfinite(ee_quat_wxyz)):
+        ee_frame.data.target_quat_w = (
+            torch.tensor(ee_quat_wxyz, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        )
+    else:
+        ee_frame.data.target_quat_w = None
+    if ee_lin_vel_w is not None and np.all(np.isfinite(ee_lin_vel_w)):
+        ee_frame.data.target_lin_vel_w = (
+            torch.tensor(ee_lin_vel_w, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        )
+    else:
+        ee_frame.data.target_lin_vel_w = None
+    if ee_ang_vel_w is not None and np.all(np.isfinite(ee_ang_vel_w)):
+        ee_frame.data.target_ang_vel_w = (
+            torch.tensor(ee_ang_vel_w, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        )
+    else:
+        ee_frame.data.target_ang_vel_w = None
 
     env.episode_length_buf = torch.tensor([step_index], dtype=torch.long, device=device)
 
@@ -609,6 +894,240 @@ def _final_condition_diagnostics(
     return asdict(snapshots[0])
 
 
+def _rescored_rule_analysis(
+    trace: list[dict[str, Any]],
+    *,
+    selected_label: dict[str, Any],
+    final_label: dict[str, Any],
+    label_source: str,
+    final_success_confirm_time_disabled: bool,
+    final_confirmation_waiver_applied: bool,
+    control_dt: float,
+) -> dict[str, Any]:
+    """Summarize rule-dependent evidence recomputed during offline replay.
+
+    Physical extrema in the collector's explanation remain useful source facts,
+    but confirmation windows, terminal transitions, closest-miss status, and
+    success quality can change under an override.  Keep this compact trace as the
+    authoritative rescore analysis instead of silently reusing source-policy
+    conclusions.
+    """
+
+    if not trace:
+        return {
+            "available": False,
+            "reason": "no_scorable_trajectory_frames",
+            "rule_trace": [],
+            "rule_event_ledger": [],
+        }
+
+    counters = np.asarray([point["success_counter"] for point in trace], dtype=np.int64)
+    required = np.maximum(
+        np.asarray([point["success_required_steps"] for point in trace], dtype=np.int64),
+        1,
+    )
+    confirmation_multiples = counters / required
+    fractions = np.minimum(confirmation_multiples, 1.0)
+    best_id = int(np.argmax(confirmation_multiples))
+    live_success = np.asarray(
+        [point["live_success_confirmed"] for point in trace], dtype=np.bool_
+    )
+    first_live_id = int(np.flatnonzero(live_success)[0]) if np.any(live_success) else None
+    selected_success_ever = bool(np.any(live_success) or final_confirmation_waiver_applied)
+    first_selected_id = first_live_id
+    if first_selected_id is None and final_confirmation_waiver_applied:
+        first_selected_id = len(trace) - 1
+    success_was_transient = bool(
+        np.any(live_success)
+        and (
+            not bool(final_label["success"])
+            or not np.all(live_success[first_live_id:])
+        )
+    )
+    stable_live_success = bool(
+        first_live_id is not None
+        and np.all(live_success[first_live_id:])
+        and bool(final_label["success"])
+    )
+    if not bool(final_label["success"]):
+        success_quality = "failure"
+    elif success_was_transient:
+        success_quality = "transient_success"
+    elif final_confirmation_waiver_applied:
+        success_quality = "confirmation_waived_success"
+    elif stable_live_success:
+        success_quality = "stable_success"
+    else:
+        success_quality = "confirmed_success"
+
+    events: list[dict[str, Any]] = []
+
+    def add(point: dict[str, Any], event_type: str, **payload: Any) -> None:
+        events.append(
+            {
+                "type": event_type,
+                "step": int(point["step"]),
+                "time_s": float(point["time_s"]),
+                **payload,
+            }
+        )
+
+    previous_candidate = False
+    previous_live_success = False
+    previous_failure = False
+    previous_timed_out = False
+    previous_failure_reason: str | None = None
+    previous_postmortem_type: str | None = None
+    for point in trace:
+        candidate = int(point["success_counter"]) > 0
+        if candidate and not previous_candidate:
+            add(
+                point,
+                "success_candidate_started",
+                held_steps=int(point["success_counter"]),
+                required_steps=int(point["success_required_steps"]),
+            )
+        elif not candidate and previous_candidate:
+            add(point, "success_candidate_lost")
+        previous_candidate = candidate
+
+        current_live_success = bool(point["live_success_confirmed"])
+        if current_live_success and not previous_live_success:
+            add(point, "success_confirmed", basis="rescored_live_benchmark_rule")
+        elif not current_live_success and previous_live_success:
+            add(point, "success_lost", basis="rescored_live_benchmark_rule")
+        previous_live_success = current_live_success
+
+        current_failure = bool(point["failure"])
+        current_failure_reason = str(point["failure_reason"])
+        if current_failure and (
+            not previous_failure or current_failure_reason != previous_failure_reason
+        ):
+            add(point, "failure_confirmed", reason=current_failure_reason)
+        elif not current_failure and previous_failure:
+            add(point, "failure_no_longer_confirmed", previous_reason=previous_failure_reason)
+        previous_failure = current_failure
+        previous_failure_reason = current_failure_reason
+
+        current_timed_out = bool(point["timed_out"])
+        if current_timed_out and not previous_timed_out:
+            add(point, "time_out")
+        previous_timed_out = current_timed_out
+
+        postmortem_type = point.get("postmortem_failure_type")
+        if (
+            bool(point.get("policy_control_active", False))
+            and postmortem_type
+            and postmortem_type != previous_postmortem_type
+        ):
+            add(
+                point,
+                "behavioral_classification_changed",
+                previous_failure_type=previous_postmortem_type,
+                failure_type=postmortem_type,
+                confidence=point.get("postmortem_confidence"),
+                rationale=point.get("postmortem_rationale"),
+            )
+            previous_postmortem_type = str(postmortem_type)
+
+    if final_confirmation_waiver_applied:
+        point = trace[-1]
+        add(
+            point,
+            "final_confirmation_waiver_applied",
+            held_steps=int(point["success_counter"]),
+            required_steps=int(point["success_required_steps"]),
+            live_success_confirmed=bool(point["live_success_confirmed"]),
+            final_scoring_success=bool(final_label["success"]),
+        )
+    for event_id, event in enumerate(events):
+        event["event_id"] = event_id
+
+    best_confirmation = {
+        "maximum_held_steps": int(counters[best_id]),
+        "required_steps": int(required[best_id]),
+        "maximum_fraction": float(fractions[best_id]),
+        "maximum_multiple_of_required_hold": float(confirmation_multiples[best_id]),
+        "best_step": int(trace[best_id]["step"]),
+        "best_time_s": float(trace[best_id]["time_s"]),
+        "longest_candidate_duration_s": float(counters[best_id] * control_dt),
+        "basis": "rescored_live_benchmark_rule",
+    }
+    closest_miss = None
+    if not bool(final_label["success"]):
+        closest_miss = {
+            "condition": (
+                "success_confirmed_then_lost"
+                if bool(np.any(live_success))
+                else "success_confirmation"
+            ),
+            "best_step": int(trace[best_id]["step"]),
+            "best_time_s": float(trace[best_id]["time_s"]),
+            "held_steps": int(counters[best_id]),
+            "required_steps": int(required[best_id]),
+            "shortfall_steps": max(0, int(required[best_id] - counters[best_id])),
+            "shortfall_s": max(
+                0.0,
+                float((required[best_id] - counters[best_id]) * control_dt),
+            ),
+            "confirmation_fraction": float(fractions[best_id]),
+            "basis": "rescored_live_benchmark_rule",
+        }
+
+    return {
+        "available": True,
+        "analysis_schema_version": 1,
+        "basis": "offline_replay_with_effective_rescore_parameters",
+        "label_source": label_source,
+        "rule_trace": trace,
+        "rule_event_ledger": events,
+        "best_achieved": {"success_confirmation": best_confirmation},
+        "closest_miss": closest_miss,
+        "outcome_quality": {
+            "final_success": bool(final_label["success"]),
+            "selected_label_success": bool(selected_label["success"]),
+            "success_ever_confirmed": bool(np.any(live_success)),
+            "live_success_ever_confirmed": bool(np.any(live_success)),
+            "selected_scoring_success_ever_true": selected_success_ever,
+            "first_success_step": (
+                int(trace[first_live_id]["step"]) if first_live_id is not None else None
+            ),
+            "first_success_time_s": (
+                float(trace[first_live_id]["time_s"]) if first_live_id is not None else None
+            ),
+            "first_live_confirmed_success_step": (
+                int(trace[first_live_id]["step"]) if first_live_id is not None else None
+            ),
+            "first_live_confirmed_success_time_s": (
+                float(trace[first_live_id]["time_s"]) if first_live_id is not None else None
+            ),
+            "first_selected_scoring_success_step": (
+                int(trace[first_selected_id]["step"]) if first_selected_id is not None else None
+            ),
+            "first_selected_scoring_success_time_s": (
+                float(trace[first_selected_id]["time_s"])
+                if first_selected_id is not None
+                else None
+            ),
+            "stable_from_first_success_through_end": stable_live_success,
+            "success_was_transient": success_was_transient,
+            "success_quality": success_quality,
+            "clean_stable_success": success_quality == "stable_success",
+            "final_success_confirmation_time_disabled": bool(
+                final_success_confirm_time_disabled
+            ),
+            "final_confirmation_waiver_applied": bool(
+                final_confirmation_waiver_applied
+            ),
+            "maximum_confirmation_fraction": float(fractions[best_id]),
+            "maximum_confirmation_multiple_of_required_hold": float(
+                confirmation_multiples[best_id]
+            ),
+            "basis": "rescored_rule_trace",
+        },
+    }
+
+
 def _rescore_episode(
     record: dict,
     *,
@@ -632,7 +1151,8 @@ def _rescore_episode(
     if stride is not None and stride != 1:
         raise ValueError(
             f"Episode {record['dataset']['episode_index']} was saved with trajectory_stride="
-            f"{stride}; faithful rescoring needs stride 1 so every confirmation step is replayed."
+            f"{stride}; faithful rescoring of confirmation, failure-hold, and postmortem "
+            "timers requires trajectory_stride=1 so every evaluated control step is replayed."
         )
 
     object_asset_names = list(state_schema["object_asset_names"])
@@ -656,9 +1176,37 @@ def _rescore_episode(
         joint_names=joint_names,
         action_joint_pos_limits=action_joint_pos_limits,
     )
+    initial_scene = dict(record["initial_scene"])
+    benchmark_record = dict(record.get("benchmark") or {})
+    canonical_episode = None
+    if benchmark_record.get("objects") and benchmark_record.get("instruction"):
+        episode_row = dict(benchmark_record.get("metadata") or {})
+        # Old outcome files may say task_family=bin because named-bin did not yet
+        # exist. Re-infer the family and target from the instruction instead.
+        episode_row.pop("task_family", None)
+        episode_row["objects"] = list(benchmark_record["objects"])
+        episode_row["instruction"] = str(benchmark_record["instruction"])
+        canonical_episode = episode_spec_from_json(
+            episode_row,
+            source=f"outcome episode {record.get('dataset', {}).get('episode_index', '?')}",
+        )
+        target_label = canonical_episode.objects[canonical_episode.target_object_id]
+        matching_scene_ids = [
+            int(object_entry["slot"])
+            for object_entry in initial_scene.get("objects", [])
+            if str(object_entry.get("label")) == target_label
+        ]
+        if len(matching_scene_ids) != 1:
+            raise ValueError(
+                f"Could not uniquely map canonical target {target_label!r} into initial_scene: "
+                f"matches={matching_scene_ids}."
+            )
+        initial_scene["task_family"] = canonical_episode.task_family
+        initial_scene["target_object_id"] = matching_scene_ids[0]
+
     _initialize_env_state(
         env,
-        initial_scene=record["initial_scene"],
+        initial_scene=initial_scene,
         eval_setup=eval_setup,
         object_asset_names=object_asset_names,
         device=device,
@@ -669,15 +1217,108 @@ def _rescore_episode(
         overrides=overrides.get("success", {}),
         defaults_for_coercion=success_defaults,
     )
+    persisted_final_success_confirm_time_disabled = bool(
+        eval_setup.get("final_success_confirm_time_disabled", False)
+    )
+    if persisted_final_success_confirm_time_disabled and "final_success_params" not in eval_setup:
+        raise ValueError(
+            f"Episode {record['dataset']['episode_index']} waived final success confirmation, "
+            "but its eval_setup predates separate live/final success parameters. The original "
+            "live confirmation window cannot be reconstructed faithfully; recollect this episode."
+        )
+    final_success_params = _build_term_params(
+        eval_setup.get("final_success_params", eval_setup["success_params"]),
+        overrides=overrides.get("success", {}),
+        defaults_for_coercion=success_defaults,
+    )
+    # A rescore override applies to both live and final success rules.  If it
+    # restores a non-zero final confirmation window, the persisted collector
+    # policy is no longer active for this rescore.
+    final_success_confirm_time_disabled = bool(
+        persisted_final_success_confirm_time_disabled
+        and float(final_success_params.get("confirm_time_s", 3.0)) <= 0.0
+    )
     failure_params = _build_term_params(
         eval_setup["failure_params"],
         overrides=overrides.get("failure", {}),
         defaults_for_coercion=failure_defaults,
     )
+    # ``task_time_out`` extends the nominal timeout by the same confirmation
+    # window used by the success rule.  Reuse the effective (possibly
+    # overridden) success parameter so rescore timing matches the configured
+    # term rather than silently falling back to its module default.
+    timeout_confirm_time_s = float(success_params.get("confirm_time_s", 3.0))
 
     trajectory = np.load(state_path)
     num_steps = int(trajectory["step"].shape[0])
     saved_steps = trajectory["step"]
+    trajectory_schema_version = (
+        int(np.asarray(trajectory["schema_version"]).reshape(-1)[0])
+        if "schema_version" in trajectory.files
+        else int(state_schema.get("schema_version", record.get("schema_version", 1)))
+    )
+    action_phases = [
+        _trajectory_action_phase(trajectory, frame)
+        for frame in range(num_steps)
+    ]
+    if trajectory_schema_version >= 2:
+        env._so101_policy_control_active = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=device
+        )
+    evaluation_mask_source = (
+        "termination_evaluation_applied"
+        if "termination_evaluation_applied" in trajectory.files
+        else "is_reset_sample"
+        if "is_reset_sample" in trajectory.files
+        else "action_phase"
+        if "action_phase" in trajectory.files
+        else "schema_v2_step_zero_fallback"
+        if trajectory_schema_version >= 2
+        else "schema_v1_all_frames"
+    )
+    evaluation_applied = [
+        _trajectory_termination_evaluation_applied(
+            trajectory,
+            frame,
+            source_schema_version=trajectory_schema_version,
+            action_phase=action_phases[frame],
+        )
+        for frame in range(num_steps)
+    ]
+    scorable_steps = np.asarray(
+        [
+            int(saved_steps[frame])
+            for frame, applied in enumerate(evaluation_applied)
+            if applied
+        ],
+        dtype=np.int64,
+    )
+    if scorable_steps.size == 0:
+        trajectory.close()
+        raise ValueError(
+            f"Episode {record['dataset']['episode_index']} has no evaluated trajectory frames; "
+            "faithful rescoring requires the complete evaluated trace beginning at step 1."
+        )
+    if int(scorable_steps[0]) != 1:
+        first_saved_step = int(scorable_steps[0])
+        trajectory.close()
+        raise ValueError(
+            f"Episode {record['dataset']['episode_index']} begins its evaluated trajectory at "
+            f"step {first_saved_step}, not step 1; temporal counters cannot be reconstructed "
+            "from a truncated prefix."
+        )
+    if scorable_steps.size > 1:
+        step_gaps = np.diff(scorable_steps)
+        if np.any(step_gaps != 1):
+            first_bad_gap = int(np.flatnonzero(step_gaps != 1)[0])
+            previous_step = int(scorable_steps[first_bad_gap])
+            next_step = int(scorable_steps[first_bad_gap + 1])
+            trajectory.close()
+            raise ValueError(
+                f"Episode {record['dataset']['episode_index']} has non-consecutive evaluated "
+                f"trajectory steps {previous_step}->{next_step}; faithful rescoring of temporal "
+                "rules requires one saved sample per evaluated control step (trajectory_stride=1)."
+            )
     has_bin_quat = "bin_quat_wxyz" in trajectory.files
     if "grasped_object_made_contact" not in trajectory.files:
         raise ValueError(
@@ -686,7 +1327,10 @@ def _rescore_episode(
         )
 
     first_terminal: TermEval | None = None
+    first_terminal_postmortem_raw: Any = None
     final_eval: TermEval | None = None
+    telemetry_only_frames_skipped = 0
+    rescored_rule_trace: list[dict[str, Any]] = []
 
     for frame in range(num_steps):
         step_index = int(saved_steps[frame])
@@ -695,18 +1339,79 @@ def _rescore_episode(
             step_index=step_index,
             object_pos_w=trajectory["object_pos_w"][frame],
             object_yaw=trajectory["object_yaw"][frame],
+            object_quat_wxyz=_optional_trajectory_frame(
+                trajectory, frame, "object_quat_wxyz", "object_quat_w"
+            ),
+            object_lin_vel_w=_optional_finite_trajectory_frame(
+                trajectory, frame, "object_lin_vel_w", "object_lin_vel_fd_w"
+            ),
+            object_ang_vel_w=_optional_finite_trajectory_frame(
+                trajectory, frame, "object_ang_vel_w"
+            ),
             bin_pos_w=trajectory["bin_pos_w"][frame],
             bin_quat_wxyz=trajectory["bin_quat_wxyz"][frame] if has_bin_quat else None,
+            bin_lin_vel_w=_optional_finite_trajectory_frame(
+                trajectory, frame, "bin_lin_vel_w", "bin_lin_vel_fd_w"
+            ),
+            bin_ang_vel_w=_optional_finite_trajectory_frame(trajectory, frame, "bin_ang_vel_w"),
             bin_yaw=float(trajectory["bin_yaw"][frame]),
             grasped_object_made_contact=bool(trajectory["grasped_object_made_contact"][frame]),
             joint_pos=trajectory["joint_pos"][frame],
+            joint_vel=_optional_finite_trajectory_frame(trajectory, frame, "joint_vel"),
+            joint_effort=_optional_finite_trajectory_frame(
+                trajectory, frame, "joint_effort", "joint_applied_torque"
+            ),
             ee_pos_w=trajectory["ee_pos_w"][frame],
+            ee_quat_wxyz=_optional_trajectory_frame(
+                trajectory, frame, "ee_quat_wxyz", "ee_quat_w"
+            ),
+            ee_lin_vel_w=_optional_finite_trajectory_frame(
+                trajectory, frame, "ee_lin_vel_w", "ee_lin_vel_fd_w"
+            ),
+            ee_ang_vel_w=_optional_finite_trajectory_frame(trajectory, frame, "ee_ang_vel_w"),
             object_asset_names=object_asset_names,
             bin_name=bin_name,
             device=device,
         )
+        if "failure_baseline_recorded" in trajectory.files:
+            baseline_recorded = bool(trajectory["failure_baseline_recorded"][frame])
+            if baseline_recorded:
+                if "object_failure_baseline_pos_w" in trajectory.files:
+                    object_baseline = trajectory["object_failure_baseline_pos_w"][frame]
+                else:
+                    object_baseline = (
+                        trajectory["object_pos_w"][frame]
+                        - trajectory["object_displacement_from_failure_baseline_w"][frame]
+                    )
+                if "bin_failure_baseline_pos_w" in trajectory.files:
+                    bin_baseline = trajectory["bin_failure_baseline_pos_w"][frame]
+                else:
+                    bin_baseline = (
+                        trajectory["bin_pos_w"][frame]
+                        - trajectory["bin_displacement_from_failure_baseline_w"][frame]
+                    )
+                env._so101_failure_object_pos_w[0] = torch.as_tensor(
+                    object_baseline, dtype=torch.float32, device=device
+                )
+                env._so101_failure_bin_pos_w[0] = torch.as_tensor(
+                    bin_baseline, dtype=torch.float32, device=device
+                )
+                env._so101_failure_baseline_recorded[0] = True
+        if hasattr(env, "_so101_policy_control_active"):
+            if "policy_control_active" in trajectory.files:
+                env._so101_policy_control_active[0] = bool(
+                    trajectory["policy_control_active"][frame]
+                )
+            elif action_phases[frame] in {"dataset", "final_hold"}:
+                env._so101_policy_control_active[0] = True
+        if not evaluation_applied[frame]:
+            telemetry_only_frames_skipped += 1
+            continue
         with torch.inference_mode():
-            timed_out_tensor = task_time_out(env)
+            timed_out_tensor = task_time_out(
+                env,
+                confirm_time_s=timeout_confirm_time_s,
+            )
             failure_tensor = benchmark_failure(env, **failure_params)
             success_tensor = task_success(env, **success_params)
         final_eval = _term_eval_from(
@@ -717,10 +1422,134 @@ def _rescore_episode(
             timed_out_tensor=timed_out_tensor,
             failure_reasons=getattr(env, "_so101_failure_reasons", None),
         )
+        current_postmortem_raw = _single_env_postmortem_raw(
+            _postmortem_failure_diagnostics(env)
+        )
+        task_family = str(env._so101_task_family[0])
+        success_counter_attr = {
+            "bin": "_so101_bin_success_counter",
+            "named_bin": "_so101_bin_success_counter",
+            "next_to": "_so101_next_to_success_counter",
+            "between": "_so101_between_success_counter",
+            "move": "_so101_move_success_counter",
+        }.get(task_family)
+        success_counter_state = (
+            getattr(env, success_counter_attr, None)
+            if success_counter_attr is not None
+            else None
+        )
+        success_counter = (
+            int(success_counter_state[0].item())
+            if isinstance(success_counter_state, torch.Tensor)
+            else 0
+        )
+        required_state = getattr(env, "_so101_success_confirmation_required_steps", None)
+        success_required_steps = (
+            int(required_state[0].item())
+            if isinstance(required_state, torch.Tensor)
+            else max(1, math.ceil(float(success_params.get("confirm_time_s", 3.0)) / control_dt))
+        )
+        failure_reasons = getattr(env, "_so101_failure_reasons", None)
+        failure_reason = (
+            str(failure_reasons[0])
+            if failure_reasons
+            else "failure"
+            if final_eval.failure
+            else "none"
+        )
+        policy_control_state = getattr(env, "_so101_policy_control_active", None)
+        policy_control_active = bool(
+            policy_control_state[0].item()
+            if isinstance(policy_control_state, torch.Tensor)
+            else True
+        )
+        rescored_rule_trace.append(
+            {
+                "step": step_index,
+                "time_s": step_index * control_dt,
+                "success_counter": success_counter,
+                "success_required_steps": success_required_steps,
+                "live_success_confirmed": bool(success_tensor[0].item()),
+                "failure": bool(failure_tensor[0].item()),
+                "failure_reason": failure_reason,
+                "timed_out": bool(timed_out_tensor[0].item()),
+                "terminal_reason": final_eval.reason,
+                "policy_control_active": policy_control_active,
+                "postmortem_failure_type": _postmortem_failure_type(
+                    current_postmortem_raw
+                ),
+                "postmortem_confidence": (
+                    current_postmortem_raw.get("confidence")
+                    if isinstance(current_postmortem_raw, dict)
+                    else None
+                ),
+                "postmortem_rationale": (
+                    current_postmortem_raw.get("rationale")
+                    if isinstance(current_postmortem_raw, dict)
+                    else None
+                ),
+            }
+        )
         if final_eval.done and first_terminal is None:
             first_terminal = final_eval
+            # Freeze the classifier state at the same point as the collector.
+            # Later replay steps may add attempts, transport, drops, or goal
+            # history and must not rewrite first-terminal attribution.
+            first_terminal_postmortem_raw = current_postmortem_raw
+
+    recomputed_postmortem = _postmortem_failure_diagnostics(env)
+    trajectory_fields = list(trajectory.files)
+    trajectory.close()
 
     rescored = dict(record)
+    effective_task_family = str(env._so101_task_family[0])
+    benchmark_payload = dict(record.get("benchmark") or {})
+    original_task_family = benchmark_payload.get("task_family")
+    benchmark_payload["task_family"] = effective_task_family
+    if canonical_episode is not None:
+        benchmark_payload["target_object_id"] = canonical_episode.target_object_id
+    rescored["benchmark"] = benchmark_payload
+    for scene_key in ("initial_scene", "final_scene"):
+        if isinstance(record.get(scene_key), dict):
+            scene_payload = dict(record[scene_key])
+            scene_payload["task_family"] = effective_task_family
+            scene_payload["target_object_id"] = int(env._so101_target_object_ids[0].item())
+            rescored[scene_key] = scene_payload
+    final_diagnostics = (
+        _final_condition_diagnostics(
+            env,
+            object_asset_names=object_asset_names,
+            success_params=final_success_params,
+            failure_params=failure_params,
+        )
+        if final_eval is not None
+        else {
+            "available": False,
+            "reason": "no_scorable_trajectory_frames",
+        }
+    )
+    final_confirmation_waiver_applied = False
+    if (
+        final_success_confirm_time_disabled
+        and record.get("episode_length", {}).get("action_stream_exhausted")
+        and final_eval is not None
+        and not final_eval.success
+    ):
+        final_confirmation_waiver_applied = any(
+            condition.get("kind") == "success" and bool(condition.get("met"))
+            for condition in final_diagnostics.get("conditions", [])
+            if isinstance(condition, dict)
+        )
+        if final_confirmation_waiver_applied:
+            final_eval = TermEval(
+                step=final_eval.step,
+                time_s=final_eval.time_s,
+                success=True,
+                failure=False,
+                timed_out=False,
+                reason="success",
+            )
+
     label_source = record.get("label", {}).get("source", "final")
     first_terminal_label = _label_from_eval(
         first_terminal,
@@ -740,20 +1569,160 @@ def _rescore_episode(
 
     rescored["first_terminal_eval"] = first_terminal_label
     rescored["final_eval"] = final_label
-    rescored["final_diagnostics"] = _final_condition_diagnostics(
-        env,
-        object_asset_names=object_asset_names,
-        success_params=success_params,
-        failure_params=failure_params,
+    rescored["final_diagnostics"] = final_diagnostics
+    # Keep the rule-level terminal reason separate from behavioral attribution.
+    # The latter is recomputed by benchmark_failure's temporal accumulator and
+    # may evolve independently as that classifier becomes more informative.
+    rescored["postmortem_failure_diagnostics"] = recomputed_postmortem
+    final_postmortem_raw = _single_env_postmortem_raw(recomputed_postmortem)
+    final_failure_attribution = _failure_attribution_from_raw(
+        final_postmortem_raw,
+        label=final_label,
+        basis="final_state_standard_confirmation",
     )
+    if first_terminal is None:
+        first_terminal_failure_attribution = _failure_attribution_from_raw(
+            final_postmortem_raw,
+            label=first_terminal_label,
+            basis="no_first_terminal_before_action_stream_end",
+        )
+    else:
+        first_terminal_failure_attribution = _failure_attribution_from_raw(
+            first_terminal_postmortem_raw,
+            label=first_terminal_label,
+            basis="first_terminal_state",
+        )
+    failure_attribution = (
+        final_failure_attribution
+        if label_source == "final"
+        else first_terminal_failure_attribution
+    )
+    rescored["failure_attribution"] = failure_attribution
+    rescored["first_terminal_failure_attribution"] = first_terminal_failure_attribution
+    rescored["final_failure_attribution"] = final_failure_attribution
+    # Keep the convenience alias synchronized with the recomputed attribution;
+    # retaining the source value here would silently expose two answers for the
+    # same rescored episode.
+    rescored["behavioral_outcome"] = failure_attribution["postmortem"]
+    rescored_analysis = _rescored_rule_analysis(
+        rescored_rule_trace,
+        selected_label=label,
+        final_label=final_label,
+        label_source=label_source,
+        final_success_confirm_time_disabled=final_success_confirm_time_disabled,
+        final_confirmation_waiver_applied=final_confirmation_waiver_applied,
+        control_dt=control_dt,
+    )
+    rescored["rescored_analysis"] = rescored_analysis
+
+    # Preserve physical extrema and rich object/contact summaries from the
+    # source collection, while replacing confirmation conclusions with values
+    # recomputed under the effective rescore rules.
+    best_achieved = dict(record.get("best_achieved") or {})
+    rescored_best = rescored_analysis.get("best_achieved") or {}
+    if "success_confirmation" in rescored_best:
+        best_achieved["success_confirmation"] = rescored_best["success_confirmation"]
+    best_achieved["analysis_basis"] = (
+        "source_collection_extrema_and_source_parameter_metrics_plus_rescored_success_confirmation"
+    )
+    rescored["best_achieved"] = best_achieved
+    rescored["closest_miss"] = rescored_analysis.get("closest_miss")
+
+    outcome_quality = dict(record.get("outcome_quality") or {})
+    outcome_quality.update(rescored_analysis.get("outcome_quality") or {})
+    if (
+        bool(outcome_quality.get("final_success"))
+        and bool(outcome_quality.get("collateral_event_detected"))
+        and outcome_quality.get("success_quality") == "stable_success"
+    ):
+        outcome_quality["success_quality"] = "success_with_source_observed_collateral"
+        outcome_quality["clean_stable_success"] = False
+    outcome_quality["analysis_basis"] = (
+        "rescored_rule_trace_plus_source_collection_physical_data_quality_and_source_parameter_metrics"
+    )
+    selected_raw = failure_attribution.get("postmortem_raw")
+    outcome_quality["behavioral_attribution_confidence"] = (
+        selected_raw.get("confidence") if isinstance(selected_raw, dict) else None
+    )
+    outcome_quality["behavioral_attribution_version"] = (
+        selected_raw.get("classification_version") if isinstance(selected_raw, dict) else None
+    )
+    outcome_quality["behavioral_attribution_basis"] = failure_attribution.get("basis")
+    outcome_quality["behavioral_attribution_applicable"] = bool(
+        failure_attribution.get("applicable")
+    )
+    rescored["outcome_quality"] = outcome_quality
+    rescored["analysis_provenance"] = {
+        "event_ledger": {
+            "basis": "source_collection",
+            "note": (
+                "physical events remain valid; source rule-transition events may reflect the "
+                "collection parameters. Use rescored_analysis.rule_event_ledger for current rules."
+            ),
+        },
+        "best_achieved": {
+            "basis": "mixed",
+            "source_fields": (
+                "collection-time physical extrema, contacts, per-object progress, and "
+                "source-parameter-derived goal geometry"
+            ),
+            "rescored_fields": ["success_confirmation"],
+        },
+        "closest_miss": {"basis": "rescored_rule_trace"},
+        "outcome_quality": {
+            "basis": "mixed",
+            "rescored_fields": sorted((rescored_analysis.get("outcome_quality") or {}).keys()),
+            "remaining_fields": (
+                "source collection physical/data-quality metrics plus source-parameter-derived "
+                "goal, collateral, contact, and attempt-threshold fields"
+            ),
+        },
+    }
     rescored["label"] = {"source": label_source, **label}
     rescored["rescore"] = {
         "rescored_at": _now_stamp(),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": RESCORE_SCHEMA_VERSION,
+        "source_record_schema_version": record.get("schema_version", 1),
+        "source_state_schema_version": trajectory_schema_version,
+        "trajectory_fields": trajectory_fields,
+        "trajectory_frame_count": num_steps,
+        "evaluated_frame_count": int(scorable_steps.size),
+        "evaluation_mask_source": evaluation_mask_source,
+        "telemetry_only_frames_skipped": telemetry_only_frames_skipped,
+        "timeout_confirm_time_s": timeout_confirm_time_s,
+        "live_success_confirm_time_s": success_params.get("confirm_time_s"),
+        "final_success_confirm_time_s": final_success_params.get("confirm_time_s"),
+        "final_success_confirm_time_disabled": final_success_confirm_time_disabled,
+        "final_confirmation_waiver_applied": final_confirmation_waiver_applied,
         "label_source": label_source,
         "overrides": {kind: dict(items) for kind, items in overrides.items() if items},
+        "effective_success_params": _jsonable(success_params),
+        "effective_final_success_params": _jsonable(final_success_params),
+        "effective_failure_params": _jsonable(failure_params),
+        "source_derived_fields": {
+            "event_ledger": "source_collection",
+            "best_achieved": "mixed; success_confirmation recomputed",
+            "closest_miss": "recomputed",
+            "outcome_quality": "mixed; rule-derived fields recomputed",
+        },
         "original_label": {key: record.get("label", {}).get(key) for key in SUCCESS_LABEL_FIELDS}
         | {"source": label_source},
+        "original_task_family": original_task_family,
+        "effective_task_family": effective_task_family,
+        "original_postmortem_failure_diagnostics": record.get(
+            "postmortem_failure_diagnostics"
+        ),
+        "original_failure_attribution": record.get("failure_attribution"),
+        "original_first_terminal_failure_attribution": record.get(
+            "first_terminal_failure_attribution"
+        ),
+        "original_final_failure_attribution": record.get(
+            "final_failure_attribution"
+        ),
+        "original_behavioral_outcome": record.get("behavioral_outcome"),
+        "original_best_achieved": record.get("best_achieved"),
+        "original_closest_miss": record.get("closest_miss"),
+        "original_outcome_quality": record.get("outcome_quality"),
     }
     return rescored
 
@@ -914,7 +1883,7 @@ def main() -> None:
                 failure_defaults=failure_defaults,
                 device=device,
             )
-            out.write(json.dumps(rescored, separators=(",", ":")) + "\n")
+            out.write(json.dumps(_jsonable(rescored), separators=(",", ":"), allow_nan=False) + "\n")
             out.flush()
             summary_records.append(rescored)
             label = rescored["label"]
@@ -932,9 +1901,15 @@ def main() -> None:
     successes = sum(1 for entry in summary_records if entry["label"]["success"])
     failures = len(summary_records) - successes
     failure_counts: dict[str, int] = {}
+    postmortem_counts: dict[str, int] = {}
     for entry in summary_records:
         reason = entry["label"]["failure_reason"]
         failure_counts[reason] = failure_counts.get(reason, 0) + 1
+        failure_type = _postmortem_failure_type(
+            entry.get("failure_attribution", {}).get("postmortem")
+        )
+        if failure_type is not None:
+            postmortem_counts[failure_type] = postmortem_counts.get(failure_type, 0) + 1
     flips = sum(
         1
         for entry in summary_records
@@ -942,7 +1917,7 @@ def main() -> None:
         and bool(entry["rescore"]["original_label"]["success"]) != bool(entry["label"]["success"])
     )
     summary = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": RESCORE_SCHEMA_VERSION,
         "rescored_at": _now_stamp(),
         "source_episodes_path": str(episodes_path),
         "rescored_episodes_path": str(rescored_path),
@@ -951,10 +1926,11 @@ def main() -> None:
         "failures": failures,
         "success_rate": successes / max(len(summary_records), 1),
         "failure_reason_counts": failure_counts,
+        "postmortem_failure_counts": postmortem_counts,
         "label_flips_vs_original": flips,
         "overrides": {kind: dict(items) for kind, items in overrides.items() if items},
     }
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     print(
         f"[INFO]: Rescore summary: success={successes}/{len(summary_records)} "
         f"({100.0 * summary['success_rate']:.1f}%), failures={failures}, "

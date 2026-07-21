@@ -33,6 +33,7 @@ from so101_bench.benchmark import (
     TASK_BIN,
     TASK_MIXED,
     TASK_MOVE,
+    TASK_NAMED_BIN,
     TASK_NEXT_TO,
     object_metadata,
     object_rigid_body_child_names,
@@ -933,6 +934,15 @@ class So101BenchBinEnvCfg(So101BenchEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.events.reset_benchmark_scene = _reset_scene_event(TASK_BIN, (1, 4))
+
+
+@configclass
+class So101BenchNamedBinEnvCfg(So101BenchEnvCfg):
+    """Place one named target in the bin while leaving three distractors undisturbed."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.events.reset_benchmark_scene = _reset_scene_event(TASK_NAMED_BIN, (4, 4))
 
 
 @configclass

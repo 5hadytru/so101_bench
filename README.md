@@ -19,7 +19,8 @@ benchmark tasks can be run, recorded, and scored without hardware.
 This repository contains:
 
 - the **Isaac Lab environment** (`source/so101_bench`) that recreates the bedroom
-  tabletop, plastic bin, household objects, and the four benchmark task families;
+  tabletop, plastic bin, household objects, the four original benchmark task
+  families, and the named-object bin extension;
 - **evaluation scripts** for running a GR00T-N1.6 (or MolmoAct2) policy in the
   simulator and recording/scoring LeRobot datasets;
 - **teleoperation, replay, and offline scoring** tooling for building and grading
@@ -62,7 +63,7 @@ objects, and instructions, instantiated in simulation. The background below
 summarizes the benchmark design and the paper's real-world findings to motivate
 what the simulator reproduces.
 
-### The four tasks
+### Task families
 
 1. **Place each object in the plastic bin** — the pure grasping task. The bin moves
    each trial; the policy must identify, grasp, transport, and deposit objects in
@@ -78,6 +79,12 @@ what the simulator reproduces.
 Distractors (same class, same color) are strategically included so the policy
 cannot succeed from class identity alone, and color words are often omitted to keep
 language grounding nontrivial.
+
+The simulation data pipeline also supports **named-object bin** instructions such
+as “Place the black pen in the plastic bin” with other active objects present. This
+is a distinct `named_bin` family: only the instructed target must enter the bin,
+while moving or persistently contacting a distractor is a failure. Ordinary `bin`
+instructions (“Place each object…”) continue to require every active object.
 
 ### Generalization splits
 
@@ -126,12 +133,13 @@ It registers several Gymnasium task IDs, one per benchmark task family:
 | Task ID                              | Description                                               |
 |--------------------------------------|----------------------------------------------------------|
 | `So101Bench-Bin-v0`                  | Place each object (or the single object) in the plastic bin. |
+| `So101Bench-NamedBin-v0`             | Place the named target in the bin while leaving distractors undisturbed. |
 | `So101Bench-Bin-SingleObject-v0`     | Bin task with exactly one randomly selected object slot active. |
 | `So101Bench-Bin-Object1-v0` … `-Object4-v0` | Bin task with a specific object slot active.       |
 | `So101Bench-NextTo-v0`               | Place one object next to another.                        |
 | `So101Bench-Between-v0`              | Place one object between two referents.                  |
 | `So101Bench-Move-v0`                 | Move one object in a commanded direction.                |
-| `So101Bench-Mixed-v0`                | Sample among all four task families.                     |
+| `So101Bench-Mixed-v0`                | Sample among all five task families.                     |
 
 Each episode is driven by two inputs:
 
@@ -265,7 +273,7 @@ the rollouts (this command uses a reduced subset of the real world tasks/ file):
   --episode_layouts_jsonl tasks/layouts/real_gr00t_WM_combined_layouts.jsonl \
   --policy_host localhost \
   --policy_port 5555 \
-  --action_horizon 16 \
+  --action_horizon 8 \
   --use_overhead_init true \
   --record_dataset \
   --repo_root data/lerobot/groot_n16_real_sim_1_ah16 \
@@ -279,8 +287,7 @@ Notable flags:
 - `--episode_layouts_jsonl` — apply exact recorded object/bin poses instead of
   sampling new ones.
 - `--num_episodes N` — evaluate only the first `N` rows (default: all).
-- `--action_horizon` — action steps executed per server query (16 matches the WM
-  checkpoint above).
+- `--action_horizon` — action steps executed per server query (default: 8).
 - `--use_overhead_init true` — send the settled `overhead_init` frame each request
   (required for WM-conditioned checkpoints).
 - `--lang_instruction "..."` — override the policy language with a fixed string
@@ -294,8 +301,7 @@ Notable flags:
 
 During a run, press `P` in the Isaac window to snapshot all cameras and `N` to skip
 to the next episode (these can also be typed into the launch terminal).
-`scripts/launch_groot_eval.sh` shows a full recording sweep at action horizons 8 and
-16.
+`scripts/launch_groot_eval.sh` runs GR00T evaluation with the default action horizon of 8.
 
 ### The dataset
 
@@ -485,6 +491,10 @@ Useful options:
   `--debug_object_placement`, which dumps a report and top-down SVGs of the selected
   layouts beside the layouts JSONL).
 - `--debug_tasks` — track and print live success/failure conditions while driving.
+- `--task_status_ui` (alias `--show_task_status`) — opt into live non-bin task
+  status in the Isaac UI. It reports target/referent surface distance for next-to,
+  perpendicular distance for between, and boundary distance plus trajectory lateral
+  error for move. Without this option, the UI does not add success/failure computation.
 
 ---
 
@@ -543,9 +553,29 @@ of outcomes.
 For combined process-level and native parallelism, `scripts/run_collect_outcomes_sharded.sh`
 also accepts `NATIVE_ENVS=4`.
 
-Each saved record includes `final_diagnostics` with the condition-level geometry
-behind the final label. To re-grade saved trajectories after changing a rule —
-**without launching Isaac Sim** — use `scripts/so101_rescore_outcomes.py`:
+Outcome schema v2 keeps the original labels and trajectory fields, and adds:
+
+- an event ledger (grasp, contact, lift, workspace, goal, and classifier transitions),
+  best-achieved state, closest miss, per-object progress, and data-quality checks;
+- raw and clamped actions, complete object/bin/EE/robot state, contact evidence,
+  condition counters, numeric goal margins, all-object attempt/acquisition/drop/release
+  evidence, and the classifier snapshot at every step;
+- distinct live-confirmed and selected-scoring success signals, including whether a
+  final-only confirmation waiver actually changed the episode label;
+- separate first-terminal, final-state, and selected-label failure attributions, each
+  with a confidence, rationale, secondary evidence, and explicit attribution basis;
+- reproducibility metadata and hashes. Missing JSON values are `null`; missing float
+  arrays remain `NaN` in the NPZ with companion availability masks.
+
+The evidence-based postmortem classifier reports stages such as
+`target_acquisition_failed`, `wrong_object_targeted`, `target_dropped`,
+`goal_reached_but_unconfirmed`, and `goal_reached_with_rule_violation`. The old
+lift-only `semantic` / `failed_grasp` / `placement` result remains available as
+`legacy_failure_type` for comparisons, but is no longer used as the primary label
+when temporal evidence exists.
+
+To re-grade saved trajectories after changing a rule — **without launching Isaac
+Sim** — use `scripts/so101_rescore_outcomes.py`:
 
 ```bash
 source ~/env_isaaclab_51/bin/activate
@@ -553,6 +583,12 @@ python scripts/so101_rescore_outcomes.py \
   --outcomes_dir data/lerobot/so101_bench_sim_1_v3.0/eval/sim_replay_outcomes_<timestamp> \
   --episode_indices 6,32,70
 ```
+
+Faithful rescoring of confirmation and failure-hold windows requires the default
+`--trajectory_stride 1`; the rescorer rejects sparse traces instead of silently
+producing inaccurate temporal labels. Rescored records include an effective-rule
+trace and `rescored_analysis`; collection-time event/extrema fields retain explicit
+provenance when they cannot be faithfully reinterpreted under an override.
 
 ---
 

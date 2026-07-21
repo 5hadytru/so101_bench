@@ -17,12 +17,14 @@ INCH = 0.0254
 MULTI_RIGID_BODY_CHILD_NAMES = ("left", "right")
 
 TASK_BIN = "bin"
+TASK_NAMED_BIN = "named_bin"
 TASK_NEXT_TO = "next_to"
 TASK_BETWEEN = "between"
 TASK_MOVE = "move"
 TASK_MIXED = "mixed"
 
-TASK_FAMILIES = (TASK_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE)
+TASK_FAMILIES = (TASK_BIN, TASK_NAMED_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE)
+BIN_TASK_FAMILIES = (TASK_BIN, TASK_NAMED_BIN)
 
 DIRECTIONS = ("left", "right", "forward", "backward")
 COLORS = {
@@ -50,13 +52,16 @@ NON_TARGET_DISPLACEMENT_LIMIT_M = 1.0 * INCH
 LIFT_OFF_GROUND_LIMIT_M = 0.5 * INCH
 BOUNDARY_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 SPATIAL_SUCCESS_DISTANCE_M = 2.0 * INCH
-BETWEEN_LINE_TOLERANCE_M = 1.5 * INCH
+BETWEEN_LINE_TOLERANCE_M = 1.75 * INCH
+# The between task now permits the target anywhere along the referent span.  The
+# line-alignment and no-contact requirements remain active.
+BETWEEN_CENTER_FRACTION_MIN = 0.0
+BETWEEN_CENTER_FRACTION_MAX = 1.0
 MOVE_BOUNDARY_SUCCESS_DISTANCE_M = 2.0 * INCH
 MOVE_NO_BOUNDARY_MIN_PROGRESS_M = 2.0 * INCH
 MOVE_STRAIGHTNESS_TOLERANCE_M = 2.0 * INCH
-# Footprints come from collision meshes, so an object resting *against* a boundary
-# overlaps it by a few millimetres. Treat penetration up to this as "touching": it
-# keeps move success and the move_past_boundary failure complementary (no dead zone).
+# Retained for compatibility with older outcome files and postmortem APIs. The live
+# Move task no longer imposes a minimum signed boundary gap or an overshoot failure.
 MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # A nearest object only counts as the move boundary if it blocks at least this fraction
 # of the target's lateral corridor. Below it the object is merely beside the path (a
@@ -82,7 +87,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "white pen": {"multiple_rigid_bodies": False, "deformable": False},
         "black pen": {"multiple_rigid_bodies": False, "deformable": False},
         "altoids container": {"multiple_rigid_bodies": False, "deformable": False},
-        # "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False}, DO NOT REMOVE
+        "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
         "blue pliers": {"multiple_rigid_bodies": False, "deformable": False},
         "green clip": {"multiple_rigid_bodies": False, "deformable": False},
         "pink eraser": {"multiple_rigid_bodies": False, "deformable": False},
@@ -108,7 +113,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "blue clip": {"multiple_rigid_bodies": False, "deformable": False},
         "blue tape": {"multiple_rigid_bodies": False, "deformable": False},
         "yellow tape": {"multiple_rigid_bodies": False, "deformable": False},
-        # "white stuffed animal": {"multiple_rigid_bodies": False, "deformable": False}, DO NOT REMOVE
+        "white stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
         "blue screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
         "pink bowl": {"multiple_rigid_bodies": False, "deformable": False},
         "white bowl": {"multiple_rigid_bodies": False, "deformable": False},
@@ -120,7 +125,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "white shoes": {"multiple_rigid_bodies": True, "deformable": False},
     },
     "unseen_unseen_class": {
-        # "blue headband": {"multiple_rigid_bodies": False, "deformable": False}, too unpredictable; also expensive
+        "blue headband": {"multiple_rigid_bodies": False, "deformable": False},
         "blue highlighter": {"multiple_rigid_bodies": False, "deformable": False},
         "purple toothbrush": {"multiple_rigid_bodies": False, "deformable": False},
         "blue controller": {"multiple_rigid_bodies": False, "deformable": False},
@@ -132,9 +137,8 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "toy fire truck": {"multiple_rigid_bodies": False, "deformable": False},
         "toy monster truck": {"multiple_rigid_bodies": False, "deformable": False},
         "toy dinosaur": {"multiple_rigid_bodies": False, "deformable": False},
-        # "baby doll": {"multiple_rigid_bodies": False, "deformable": False}, # DO NOT REMOVE
+        "baby doll": {"multiple_rigid_bodies": False, "deformable": False},
         "sponge": {"multiple_rigid_bodies": False, "deformable": False},
-        # "yellow flashlight": {"multiple_rigid_bodies": False}, ROLLED TOO MUCH
     },
 }
 
@@ -161,6 +165,13 @@ FAILURE_TAXONOMY: dict[str, tuple[str, ...]] = {
         "dropped/pushed out of range",
     ),
     "bin_placement": (
+        "knocked bin",
+        "missed bin",
+        "not fully in bin",
+    ),
+    "named_bin": (
+        "wrong object targeted",
+        "distractor moved",
         "knocked bin",
         "missed bin",
         "not fully in bin",
@@ -195,7 +206,6 @@ FAILURE_TAXONOMY: dict[str, tuple[str, ...]] = {
         "not close enough to boundary",
         "trajectory not straight enough",
         "moved boundary",
-        "moved past boundary",
         "made contact",
     ),
 }
@@ -205,9 +215,9 @@ def task_instruction(task_family: str, active_labels: list[str], direction: str 
     """Return the natural-language instruction for a benchmark episode."""
 
     if task_family == TASK_BIN:
-        if len(active_labels) == 1:
-            return f"Place the {active_labels[0]} in the plastic bin."
         return "Place each object in the plastic bin."
+    if task_family == TASK_NAMED_BIN:
+        return f"Place the {active_labels[0]} in the plastic bin."
     if task_family == TASK_NEXT_TO:
         return f"Place the {active_labels[0]} next to the {active_labels[1]}."
     if task_family == TASK_BETWEEN:
@@ -376,11 +386,11 @@ def _canonical_direction(token: str) -> str:
 
 
 def infer_task_family(instruction: str) -> str:
-    """Infer one of the four benchmark task families from an instruction."""
+    """Infer a supported benchmark task family from an instruction."""
 
     normalized = _normalized_instruction(instruction)
     if "plastic bin" in normalized and normalized.startswith("place"):
-        return TASK_BIN
+        return TASK_BIN if normalized.startswith("place each object ") else TASK_NAMED_BIN
     if normalized.startswith("place") and " next to " in normalized:
         return TASK_NEXT_TO
     if normalized.startswith("place") and " between " in normalized and " and " in normalized:
@@ -389,7 +399,7 @@ def infer_task_family(instruction: str) -> str:
         return TASK_MOVE
     raise ValueError(
         f"Instruction {instruction!r} does not match a supported benchmark task. "
-        "Expected bin, next-to, between, or directional move phrasing."
+        "Expected all-object bin, named-object bin, next-to, between, or directional move phrasing."
     )
 
 
@@ -438,6 +448,17 @@ def _resolve_instruction_object_label(
 def _parse_instruction_object_labels(instruction: str, task_family: str, *, source: str) -> tuple[str, ...]:
     if task_family == TASK_BIN:
         return ()
+    if task_family == TASK_NAMED_BIN:
+        match = re.fullmatch(
+            r"\s*place\s+(?:the\s+)?(.+?)\s+in\s+(?:the\s+)?plastic\s+bin\.?\s*",
+            instruction,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            return (match.group(1),)
+        raise ValueError(
+            f"{source}: named-bin instruction must be phrased as 'Place the TARGET in the plastic bin'."
+        )
     if task_family == TASK_NEXT_TO:
         match = re.fullmatch(
             r"\s*place\s+(?:the\s+)?(.+?)\s+next\s+to\s+(?:the\s+)?(.+?)\.?\s*",
@@ -504,7 +525,10 @@ def row_with_canonical_instruction_metadata(
         updated["task_family"] = task_family
 
     labels = _parse_instruction_object_labels(instruction_text, task_family, source=source)
-    if task_family == TASK_NEXT_TO:
+    if task_family == TASK_NAMED_BIN:
+        target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
+        updated["target"] = objects[target_id]
+    elif task_family == TASK_NEXT_TO:
         target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
         referent_id = _resolve_instruction_object_label(labels[1], objects, source=source)
         if referent_id == target_id:
@@ -604,6 +628,18 @@ def episode_spec_from_json(row: dict[str, Any], *, source: str = "JSONL row") ->
             raise ValueError(f"{source}: bin episodes must contain either one or four objects.")
         target_id = 0
         referents = _referent_pair(len(objects), [], mentions[1:])
+        direction = None
+    elif task_family == TASK_NAMED_BIN:
+        labels = _parse_instruction_object_labels(instruction, task_family, source=source)
+        instruction_target_id = _resolve_instruction_object_label(labels[0], objects, source=source)
+        if row_target_id is not None and row_target_id != instruction_target_id:
+            raise ValueError(
+                f"{source}: named-bin target {objects[row_target_id]!r} does not match the "
+                f"instruction target {objects[instruction_target_id]!r}."
+            )
+        target_id = instruction_target_id
+        fallback = [object_id for object_id in range(len(objects)) if object_id != target_id]
+        referents = _referent_pair(len(objects), row_referent_ids, fallback)
         direction = None
     elif task_family == TASK_NEXT_TO:
         if len(objects) != 4:

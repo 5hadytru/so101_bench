@@ -15,7 +15,7 @@ accepted only when it satisfies the four shared initial-placement constraints:
 
 Object footprints are the exact raster decompositions loaded from
 ``assets/objects/<name>.json`` (a missing file raises); the plastic bin is the
-only rectangular footprint.  ``TASK_BIN`` episodes may use any of the configured
+only rectangular footprint. All-object and named-object bin episodes may use any of the configured
 bin poses; every other task family uses bin pose 0.
 
 The sampler is a plain incremental rejection sampler: objects are placed
@@ -38,6 +38,7 @@ import numpy as np
 from so101_bench.benchmark import (
     INCH,
     TASK_BIN,
+    TASK_NAMED_BIN,
     BenchmarkEpisodeSpec,
     load_object_move_footprint_boxes,
 )
@@ -585,7 +586,11 @@ def generate_episode_layout(
     bin_local_corners = _rectangle_local_corners(DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS)
 
     # Bin tasks may try any configured bin pose; every other family uses pose 0.
-    pose_order = list(range(len(bin_random_poses))) if episode.task_family == TASK_BIN else [0]
+    pose_order = (
+        list(range(len(bin_random_poses)))
+        if episode.task_family in {TASK_BIN, TASK_NAMED_BIN}
+        else [0]
+    )
     rng.shuffle(pose_order)
 
     attempted_pose_indices: list[int] = []

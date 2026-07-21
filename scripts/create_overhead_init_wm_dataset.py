@@ -422,21 +422,56 @@ def update_v3_episode_metadata(
     dest: Path,
     episode_files: list[tuple[Path, list[dict[str, Any]]]],
     wm_stats: dict[int, dict[str, Any]],
+    fps: int,
 ) -> None:
+    # The new overhead_init stream contains only frames from retained episodes.
+    # It may therefore be shorter than the source overhead shard when the source
+    # dataset has pruned episodes whose video spans remain in that shard. Build
+    # fresh contiguous spans for overhead_init instead of copying overhead spans.
+    all_records = [record for _, records in episode_files for record in records]
+    by_source_video: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for record in all_records:
+        key = (
+            int(record[f"videos/{OVERHEAD_KEY}/chunk_index"]),
+            int(record[f"videos/{OVERHEAD_KEY}/file_index"]),
+        )
+        by_source_video[key].append(record)
+
+    init_spans: dict[int, tuple[int, int, float, float]] = {}
+    for (chunk_index, file_index), records in by_source_video.items():
+        offset_frames = 0
+        for record in sorted(records, key=lambda rec: float(rec[f"videos/{OVERHEAD_KEY}/from_timestamp"])):
+            episode_index = int(record["episode_index"])
+            length = int(record["length"])
+            init_spans[episode_index] = (
+                chunk_index,
+                file_index,
+                offset_frames / fps,
+                (offset_frames + length) / fps,
+            )
+            offset_frames += length
+
     for source_meta_path, records in episode_files:
         dest_meta_path = dest / source_meta_path.relative_to(source_meta_path.parents[3])
         updated_records = []
         for record in records:
             episode_index = int(record["episode_index"])
             record = dict(record)
-            for suffix in ["chunk_index", "file_index", "from_timestamp", "to_timestamp"]:
-                record[f"videos/{OVERHEAD_INIT_KEY}/{suffix}"] = record[f"videos/{OVERHEAD_KEY}/{suffix}"]
+            chunk_index, file_index, from_timestamp, to_timestamp = init_spans[episode_index]
+            record[f"videos/{OVERHEAD_INIT_KEY}/chunk_index"] = chunk_index
+            record[f"videos/{OVERHEAD_INIT_KEY}/file_index"] = file_index
+            record[f"videos/{OVERHEAD_INIT_KEY}/from_timestamp"] = from_timestamp
+            record[f"videos/{OVERHEAD_INIT_KEY}/to_timestamp"] = to_timestamp
             for stat_key, value in wm_stats[episode_index].items():
                 record[f"stats/{OVERHEAD_INIT_KEY}/{stat_key}"] = value
             updated_records.append(record)
         table = pa.Table.from_pylist(updated_records)
         dest_meta_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, dest_meta_path)
+        # copy_dataset_tree hardlinks source files. Write-and-replace so this
+        # metadata update never mutates the source parquet through that link.
+        tmp_meta_path = dest_meta_path.with_suffix(dest_meta_path.suffix + ".tmp")
+        pq.write_table(table, tmp_meta_path)
+        tmp_meta_path.replace(dest_meta_path)
 
 
 def create_v3_wm(source: Path, dest: Path, info: dict[str, Any], workers: int, codec: str, crf: int) -> None:
@@ -481,7 +516,7 @@ def create_v3_wm(source: Path, dest: Path, info: dict[str, Any], workers: int, c
 
     write_json(dest / "meta" / "info.json", add_overhead_init_feature(info))
     add_global_stats(dest, wm_stats)
-    update_v3_episode_metadata(dest, episode_files, wm_stats)
+    update_v3_episode_metadata(dest, episode_files, wm_stats, int(info["fps"]))
 
 
 def main() -> None:

@@ -741,7 +741,11 @@ def _generate_and_save_episode_layouts(
     episode_plan: list[BenchmarkEpisodeSpec],
 ) -> tuple[list[dict], Path]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    layout_rng = random.Random(args_cli.seed)
+    # Layout diversity should not depend on the deterministic simulator/policy
+    # seed. Use one auditable wall-clock seed for the entire generated file.
+    layout_seed = time.time_ns()
+    layout_rng = random.Random(layout_seed)
+    print(f"[INFO]: Generating episode layouts with time-derived seed {layout_seed}.")
     # Shared across the run so object roots spread away from recent episodes
     # (high inter-episode placement variance).
     placement_history: list[tuple[float, float]] = []
@@ -753,7 +757,7 @@ def _generate_and_save_episode_layouts(
             bin_random_poses=BIN_RANDOM_POSES,
             valid_spawn_regions=VALID_OBJECT_SPAWN_REGIONS,
             table_object_z=TABLE_OBJECT_Z,
-            seed=args_cli.seed,
+            seed=layout_seed,
             generated_at=generated_at,
             robot_bounding_box=SO101_BOUNDING_BOX,
             placement_history=placement_history,

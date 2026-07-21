@@ -26,6 +26,7 @@ from so101_bench.benchmark import (
     TASK_FAMILIES,
     TASK_MIXED,
     TASK_MOVE,
+    TASK_NAMED_BIN,
     TASK_NEXT_TO,
     load_object_move_footprint_boxes,
     object_rigid_body_child_names,
@@ -533,7 +534,12 @@ def _required_object_count(task_family: str, object_count_range: tuple[int, int]
         if not supported_bin_counts:
             raise ValueError(f"Bin tasks need one or four active objects, got range {object_count_range}.")
         return random.choice(supported_bin_counts)
-    if task_family == TASK_NEXT_TO:
+    if task_family == TASK_NAMED_BIN:
+        if low > 4 or high < 1:
+            raise ValueError(f"Named-bin tasks need one to four active objects, got range {object_count_range}.")
+        low = max(low, 1)
+        high = min(high, 4)
+    elif task_family == TASK_NEXT_TO:
         low = max(low, 4)
     elif task_family == TASK_BETWEEN:
         low = max(low, 4)
@@ -1017,11 +1023,15 @@ def reset_benchmark_scene(
     env._so101_grasped_object_contact_last_episode_steps = _reset_tensor_rows(
         env, "_so101_grasped_object_contact_last_episode_steps", (num_envs,), torch.long, env_ids, -1
     )
+    env._so101_target_object_contact_ever = _reset_tensor_rows(
+        env, "_so101_target_object_contact_ever", (num_envs,), torch.bool, env_ids, False
+    )
     env.so101_bench_episodes = _reset_list_rows(env, "so101_bench_episodes", env_ids, {})
     for cache_name in (
         "_so101_move_boundary_coords",
         "_so101_move_boundary_ids",
         "_so101_grasped_object_made_contact_override",
+        "_so101_target_object_made_contact_override",
         "_so101_termination_step_state_cache",
     ):
         if hasattr(env, cache_name):
@@ -1098,7 +1108,7 @@ def reset_benchmark_scene(
                     dtype=torch.float32,
                     device=device,
                 )
-        elif selected_task == TASK_BIN and randomize_bin_for_bin_task and bin_random_poses:
+        elif selected_task in {TASK_BIN, TASK_NAMED_BIN} and randomize_bin_for_bin_task and bin_random_poses:
             selected_bin_pose_index = random.randrange(len(bin_random_poses))
             bin_pos, bin_rpy = bin_random_poses[selected_bin_pose_index]
             bin_quat = _rpy_quat(bin_rpy, device)
@@ -1116,7 +1126,7 @@ def reset_benchmark_scene(
                 raise ValueError(f"Episode layout is missing active object slot(s): {missing_layout_ids}.")
             sampled_positions = []
         elif (
-            selected_task == TASK_BIN
+            selected_task in {TASK_BIN, TASK_NAMED_BIN}
             and selected_bin_pose_index is not None
             and valid_spawn_regions is not None
         ):

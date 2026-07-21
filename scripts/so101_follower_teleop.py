@@ -31,6 +31,7 @@ from isaaclab.app import AppLauncher
 DEFAULT_ACTION_VELOCITY_LIMIT_UNITS_PER_S = (110.0, 140.0, 150.0, 125.0, 110.0, 120.0)
 ACTION_VELOCITY_LIMIT_JOINT_COUNT = 6
 DEBUG_TASKS_PRINT_INTERVAL_S = 5.0
+TASK_STATUS_UI_UPDATE_INTERVAL_S = 0.1
 
 
 def _str_to_bool(value: str | bool) -> bool:
@@ -117,6 +118,15 @@ parser.add_argument(
     type=Path,
     required=True,
     help="Required JSONL file defining benchmark episodes, matching scripts/groot_eval.py.",
+)
+parser.add_argument(
+    "--object_pool_episodes_jsonl",
+    type=Path,
+    default=None,
+    help=(
+        "Optional full episode JSONL used only to define the pre-spawned object-pool order. "
+        "Use this when recording a subset so its Object_N/PhysX actor ordering matches the canonical run."
+    ),
 )
 parser.add_argument(
     "--episode_layouts_jsonl",
@@ -377,6 +387,19 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--task_status_ui",
+    "--show_task_status",
+    nargs="?",
+    const=True,
+    default=False,
+    type=_str_to_bool,
+    help=(
+        "Show live success/failure and geometric measurements in the Isaac UI for next-to, between, "
+        "and move tasks. Disabled by default so those conditions are not computed unless another option, "
+        "such as --debug_tasks or --end_on_success/--end_on_failure, requests them."
+    ),
+)
+parser.add_argument(
     "--save_failed_episodes",
     dest="save_failed_episodes",
     action="store_true",
@@ -441,6 +464,7 @@ from so101_bench.benchmark import (
     TASK_BETWEEN,
     TASK_BIN,
     TASK_MOVE,
+    TASK_NAMED_BIN,
     TASK_NEXT_TO,
     load_episode_jsonl,
 )
@@ -678,13 +702,59 @@ class _TeleopControls:
         self._keyboard_sub = None
 
 
-class _SimClockRateWindow:
-    """Omni UI window showing sim-time speed relative to wall time."""
+_TASK_STATUS_METRIC_RE_TEMPLATE = r"(?:^|[;,]\s*){name}=([^,;\s)]+)"
 
-    def __init__(self, *, control_dt: float, update_interval_s: float = 0.5):
+
+def _task_status_ui_text(diagnostics) -> str:
+    """Format the concise spatial-task status shown in the Isaac UI."""
+    if not diagnostics:
+        return "Task status: waiting for task state"
+
+    snapshot = diagnostics[0]
+    success_conditions = [condition for condition in snapshot.conditions if condition.kind == "success"]
+    failed_conditions = [
+        condition for condition in snapshot.conditions if condition.kind == "failure" and condition.met
+    ]
+    if failed_conditions:
+        status = "FAILURE (" + ", ".join(condition.name for condition in failed_conditions) + ")"
+    elif any(condition.met for condition in success_conditions):
+        status = "SUCCESS"
+    else:
+        status = "IN PROGRESS"
+
+    success_details = success_conditions[0].details if success_conditions else ""
+
+    def metric(name: str) -> str:
+        match = re.search(_TASK_STATUS_METRIC_RE_TEMPLATE.format(name=re.escape(name)), success_details)
+        return match.group(1) if match is not None else "unavailable"
+
+    lines = [f"Task status: {status}"]
+    if snapshot.task_family == TASK_NEXT_TO:
+        lines.append(f"Target/referent surface distance: {metric('surface_distance')}")
+    elif snapshot.task_family == TASK_BETWEEN:
+        lines.append(f"Perpendicular distance: {metric('perpendicular_distance')}")
+    elif snapshot.task_family == TASK_MOVE:
+        lines.append(f"Distance to boundary: {metric('distance_to_boundary')}")
+        lines.append(f"Trajectory straightness (lateral error): {metric('current_lateral_error')}")
+    return "\n".join(lines)
+
+
+class _SimClockRateWindow:
+    """Omni UI window showing the instruction, sim speed, and optional task status."""
+
+    def __init__(
+        self,
+        *,
+        control_dt: float,
+        show_task_status: bool = False,
+        update_interval_s: float = 0.5,
+    ):
         self._control_dt = control_dt
+        self._show_task_status = show_task_status
         self._update_interval_s = update_interval_s
         self._window = None
+        self._instruction_label = None
+        self._task_status_label = None
         self._rate_label = None
         self._fps_label = None
         self._sim_time_s = 0.0
@@ -698,22 +768,41 @@ class _SimClockRateWindow:
         try:
             import omni.ui as ui
 
-            self._window = ui.Window("SO-101 Sim Speed", width=260, height=82)
+            height = 184 if self._show_task_status else 126
+            self._window = ui.Window("SO-101 Teleop", width=620, height=height)
             with self._window.frame:
                 with ui.VStack(spacing=4):
+                    self._instruction_label = ui.Label("Instruction: --", word_wrap=True)
                     self._rate_label = ui.Label("Sim speed: --")
                     self._fps_label = ui.Label("Sim FPS: --")
+                    if self._show_task_status:
+                        self._task_status_label = ui.Label(
+                            "Task status: waiting for episode start",
+                            word_wrap=True,
+                        )
         except Exception as exc:
-            print(f"[WARN]: Sim speed UI unavailable: {exc}")
+            print(f"[WARN]: Teleop status UI unavailable: {exc}")
             self._window = None
+            self._instruction_label = None
+            self._task_status_label = None
             self._rate_label = None
             self._fps_label = None
+
+    def set_instruction(self, instruction: str) -> None:
+        if self._instruction_label is not None:
+            self._instruction_label.text = f"Instruction: {instruction}"
+
+    def set_task_status(self, status: str) -> None:
+        if self._task_status_label is not None:
+            self._task_status_label.text = status
 
     def reset(self) -> None:
         self._sim_time_s = 0.0
         now = time.perf_counter()
         self._last_update_wall_s = now
         self._last_update_sim_s = 0.0
+        if self._task_status_label is not None:
+            self._task_status_label.text = "Task status: waiting for episode start"
         self.update(force=True)
 
     def add_step(self) -> None:
@@ -742,6 +831,8 @@ class _SimClockRateWindow:
         if self._window is not None:
             self._window.visible = False
         self._window = None
+        self._instruction_label = None
+        self._task_status_label = None
         self._rate_label = None
         self._fps_label = None
 
@@ -1289,7 +1380,7 @@ def _debug_object_placement_lines(
         ),
         f"rejection_counts={placement.get('rejection_counts', {})}",
     ]
-    if episode.task_family == TASK_BIN:
+    if episode.task_family in {TASK_BIN, TASK_NAMED_BIN}:
         lines.append("task_feasibility=not applicable for bin placement")
     elif task_feasibility is None:
         lines.append("task_feasibility=not evaluated (placement is task-agnostic)")
@@ -1607,7 +1698,11 @@ def _generate_and_save_episode_layouts(
     episode_plan: list[BenchmarkEpisodeSpec],
 ) -> tuple[list[dict], Path]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    layout_rng = random.Random(args_cli.seed)
+    # Layout diversity should not depend on the deterministic simulator/teleop
+    # seed. Use one auditable wall-clock seed for the entire generated file.
+    layout_seed = time.time_ns()
+    layout_rng = random.Random(layout_seed)
+    print(f"[INFO]: Generating episode layouts with time-derived seed {layout_seed}.")
     # Shared across the run so object roots spread away from recent episodes
     # (high inter-episode placement variance).
     placement_history: list[tuple[float, float]] = []
@@ -1619,7 +1714,7 @@ def _generate_and_save_episode_layouts(
             bin_random_poses=BIN_RANDOM_POSES,
             valid_spawn_regions=VALID_OBJECT_SPAWN_REGIONS,
             table_object_z=TABLE_OBJECT_Z,
-            seed=args_cli.seed,
+            seed=layout_seed,
             generated_at=generated_at,
             robot_bounding_box=SO101_BOUNDING_BOX,
             placement_history=placement_history,
@@ -2124,7 +2219,17 @@ def main():
     if args_cli.debug_object_placement:
         _write_object_placement_debug_artifacts(episode_plan, episode_layouts, layout_path)
 
-    object_pool = _episode_object_pool(episode_plan)
+    object_pool_episode_specs = (
+        load_episode_jsonl(args_cli.object_pool_episodes_jsonl)
+        if args_cli.object_pool_episodes_jsonl is not None
+        else episode_plan
+    )
+    object_pool = _episode_object_pool(object_pool_episode_specs)
+    if args_cli.object_pool_episodes_jsonl is not None:
+        print(
+            f"[INFO]: Using canonical object-pool order from {args_cli.object_pool_episodes_jsonl} "
+            f"({len(object_pool_episode_specs)} episode row(s))."
+        )
     print(f"[INFO]: Pre-spawning {len(object_pool)} benchmark object asset(s): {', '.join(object_pool)}")
 
     env, object_asset_names, success_term_params, failure_term_params = _make_env(
@@ -2147,6 +2252,11 @@ def main():
             "[INFO]: Task debugging enabled: observer checks run every control step and detailed statuses print "
             f"every {DEBUG_TASKS_PRINT_INTERVAL_S:.1f}s."
         )
+    if args_cli.task_status_ui:
+        print(
+            "[INFO]: Spatial task status UI enabled: next-to, between, and move measurements update "
+            f"every {TASK_STATUS_UI_UPDATE_INTERVAL_S:.1f}s."
+        )
 
     cameras = _discover_cameras(env)
     if not cameras:
@@ -2154,16 +2264,22 @@ def main():
     camera_sources = _real_compatible_camera_sources(cameras)
     dataset_cameras = _dataset_cameras(cameras, camera_sources)
 
+    sim_speed_ui = _SimClockRateWindow(
+        control_dt=control_dt,
+        show_task_status=args_cli.task_status_ui,
+    )
+
     if args_cli.inspect_initial_scene:
         _reset_env(env)
+        sim_speed_ui.set_instruction(_instruction(env, args_cli.task_name))
         _print_initial_scene(env, object_asset_names)
         print("[INFO]: Inspecting initial scene. Close the Isaac app window to exit; physics is not being stepped.")
         while simulation_app.is_running():
             simulation_app.update()
+        sim_speed_ui.close()
         env.close()
         return
 
-    sim_speed_ui = _SimClockRateWindow(control_dt=control_dt)
     mapper = SO101CalibrationMapper(device=env.unwrapped.device)
     action_velocity_limits_lerobot = None
     if args_cli.action_velocity_limit_units_per_s is not None:
@@ -2260,6 +2376,7 @@ def main():
         hold_action_lerobot.clone() if action_velocity_limits_lerobot is not None else None
     )
     next_task_debug_print_time = time.monotonic() + DEBUG_TASKS_PRINT_INTERVAL_S
+    next_task_status_ui_update_time = time.monotonic()
     task_debug_prev_lines: dict[int, dict[str, str]] = {}
 
     def _current_task() -> str:
@@ -2295,7 +2412,7 @@ def main():
 
     def _reset_current_episode() -> None:
         nonlocal obs, hold_action, hold_action_lerobot, step, robot_control_started, episode_started
-        nonlocal next_task_debug_print_time, smoothed_action_lerobot
+        nonlocal next_task_debug_print_time, next_task_status_ui_update_time, smoothed_action_lerobot
         print(f"[INFO]: Resetting episode {_current_episode_label()}...")
         hold_action_lerobot, hold_action = _sample_leader_start_pose()
         _configure_env_for_episode(
@@ -2307,6 +2424,9 @@ def main():
         )
         obs, _ = _reset_env(env, hold_action)
         sim_speed_ui.reset()
+        sim_speed_ui.set_instruction(_current_task())
+        if args_cli.task_status_ui and episode_plan[episode_index].task_family in {TASK_BIN, TASK_NAMED_BIN}:
+            sim_speed_ui.set_task_status("Task status: not computed for bin tasks")
         _print_episode_setup(env)
         print(f"[INFO]: Episode instruction: {_current_task()}")
         leader.reset(hold_action_lerobot)
@@ -2318,6 +2438,7 @@ def main():
         episode_started = False
         smoothed_action_lerobot = None
         next_task_debug_print_time = time.monotonic() + DEBUG_TASKS_PRINT_INTERVAL_S
+        next_task_status_ui_update_time = time.monotonic()
         task_debug_prev_lines.clear()
         print("[INFO]: Episode ready at timestep 0. Click the Isaac window and press S to start.")
 
@@ -2336,14 +2457,17 @@ def main():
         recorder.start_episode(task=_current_task())
 
     def _start_episode() -> None:
-        nonlocal episode_started, next_task_debug_print_time, step
+        nonlocal episode_started, next_task_debug_print_time, next_task_status_ui_update_time, step
         if episode_started:
             return
         _apply_robot_start_pose_from_leader()
         step = 0
         episode_started = True
         next_task_debug_print_time = time.monotonic() + DEBUG_TASKS_PRINT_INTERVAL_S
+        next_task_status_ui_update_time = time.monotonic()
         sim_speed_ui.reset()
+        if args_cli.task_status_ui and episode_plan[episode_index].task_family in {TASK_BIN, TASK_NAMED_BIN}:
+            sim_speed_ui.set_task_status("Task status: not computed for bin tasks")
         if recorder is not None:
             recorder.start_episode(task=_current_task())
         print(
@@ -2431,9 +2555,34 @@ def main():
             f"dataset={args_cli.repo_root if recorder is not None else 'disabled'}"
         )
 
-    def _update_task_debug() -> None:
-        nonlocal next_task_debug_print_time
-        if not args_cli.debug_tasks:
+    def _current_task_diagnostics():
+        return task_condition_diagnostics(
+            env.unwrapped,
+            object_asset_names=object_asset_names,
+            bin_name=success_term_params["bin_name"],
+            table_bounds=success_term_params.get("table_bounds"),
+            success_min_episode_time_s=success_term_params.get("min_episode_time_s", 5.0),
+            confirm_time_s=success_term_params.get("confirm_time_s", 1.0),
+            move_straightness_tolerance=success_term_params.get(
+                "move_straightness_tolerance", 0.0508
+            ),
+            failure_min_episode_time_s=failure_term_params.get("min_episode_time_s", 5.0),
+            max_grasp_attempts=failure_term_params.get("max_grasp_attempts", 3),
+            enforce_max_grasp_attempts=failure_term_params.get("enforce_max_grasp_attempts", True),
+            bin_displacement_limit=failure_term_params.get("bin_displacement_limit", 0.0254),
+            non_target_displacement_limit=failure_term_params.get(
+                "non_target_displacement_limit", 0.0127
+            ),
+            boundary_displacement_limit=failure_term_params.get("boundary_displacement_limit", 0.0127),
+        )
+
+    def _update_task_observers() -> None:
+        nonlocal next_task_debug_print_time, next_task_status_ui_update_time
+        show_spatial_status = (
+            args_cli.task_status_ui
+            and episode_plan[episode_index].task_family not in {TASK_BIN, TASK_NAMED_BIN}
+        )
+        if not args_cli.debug_tasks and not show_spatial_status:
             return
 
         unwrapped = env.unwrapped
@@ -2442,33 +2591,25 @@ def main():
         if not args_cli.end_on_success:
             task_success(unwrapped, **success_term_params)
         now = time.monotonic()
-        if now < next_task_debug_print_time:
+        debug_due = args_cli.debug_tasks and now >= next_task_debug_print_time
+        status_ui_due = show_spatial_status and now >= next_task_status_ui_update_time
+        if not debug_due and not status_ui_due:
             return
 
+        diagnostics = _current_task_diagnostics()
+        if status_ui_due:
+            while next_task_status_ui_update_time <= now:
+                next_task_status_ui_update_time += TASK_STATUS_UI_UPDATE_INTERVAL_S
+            sim_speed_ui.set_task_status(_task_status_ui_text(diagnostics))
+
+        if not debug_due:
+            return
         while next_task_debug_print_time <= now:
             next_task_debug_print_time += DEBUG_TASKS_PRINT_INTERVAL_S
         max_grasp_attempts = failure_term_params.get("max_grasp_attempts", 3)
         enforce_max_grasp_attempts = failure_term_params.get("enforce_max_grasp_attempts", True)
         _print_task_diagnostics(
-            task_condition_diagnostics(
-                unwrapped,
-                object_asset_names=object_asset_names,
-                bin_name=success_term_params["bin_name"],
-                table_bounds=success_term_params.get("table_bounds"),
-                success_min_episode_time_s=success_term_params.get("min_episode_time_s", 5.0),
-                confirm_time_s=success_term_params.get("confirm_time_s", 1.0),
-                move_straightness_tolerance=success_term_params.get(
-                    "move_straightness_tolerance", 0.0508
-                ),
-                failure_min_episode_time_s=failure_term_params.get("min_episode_time_s", 5.0),
-                max_grasp_attempts=max_grasp_attempts,
-                enforce_max_grasp_attempts=enforce_max_grasp_attempts,
-                bin_displacement_limit=failure_term_params.get("bin_displacement_limit", 0.0254),
-                non_target_displacement_limit=failure_term_params.get(
-                    "non_target_displacement_limit", 0.0127
-                ),
-                boundary_displacement_limit=failure_term_params.get("boundary_displacement_limit", 0.0127),
-            ),
+            diagnostics,
             _current_episode_label(),
             unwrapped,
             object_asset_names,
@@ -2536,7 +2677,7 @@ def main():
                 obs, _rewards, terminated, truncated, info = env.step(actions)
                 step += 1
                 sim_speed_ui.add_step()
-                _update_task_debug()
+                _update_task_observers()
 
                 if recorder is not None and recorder.recording:
                     observation_lerobot = mapper.sim_radians_to_lerobot_positions(

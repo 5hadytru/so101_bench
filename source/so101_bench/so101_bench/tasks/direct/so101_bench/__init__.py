@@ -19,6 +19,7 @@ def _register(task_id: str, cfg_name: str):
 
 _register("So101Bench-Mixed-v0", "So101BenchEnvCfg")
 _register("So101Bench-Bin-v0", "So101BenchBinEnvCfg")
+_register("So101Bench-NamedBin-v0", "So101BenchNamedBinEnvCfg")
 _register("So101Bench-Bin-SingleObject-v0", "So101BenchBinSingleObjectEnvCfg")
 _register("So101Bench-Bin-Object1-v0", "So101BenchBinObject1EnvCfg")
 _register("So101Bench-Bin-Object2-v0", "So101BenchBinObject2EnvCfg")

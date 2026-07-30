@@ -21,6 +21,7 @@ import json
 import math
 from pathlib import Path
 import platform
+import signal
 import subprocess
 import sys
 import time
@@ -181,6 +182,36 @@ parser.add_argument("--dataset_image_writer_processes", type=int, default=0)
 parser.add_argument("--dataset_image_writer_threads_per_camera", type=int, default=4)
 parser.add_argument("--dataset_video_files_size_mb", type=int, default=200)
 parser.add_argument(
+    "--retime_reference_repo_root",
+    type=Path,
+    default=None,
+    help=(
+        "Optional local LeRobot dataset whose mean frames per episode is matched by uniformly time-warping "
+        "every replayed source action path. The output remains at the environment control rate and, with "
+        "--record_dataset, contains newly simulated images, states, and actions."
+    ),
+)
+parser.add_argument(
+    "--retime_scale",
+    type=float,
+    default=None,
+    help=(
+        "Explicit uniform trajectory-duration multiplier. Values must be >= 1.0. This is mutually exclusive "
+        "with --retime_reference_repo_root."
+    ),
+)
+parser.add_argument(
+    "--retime_strategy",
+    choices=("tracking_compensated", "action_path"),
+    default="tracking_compensated",
+    help=(
+        "How slowed arm targets are constructed. 'tracking_compensated' follows the recorded physical "
+        "joint-state path and retains a time-scaled fraction of the original action/state tracking offset; "
+        "'action_path' directly time-warps the original commands. The gripper always follows the original "
+        "command path so grasp/release semantics are preserved."
+    ),
+)
+parser.add_argument(
     "--frame_source",
     choices=("dataset", "sim", "none"),
     default="none",
@@ -190,6 +221,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument("--overwrite", action="store_true", default=False, help="Allow writing into an existing output dir.")
+parser.add_argument(
+    "--resume",
+    action="store_true",
+    default=False,
+    help=(
+        "Resume a sequential replay from an existing --output_dir and recorded LeRobot dataset. "
+        "Completed outcome rows and recorded episodes must be contiguous and have identical counts."
+    ),
+)
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
@@ -354,6 +394,7 @@ from so101_bench.utils.lerobot_dataset import (
 
 
 ACTION = "action"
+OBSERVATION_STATE = "observation.state"
 ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 INITIAL_ROBOT_JOINT_POS = lerobot_pose_to_sim_joint_pos(LEROBOT_INITIAL_JOINT_POS)
 BIN_NAME = "plastic_bin"
@@ -378,6 +419,24 @@ CONDITION_COUNTER_SPECS = (
 )
 
 ACTION_PHASE_IDS = {"reset": 0, "initial_hold": 1, "dataset": 2, "final_hold": 3}
+STOP_REQUESTED = False
+
+
+def _request_graceful_stop(signum, _frame) -> None:
+    """Finish active replay lanes, persist them, and then stop scheduling episodes."""
+
+    global STOP_REQUESTED
+    if not STOP_REQUESTED:
+        signal_name = signal.Signals(signum).name
+        print(
+            f"\n[INFO]: Received {signal_name}; finishing the active episode before pausing...",
+            flush=True,
+        )
+    STOP_REQUESTED = True
+
+
+for _stop_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_stop_signal, _request_graceful_stop)
 
 
 class SO101ReplayActionMapper:
@@ -460,10 +519,24 @@ class LeRobotActionEpisode:
     fps: float
     action_names: tuple[str, ...]
     actions: torch.Tensor
+    observed_states: torch.Tensor | None = None
 
     @property
     def num_frames(self) -> int:
         return int(self.actions.shape[0])
+
+
+@dataclass(frozen=True)
+class UniformRetimingPlan:
+    """Smooth time warp used to lengthen a replay while preserving its demonstrated path."""
+
+    scale: float
+    strategy: str
+    source_mean_frames: float
+    target_mean_frames: float
+    source_total_episodes: int
+    source_total_frames: int
+    reference_repo_root: str | None
 
 
 @dataclass
@@ -496,6 +569,7 @@ class ReplayLane:
     episode_layout: dict | None
     dataset_episode_index: int
     action_episode: LeRobotActionEpisode
+    source_action_num_frames: int
     setup: dict[str, Any]
     initial_scene: dict[str, Any]
     initial_frame_path: Path | None
@@ -567,6 +641,11 @@ def _run_provenance() -> dict[str, Any]:
 
     tracked_status = command_output(["git", "status", "--porcelain", "--untracked-files=no"])
     metadata_info_path = args_cli.repo_root / "meta" / "info.json" if args_cli.repo_root is not None else None
+    retime_reference_info_path = (
+        args_cli.retime_reference_repo_root / "meta" / "info.json"
+        if args_cli.retime_reference_repo_root is not None
+        else None
+    )
     _PROVENANCE_CACHE = {
         "git_commit": command_output(["git", "rev-parse", "HEAD"]),
         "git_tracked_worktree_dirty": bool(tracked_status),
@@ -582,6 +661,7 @@ def _run_provenance() -> dict[str, Any]:
             "object_pool_episodes_jsonl": _file_sha256(args_cli.object_pool_episodes_jsonl),
             "episode_layouts_jsonl": _file_sha256(args_cli.episode_layouts_jsonl),
             "dataset_info_json": _file_sha256(metadata_info_path),
+            "retime_reference_info_json": _file_sha256(retime_reference_info_path),
         },
         "collector_script_sha256": _file_sha256(Path(__file__).resolve()),
     }
@@ -657,37 +737,38 @@ def _open_lerobot_dataset(repo_id: str, root: Path | None, episode_index: int):
     return LeRobotDataset(repo_id, **dataset_kwargs)
 
 
-def _raw_action_to_tensor(
-    raw_action: Any,
+def _raw_joint_positions_to_tensor(
+    raw_positions: Any,
     source_names: list[str],
     *,
+    feature_name: str,
     device: str,
     episode_index: int,
     frame_index: int,
 ) -> torch.Tensor:
-    if isinstance(raw_action, dict):
-        raw_names = list(raw_action.keys())
-        raw_values = np.asarray([raw_action[name] for name in raw_names], dtype=np.float32).reshape(-1)
+    if isinstance(raw_positions, dict):
+        raw_names = list(raw_positions.keys())
+        raw_values = np.asarray([raw_positions[name] for name in raw_names], dtype=np.float32).reshape(-1)
         source_names = raw_names
-    elif isinstance(raw_action, torch.Tensor):
-        raw_values = raw_action.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+    elif isinstance(raw_positions, torch.Tensor):
+        raw_values = raw_positions.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
     else:
-        raw_values = np.asarray(raw_action, dtype=np.float32).reshape(-1)
+        raw_values = np.asarray(raw_positions, dtype=np.float32).reshape(-1)
 
     if len(source_names) != len(raw_values):
         if len(raw_values) == len(LEROBOT_JOINT_FEATURE_ORDER):
             source_names = list(LEROBOT_JOINT_FEATURE_ORDER)
         else:
             raise ValueError(
-                f"Dataset episode {episode_index} frame {frame_index} has action shape {raw_values.shape}, "
-                f"but action feature names are {source_names!r}."
+                f"Dataset episode {episode_index} frame {frame_index} has {feature_name} shape "
+                f"{raw_values.shape}, but its feature names are {source_names!r}."
             )
 
     index_by_name = {_canonical_action_name(name): index for index, name in enumerate(source_names)}
     missing = [name for name in LEROBOT_JOINT_FEATURE_ORDER if name not in index_by_name]
     if missing:
         raise ValueError(
-            f"Dataset episode {episode_index} action names are missing {missing}. "
+            f"Dataset episode {episode_index} {feature_name} names are missing {missing}. "
             f"Found {source_names!r}."
         )
 
@@ -701,40 +782,75 @@ def _load_lerobot_action_episode(
     root: Path | None,
     episode_index: int,
     device: str,
+    load_observed_states: bool = False,
 ) -> LeRobotActionEpisode:
     dataset = _open_lerobot_dataset(repo_id, root, episode_index)
     features = getattr(dataset, "features", {})
     if ACTION not in features:
         raise ValueError(f"LeRobot dataset has no {ACTION!r} feature. Found features: {list(features)}")
+    if load_observed_states and OBSERVATION_STATE not in features:
+        raise ValueError(
+            f"Trajectory-preserving retiming requires {OBSERVATION_STATE!r}. "
+            f"Found features: {list(features)}. Use --retime_strategy action_path for this dataset."
+        )
 
     feature_names = _coerce_action_feature_names(features[ACTION].get("names"))
+    state_feature_names = (
+        _coerce_action_feature_names(features[OBSERVATION_STATE].get("names"))
+        if load_observed_states
+        else []
+    )
     if hasattr(dataset, "select_columns"):
         action_rows = dataset.select_columns(ACTION)
+        state_rows = dataset.select_columns(OBSERVATION_STATE) if load_observed_states else None
     else:
         action_rows = getattr(dataset, "hf_dataset").select_columns(ACTION)
+        state_rows = (
+            getattr(dataset, "hf_dataset").select_columns(OBSERVATION_STATE)
+            if load_observed_states
+            else None
+        )
 
     num_frames = int(getattr(dataset, "num_frames", len(action_rows)))
     if num_frames <= 0:
         raise ValueError(f"LeRobot dataset episode {episode_index} has no frames.")
 
     actions = []
+    observed_states = [] if load_observed_states else None
     for frame_index in range(num_frames):
         row = action_rows[frame_index]
         actions.append(
-            _raw_action_to_tensor(
+            _raw_joint_positions_to_tensor(
                 row[ACTION],
                 feature_names,
+                feature_name=ACTION,
                 device=device,
                 episode_index=episode_index,
                 frame_index=frame_index,
             )
         )
+        if observed_states is not None:
+            assert state_rows is not None
+            state_row = state_rows[frame_index]
+            observed_states.append(
+                _raw_joint_positions_to_tensor(
+                    state_row[OBSERVATION_STATE],
+                    state_feature_names,
+                    feature_name=OBSERVATION_STATE,
+                    device=device,
+                    episode_index=episode_index,
+                    frame_index=frame_index,
+                )
+            )
 
     return LeRobotActionEpisode(
         episode_index=episode_index,
         fps=_dataset_fps(dataset),
         action_names=tuple(LEROBOT_JOINT_FEATURE_ORDER),
         actions=torch.stack(actions, dim=0),
+        observed_states=(
+            torch.stack(observed_states, dim=0) if observed_states is not None else None
+        ),
     )
 
 
@@ -748,6 +864,163 @@ def _dataset_total_episodes(root: Path | None) -> int | None:
         return int(json.loads(info_path.read_text(encoding="utf-8"))["total_episodes"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def _dataset_frame_totals(root: Path, *, option_name: str) -> tuple[int, int]:
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"{option_name} is missing LeRobot metadata: {info_path}")
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        total_episodes = int(info["total_episodes"])
+        total_frames = int(info["total_frames"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"{info_path} must contain integer total_episodes and total_frames fields."
+        ) from exc
+    if total_episodes <= 0 or total_frames <= 0:
+        raise ValueError(
+            f"{info_path} has invalid dataset totals: episodes={total_episodes}, frames={total_frames}."
+        )
+    return total_episodes, total_frames
+
+
+def _build_uniform_retiming_plan(source_root: Path | None) -> UniformRetimingPlan | None:
+    if args_cli.retime_reference_repo_root is None and args_cli.retime_scale is None:
+        return None
+    if args_cli.retime_reference_repo_root is not None and args_cli.retime_scale is not None:
+        raise ValueError("--retime_reference_repo_root and --retime_scale are mutually exclusive.")
+    if source_root is None:
+        raise ValueError("Action retiming requires a local --repo_root.")
+
+    source_episodes, source_frames = _dataset_frame_totals(source_root, option_name="--repo_root")
+    source_mean = source_frames / source_episodes
+    reference_root = args_cli.retime_reference_repo_root
+    if reference_root is not None:
+        reference_episodes, reference_frames = _dataset_frame_totals(
+            reference_root,
+            option_name="--retime_reference_repo_root",
+        )
+        target_mean = reference_frames / reference_episodes
+        scale = target_mean / source_mean
+    else:
+        scale = float(args_cli.retime_scale)
+        target_mean = source_mean * scale
+
+    if not math.isfinite(scale) or scale < 1.0:
+        raise ValueError(
+            "Retiming only supports slowing trajectories: expected a finite scale >= 1.0, "
+            f"got {scale:.9g} from source_mean={source_mean:.3f}, target_mean={target_mean:.3f}."
+        )
+    return UniformRetimingPlan(
+        scale=scale,
+        strategy=args_cli.retime_strategy,
+        source_mean_frames=source_mean,
+        target_mean_frames=target_mean,
+        source_total_episodes=source_episodes,
+        source_total_frames=source_frames,
+        reference_repo_root=str(reference_root) if reference_root is not None else None,
+    )
+
+
+def smoothly_retime_waypoint_path(
+    source_waypoints: np.ndarray,
+    *,
+    initial_waypoint: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+    """Time-warp a joint path with shape-preserving C1 interpolation.
+
+    PCHIP avoids the coordinate overshoot of an unconstrained cubic spline while
+    removing the velocity discontinuities introduced by repeated frames or
+    piecewise-linear targets. The final waypoint is restored exactly.
+    """
+
+    from scipy.interpolate import PchipInterpolator
+
+    waypoints = np.asarray(source_waypoints, dtype=np.float32)
+    initial = np.asarray(initial_waypoint, dtype=np.float32)
+    if waypoints.ndim != 2 or waypoints.shape[0] < 1:
+        raise ValueError(f"Expected non-empty [frames, joints] waypoints, got shape {waypoints.shape}.")
+    if initial.shape != waypoints.shape[1:]:
+        raise ValueError(
+            f"Initial waypoint shape {initial.shape} does not match joint shape {waypoints.shape[1:]}."
+        )
+    if not math.isfinite(scale) or scale < 1.0:
+        raise ValueError(f"Expected finite retime scale >= 1.0, got {scale!r}.")
+
+    source_frames = int(waypoints.shape[0])
+    target_frames = max(source_frames, int(round(source_frames * scale)))
+    if target_frames == source_frames:
+        return waypoints.copy()
+
+    path = np.concatenate((initial[None, :], waypoints), axis=0)
+    source_times = np.arange(source_frames + 1, dtype=np.float64)
+    target_times = np.arange(1, target_frames + 1, dtype=np.float64) * (
+        source_frames / target_frames
+    )
+    result = PchipInterpolator(source_times, path, axis=0)(target_times)
+    result[-1] = waypoints[-1]
+    return np.asarray(result, dtype=np.float32)
+
+
+def trajectory_preserving_retime_actions(
+    source_actions: np.ndarray,
+    *,
+    source_observed_states: np.ndarray | None,
+    initial_action: np.ndarray,
+    scale: float,
+    strategy: str,
+) -> np.ndarray:
+    """Build smooth slowed commands that follow the demonstrated physical path.
+
+    Directly stretching absolute position commands gives the simulator more time to
+    converge on command excursions that the original robot only partially reached.
+    That changes the spatial path and can cause overshoot. The tracking-compensated
+    strategy instead uses the recorded joint-state path as the arm reference and
+    retains 1/scale of the original action/state offset as feed-forward. At scale
+    1.0 this reduces exactly to the original arm commands; as duration increases it
+    smoothly reduces the dynamic lead that would otherwise cause overshoot.
+
+    The gripper keeps the source command path (rather than the observed jaw state)
+    so grasp and release intent remains coordinated with arm progress.
+    """
+
+    actions = np.asarray(source_actions, dtype=np.float32)
+    initial = np.asarray(initial_action, dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[0] < 1:
+        raise ValueError(f"Expected non-empty [frames, joints] actions, got shape {actions.shape}.")
+    if initial.shape != actions.shape[1:]:
+        raise ValueError(
+            f"Initial action shape {initial.shape} does not match action joint shape {actions.shape[1:]}."
+        )
+    if not math.isfinite(scale) or scale < 1.0:
+        raise ValueError(f"Expected finite retime scale >= 1.0, got {scale!r}.")
+
+    if strategy == "action_path":
+        waypoints = actions
+    elif strategy == "tracking_compensated":
+        if source_observed_states is None:
+            raise ValueError(
+                "tracking_compensated retiming requires source observation.state waypoints."
+            )
+        states = np.asarray(source_observed_states, dtype=np.float32)
+        if states.shape != actions.shape:
+            raise ValueError(
+                f"Observed-state shape {states.shape} does not match action shape {actions.shape}."
+            )
+        waypoints = states + (actions - states) / scale
+        # Jaw observations contain actuator/contact lag. Preserve the demonstrated
+        # command path so close/open intent is not weakened by feeding that lag back.
+        waypoints[:, -1] = actions[:, -1]
+    else:
+        raise ValueError(f"Unknown retime strategy: {strategy!r}.")
+
+    return smoothly_retime_waypoint_path(
+        waypoints,
+        initial_waypoint=initial,
+        scale=scale,
+    )
 
 
 def _load_dataset_video_spans(
@@ -2499,11 +2772,13 @@ def _manual_term_evals(
     control_dt: float,
     success_params: dict[str, Any],
     failure_params: dict[str, Any],
+    timeout_scale: float = 1.0,
 ) -> dict[int, TermEval]:
     with torch.inference_mode():
         timed_out_tensor = task_time_out(
             env.unwrapped,
             confirm_time_s=float(success_params.get("confirm_time_s", 3.0)),
+            duration_scale=timeout_scale,
         )
         failure_tensor = benchmark_failure(env.unwrapped, **failure_params)
         success_tensor = task_success(env.unwrapped, **success_params)
@@ -2645,6 +2920,108 @@ def _planned_count(episode_specs: list[BenchmarkEpisodeSpec], benchmark_start: i
     return min(dataset_remaining, benchmark_remaining)
 
 
+def _load_resume_records(output_dir: Path) -> list[dict[str, Any]]:
+    if not args_cli.resume:
+        return []
+    episodes_path = output_dir / "episodes.jsonl"
+    if not episodes_path.is_file():
+        return []
+
+    records: list[dict[str, Any]] = []
+    with episodes_path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Cannot resume: invalid JSON in {episodes_path} at line {line_number}."
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Cannot resume: expected an object in {episodes_path} at line {line_number}."
+                )
+            records.append(record)
+    return records
+
+
+def _validate_resume_state(records: list[dict[str, Any]]) -> None:
+    if not args_cli.resume:
+        return
+    if args_cli.overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive.")
+    if args_cli.output_dir is None:
+        raise ValueError("--resume requires an explicit --output_dir.")
+    if args_cli.dataset_episode_indices is not None or args_cli.benchmark_episode_indices is not None:
+        raise ValueError("--resume currently supports only contiguous sequential episode selection.")
+    if args_cli.benchmark_episode_index not in (None, args_cli.dataset_episode_index):
+        raise ValueError(
+            "--resume requires --benchmark_episode_index to equal --dataset_episode_index when provided."
+        )
+    if not args_cli.record_dataset or args_cli.record_repo_root is None:
+        raise ValueError("--resume requires --record_dataset and --record_repo_root.")
+
+    expected_source_indices = list(
+        range(args_cli.dataset_episode_index, args_cli.dataset_episode_index + len(records))
+    )
+    actual_source_indices = []
+    actual_recorded_indices = []
+    for row_id, record in enumerate(records):
+        try:
+            actual_source_indices.append(int(record["dataset"]["episode_index"]))
+            actual_recorded_indices.append(int(record["recorded_sim_dataset"]["episode_index"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot resume: outcome record {row_id} lacks valid source/recorded episode indices."
+            ) from exc
+    if actual_source_indices != expected_source_indices:
+        raise ValueError(
+            "Cannot resume: outcome source episode indices are not contiguous from "
+            f"{args_cli.dataset_episode_index}: {actual_source_indices[:10]}..."
+        )
+    expected_recorded_indices = list(range(len(records)))
+    if actual_recorded_indices != expected_recorded_indices:
+        raise ValueError(
+            "Cannot resume: recorded dataset episode indices are not contiguous from zero: "
+            f"{actual_recorded_indices[:10]}..."
+        )
+
+    recorded_total = _dataset_total_episodes(args_cli.record_repo_root)
+    if recorded_total is None:
+        if records:
+            raise ValueError(
+                f"Cannot resume: recorded dataset metadata is missing under {args_cli.record_repo_root}."
+            )
+    elif recorded_total != len(records):
+        raise ValueError(
+            "Cannot resume: outcome/recorded dataset counts differ: "
+            f"outcomes={len(records)}, recorded_episodes={recorded_total}."
+        )
+
+    if records:
+        prior_hashes = records[0].get("provenance", {}).get("input_sha256", {})
+        current_hashes = {
+            "episodes_jsonl": _file_sha256(args_cli.episodes_jsonl),
+            "episode_layouts_jsonl": _file_sha256(args_cli.episode_layouts_jsonl),
+            "dataset_info_json": _file_sha256(
+                args_cli.repo_root / "meta" / "info.json" if args_cli.repo_root is not None else None
+            ),
+            "retime_reference_info_json": _file_sha256(
+                args_cli.retime_reference_repo_root / "meta" / "info.json"
+                if args_cli.retime_reference_repo_root is not None
+                else None
+            ),
+        }
+        mismatches = {
+            key: {"previous": prior_hashes.get(key), "current": value}
+            for key, value in current_hashes.items()
+            if prior_hashes.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"Cannot resume because replay inputs changed: {mismatches}")
+
+
 def _make_output_dir() -> Path:
     if args_cli.output_dir is not None:
         output_dir = args_cli.output_dir
@@ -2664,7 +3041,7 @@ def _make_output_dir() -> Path:
             )
 
     episodes_path = output_dir / "episodes.jsonl"
-    if output_dir.exists() and episodes_path.exists() and not args_cli.overwrite:
+    if output_dir.exists() and episodes_path.exists() and not (args_cli.overwrite or args_cli.resume):
         raise FileExistsError(f"Output dir already contains episodes.jsonl; use --overwrite or a new dir: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "frames").mkdir(exist_ok=True)
@@ -2734,6 +3111,7 @@ def _start_replay_lane(
     hold_action_lerobot: torch.Tensor,
     success_params: dict[str, Any],
     failure_params: dict[str, Any],
+    retiming_plan: UniformRetimingPlan | None,
 ) -> ReplayLane:
     episode = episode_plan[offset]
     benchmark_index = benchmark_indices[offset]
@@ -2748,7 +3126,40 @@ def _start_replay_lane(
         root=args_cli.repo_root,
         episode_index=dataset_episode_index,
         device=env.unwrapped.device,
+        load_observed_states=(
+            retiming_plan is not None and retiming_plan.strategy == "tracking_compensated"
+        ),
     )
+    source_action_num_frames = action_episode.num_frames
+    if retiming_plan is not None:
+        source_actions = mapper.clamp_lerobot_positions(action_episode.actions)
+        source_observed_states = (
+            mapper.clamp_lerobot_positions(action_episode.observed_states)
+            if action_episode.observed_states is not None
+            else None
+        )
+        retimed_actions = trajectory_preserving_retime_actions(
+            source_actions.detach().cpu().numpy(),
+            source_observed_states=(
+                source_observed_states.detach().cpu().numpy()
+                if source_observed_states is not None
+                else None
+            ),
+            initial_action=hold_action_lerobot.detach().cpu().numpy(),
+            scale=retiming_plan.scale,
+            strategy=retiming_plan.strategy,
+        )
+        action_episode = LeRobotActionEpisode(
+            episode_index=action_episode.episode_index,
+            fps=1.0 / control_dt,
+            action_names=action_episode.action_names,
+            actions=torch.as_tensor(retimed_actions, dtype=torch.float32, device=env.unwrapped.device),
+        )
+        print(
+            f"[INFO]: Lane {env_id}: retimed {source_action_num_frames} source action frame(s) to "
+            f"{action_episode.num_frames} frame(s) "
+            f"(scale={retiming_plan.scale:.6f}, strategy={retiming_plan.strategy})."
+        )
     dataset_dt = 1.0 / max(action_episode.fps, 1.0e-6)
     if abs(dataset_dt - control_dt) > 1.0e-3:
         print(
@@ -2804,6 +3215,7 @@ def _start_replay_lane(
         episode_layout=episode_layout,
         dataset_episode_index=dataset_episode_index,
         action_episode=action_episode,
+        source_action_num_frames=source_action_num_frames,
         setup=setup,
         initial_scene=_scene_state(env, object_asset_names, object_pool, env_id=env_id),
         initial_frame_path=initial_frame_path,
@@ -4364,7 +4776,7 @@ def _finalize_replay_lane(
                 "repo_root": str(args_cli.record_repo_root),
                 "episode_index": lane.recorded_dataset_episode_index,
                 "frame_semantics": (
-                    "one post-step simulated observation for each replayed source action; "
+                    "one post-step simulated observation for each replay action (retimed when configured); "
                     "initial/final diagnostic holds are excluded"
                 ),
             }
@@ -4410,6 +4822,29 @@ def _finalize_replay_lane(
             failure_params=failure_params,
         ),
         "episode_length": {
+            "source_dataset_frames": lane.source_action_num_frames,
+            "uniform_retime_scale": (
+                lane.action_episode.num_frames / max(lane.source_action_num_frames, 1)
+            ),
+            "retime_strategy": (
+                args_cli.retime_strategy
+                if args_cli.retime_reference_repo_root is not None or args_cli.retime_scale is not None
+                else None
+            ),
+            "retime_interpolation": (
+                "pchip"
+                if args_cli.retime_reference_repo_root is not None or args_cli.retime_scale is not None
+                else None
+            ),
+            "timeout_scale": (
+                (
+                    float(args_cli.retime_scale)
+                    if args_cli.retime_scale is not None
+                    else lane.action_episode.num_frames / max(lane.source_action_num_frames, 1)
+                )
+                if args_cli.retime_reference_repo_root is not None or args_cli.retime_scale is not None
+                else 1.0
+            ),
             "dataset_frames": lane.action_episode.num_frames,
             "dataset_seconds": lane.action_episode.num_frames / max(lane.action_episode.fps, 1.0e-6),
             "frames_played": lane.frame_index,
@@ -4507,7 +4942,12 @@ def main():
         raise ValueError(f"Expected --hold_last_action_time_s >= 0, got {args_cli.hold_last_action_time_s}.")
     if args_cli.trajectory_stride < 1:
         raise ValueError(f"Expected --trajectory_stride >= 1, got {args_cli.trajectory_stride}.")
+    retiming_plan = _build_uniform_retiming_plan(args_cli.repo_root)
     episode_specs = load_episode_jsonl(args_cli.episodes_jsonl)
+    output_dir = _make_output_dir()
+    resume_records = _load_resume_records(output_dir)
+    _validate_resume_state(resume_records)
+    resume_count = len(resume_records)
     selected_dataset_indices = (
         _parse_episode_indices(
             args_cli.dataset_episode_indices,
@@ -4533,25 +4973,35 @@ def main():
             benchmark_indices = list(selected_dataset_indices)
         episode_plan = _episode_selection(episode_specs, benchmark_indices)
         dataset_episode_indices = list(selected_dataset_indices)
-        planned_count = len(episode_plan)
+        run_planned_count = len(episode_plan)
+        total_planned_count = run_planned_count
     elif args_cli.benchmark_episode_indices:
         benchmark_indices = _parse_episode_indices(args_cli.benchmark_episode_indices)
         episode_plan = _episode_selection(episode_specs, benchmark_indices)
-        planned_count = len(episode_plan)
+        run_planned_count = len(episode_plan)
+        total_planned_count = run_planned_count
     else:
-        benchmark_start = (
+        requested_benchmark_start = (
             args_cli.dataset_episode_index
             if args_cli.benchmark_episode_index is None
             else args_cli.benchmark_episode_index
         )
-        planned_count = _planned_count(episode_specs, benchmark_start)
+        total_planned_count = _planned_count(episode_specs, requested_benchmark_start)
+        if resume_count >= total_planned_count:
+            raise ValueError(
+                "Replay is already complete: "
+                f"resume_records={resume_count}, requested_episodes={total_planned_count}."
+            )
+        benchmark_start = requested_benchmark_start + resume_count
+        run_planned_count = total_planned_count - resume_count
         episode_plan, benchmark_indices = _episode_window(
             episode_specs,
             start_index=benchmark_start,
-            count=planned_count,
+            count=run_planned_count,
         )
     if selected_dataset_indices is None:
-        dataset_episode_indices = [args_cli.dataset_episode_index + i for i in range(len(episode_plan))]
+        dataset_start = args_cli.dataset_episode_index + resume_count
+        dataset_episode_indices = [dataset_start + i for i in range(len(episode_plan))]
     episode_layouts = _load_episode_layouts(episode_plan, benchmark_indices, args_cli.episode_layouts_jsonl)
 
     dataset_instructions = _load_dataset_episode_instructions(args_cli.repo_root)
@@ -4563,7 +5013,6 @@ def main():
         dataset_instructions=dataset_instructions,
     )
 
-    output_dir = _make_output_dir()
     video_spans = (
         _load_dataset_video_spans(args_cli.repo_root)
         if args_cli.frame_source == "dataset"
@@ -4576,10 +5025,22 @@ def main():
         f"dataset episodes {dataset_episode_indices} -> benchmark rows {benchmark_indices}"
     )
     print(f"[INFO]: Saving outcome artifacts to {output_dir}")
+    if resume_count:
+        print(
+            f"[INFO]: Resuming after {resume_count} completed episode(s); "
+            f"next source/benchmark episode is {dataset_episode_indices[0]}."
+        )
     if args_cli.frame_source == "dataset":
         print("[INFO]: Saving overhead frames from recorded LeRobot videos; Isaac camera sensors are disabled.")
     if args_cli.no_success_confirm_time:
         print("[INFO]: Final exhausted action streams will be scored with success confirm_time_s=0.0.")
+    if retiming_plan is not None:
+        print(
+            "[INFO]: Smooth trajectory-preserving retiming: "
+            f"source_mean={retiming_plan.source_mean_frames:.3f} frames/episode, "
+            f"target_mean={retiming_plan.target_mean_frames:.3f}, "
+            f"scale={retiming_plan.scale:.9f}, strategy={retiming_plan.strategy}."
+        )
 
     torch.manual_seed(args_cli.seed)
     if torch.cuda.is_available():
@@ -4645,6 +5106,11 @@ def main():
             video_files_size_mb=args_cli.dataset_video_files_size_mb,
         )
         recorder.init_dataset()
+        if args_cli.resume and recorder.num_saved_episodes != resume_count:
+            raise RuntimeError(
+                "Cannot resume: recorder metadata changed during initialization: "
+                f"outcomes={resume_count}, recorded_episodes={recorder.num_saved_episodes}."
+            )
     else:
         print("[INFO]: Simulated LeRobot dataset recording disabled. Pass --record_dataset to enable it.")
 
@@ -4655,15 +5121,18 @@ def main():
     _reset_env(env)
 
     episodes_path = output_dir / "episodes.jsonl"
-    summary_records: list[dict[str, Any]] = []
+    summary_records: list[dict[str, Any]] = list(resume_records)
+    collection_complete = False
 
     try:
-        with episodes_path.open("w", encoding="utf-8") as episodes_file:
+        episodes_mode = "a" if args_cli.resume else "w"
+        with episodes_path.open(episodes_mode, encoding="utf-8") as episodes_file:
             active_lanes: dict[int, ReplayLane] = {}
             pending_records: dict[int, dict[str, Any]] = {}
             next_offset = 0
             next_write_offset = 0
-            completed_count = 0
+            completed_count = resume_count
+            segment_completed_count = 0
             collection_start_s = time.perf_counter()
 
             def start_lane(env_id: int) -> None:
@@ -4687,6 +5156,7 @@ def main():
                     hold_action_lerobot=hold_action_lerobot,
                     success_params=success_params,
                     failure_params=failure_params,
+                    retiming_plan=retiming_plan,
                 )
                 active_lanes[env_id] = lane
                 if recorder is not None:
@@ -4705,7 +5175,7 @@ def main():
                     summary_records.append(record)
                     next_write_offset += 1
 
-            for env_id in range(min(num_parallel_envs, planned_count)):
+            for env_id in range(min(num_parallel_envs, run_planned_count)):
                 start_lane(env_id)
 
             while active_lanes and simulation_app.is_running():
@@ -4743,6 +5213,9 @@ def main():
                         control_dt=control_dt,
                         success_params=success_params,
                         failure_params=failure_params,
+                        timeout_scale=(
+                            retiming_plan.scale if retiming_plan is not None else 1.0
+                        ),
                     )
 
                 finished_env_ids = []
@@ -4809,12 +5282,17 @@ def main():
                     )
                     pending_records[lane.offset] = record
                     completed_count += 1
+                    segment_completed_count += 1
                     elapsed_s = time.perf_counter() - collection_start_s
-                    episodes_per_minute = 60.0 * completed_count / max(elapsed_s, 1.0e-6)
-                    remaining_s = elapsed_s * (planned_count - completed_count) / completed_count
+                    episodes_per_minute = 60.0 * segment_completed_count / max(elapsed_s, 1.0e-6)
+                    remaining_s = (
+                        elapsed_s
+                        * (total_planned_count - completed_count)
+                        / max(segment_completed_count, 1)
+                    )
                     expected_completion = datetime.now().astimezone() + timedelta(seconds=remaining_s)
                     print(
-                        f"[INFO]: Episode {completed_count}/{planned_count} finished on lane {env_id}: "
+                        f"[INFO]: Episode {completed_count}/{total_planned_count} finished on lane {env_id}: "
                         f"dataset_episode={lane.dataset_episode_index}, "
                         f"label_success={record['label']['success']}, "
                         f"reason={record['label']['failure_reason']}, "
@@ -4825,7 +5303,7 @@ def main():
                         f"eta={_format_duration(remaining_s)}, "
                         f"expected_completion={expected_completion.isoformat(timespec='seconds')}"
                     )
-                    if next_offset < planned_count:
+                    if next_offset < run_planned_count and not STOP_REQUESTED:
                         start_lane(env_id)
 
                 flush_ready_records()
@@ -4843,6 +5321,14 @@ def main():
 
         successes = sum(1 for record in summary_records if record["label"]["success"])
         failures = len(summary_records) - successes
+        source_frame_total = sum(
+            int(record["episode_length"]["source_dataset_frames"])
+            for record in summary_records
+        )
+        replay_frame_total = sum(
+            int(record["episode_length"]["dataset_frames"])
+            for record in summary_records
+        )
         failure_counts: dict[str, int] = {}
         behavioral_failure_counts: dict[str, int] = {}
         for record in summary_records:
@@ -4870,18 +5356,53 @@ def main():
             "provenance": _run_provenance(),
             "episodes_path": str(episodes_path),
             "label_source": args_cli.label_source,
-            "planned_episodes": planned_count,
+            "planned_episodes": total_planned_count,
             "completed_episodes": len(summary_records),
-            "collection_complete": len(summary_records) == planned_count,
+            "collection_complete": len(summary_records) == total_planned_count,
             "missing_dataset_episode_indices": sorted(
-                set(dataset_episode_indices)
+                set(
+                    range(
+                        args_cli.dataset_episode_index,
+                        args_cli.dataset_episode_index + total_planned_count,
+                    )
+                )
                 - {int(record["dataset"]["episode_index"]) for record in summary_records}
             ),
             "successes": successes,
             "failures": failures,
             "success_rate": successes / max(len(summary_records), 1),
+            "successful_dataset_episode_indices": [
+                int(record["dataset"]["episode_index"])
+                for record in summary_records
+                if record["label"]["success"]
+            ],
+            "failed_dataset_episode_indices": [
+                int(record["dataset"]["episode_index"])
+                for record in summary_records
+                if not record["label"]["success"]
+            ],
             "failure_reason_counts": failure_counts,
             "behavioral_outcome_counts": behavioral_failure_counts,
+            "retiming": {
+                "enabled": retiming_plan is not None,
+                "requested_scale": retiming_plan.scale if retiming_plan is not None else 1.0,
+                "strategy": (
+                    retiming_plan.strategy if retiming_plan is not None else None
+                ),
+                "interpolation": "pchip" if retiming_plan is not None else None,
+                "timeout_scale": retiming_plan.scale if retiming_plan is not None else 1.0,
+                "reference_repo_root": (
+                    retiming_plan.reference_repo_root if retiming_plan is not None else None
+                ),
+                "reference_target_mean_frames": (
+                    retiming_plan.target_mean_frames if retiming_plan is not None else None
+                ),
+                "source_total_frames": source_frame_total,
+                "replay_total_frames": replay_frame_total,
+                "source_mean_frames": source_frame_total / max(len(summary_records), 1),
+                "replay_mean_frames": replay_frame_total / max(len(summary_records), 1),
+                "realized_scale": replay_frame_total / max(source_frame_total, 1),
+            },
             "transient_successes": sum(
                 1 for record in summary_records if record.get("outcome_quality", {}).get("success_was_transient")
             ),
@@ -4900,6 +5421,7 @@ def main():
             f"failures={failures}"
         )
         print(f"[INFO]: Wrote {episodes_path} and {output_dir / 'summary.json'}")
+        collection_complete = bool(summary["collection_complete"])
     finally:
         try:
             if recorder is not None and recorder.recording:
@@ -4910,10 +5432,14 @@ def main():
                     recorder.finalize()
             finally:
                 env.close()
+    return collection_complete
 
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
-        main()
+        if not main():
+            exit_code = 130 if STOP_REQUESTED else 1
     finally:
         simulation_app.close()
+    raise SystemExit(exit_code)

@@ -68,7 +68,7 @@ MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # glancing clip), so the move is scored on forward progress instead of "reaching" it.
 MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
 DEFAULT_EPISODE_LENGTH_S = 20.0
-FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 60.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 70.0
 
 
 def episode_length_s(task_family: str, object_count: int) -> float:

@@ -112,7 +112,7 @@ POSTMORTEM_ACQUISITION_HOLD_STEPS = 2
 POSTMORTEM_DROP_HOLD_STEPS = 2
 POSTMORTEM_MEANINGFUL_GOAL_HOLD_TIME_S = 0.25
 
-DEFAULT_SUCCESS_CONFIRM_TIME_S = 3.0
+DEFAULT_SUCCESS_CONFIRM_TIME_S = 5.0
 DEFAULT_FAILURE_CONFIRM_TIME_S = 5.0
 DEFAULT_CONTACT_GRACE_TIME_S = 5.0
 DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S = 5.0
@@ -440,8 +440,17 @@ def _task_success_counters(env: ManagerBasedRLEnv) -> torch.Tensor:
 def task_time_out(
     env: ManagerBasedRLEnv,
     confirm_time_s: float = DEFAULT_SUCCESS_CONFIRM_TIME_S,
+    duration_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Time out episodes unless an in-progress success confirmation window remains intact."""
+    """Time out episodes unless an in-progress success confirmation window remains intact.
+
+    ``duration_scale`` lets an offline replay apply the same time warp to the
+    benchmark time budget as it applies to the action stream. Online benchmark
+    environments retain the original behavior through the default value of 1.0.
+    """
+
+    if not math.isfinite(duration_scale) or duration_scale <= 0.0:
+        raise ValueError(f"Expected finite duration_scale > 0, got {duration_scale!r}.")
 
     active_mask = getattr(env, "_so101_active_object_mask", None)
     if active_mask is None:
@@ -451,7 +460,7 @@ def task_time_out(
     task_families = getattr(env, "_so101_task_family", [TASK_BIN] * env.num_envs)
     timeouts = torch.tensor(
         [
-            episode_length_s(task_family, int(active_count))
+            episode_length_s(task_family, int(active_count)) * duration_scale
             for task_family, active_count in zip(task_families, active_counts, strict=True)
         ],
         dtype=torch.float32,

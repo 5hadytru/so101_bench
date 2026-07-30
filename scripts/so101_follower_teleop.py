@@ -32,6 +32,8 @@ DEFAULT_ACTION_VELOCITY_LIMIT_UNITS_PER_S = (110.0, 140.0, 150.0, 125.0, 110.0, 
 ACTION_VELOCITY_LIMIT_JOINT_COUNT = 6
 DEBUG_TASKS_PRINT_INTERVAL_S = 5.0
 TASK_STATUS_UI_UPDATE_INTERVAL_S = 0.1
+FOLLOWER_CONNECT_TIMEOUT_S = 15.0
+FOLLOWER_OBSERVATION_TIMEOUT_S = 2.0
 
 
 def _str_to_bool(value: str | bool) -> bool:
@@ -838,7 +840,12 @@ class _SimClockRateWindow:
 
 
 class SO101FollowerLeader:
-    """Read a real SO-101 follower arm as a passive LeRobot-position teleop source."""
+    """Read a follower arm without ever blocking Isaac's main/UI thread.
+
+    LeRobot's serial transport can block indefinitely after a USB disconnect.  Keep
+    all calls into it on a daemon worker: the main thread can then process Ctrl-C
+    and close the Kit window even when the transport is wedged.
+    """
 
     def __init__(
         self,
@@ -854,7 +861,17 @@ class SO101FollowerLeader:
         self.device = device
         self.disable_torque = disable_torque
         self.calibrate_on_connect = calibrate_on_connect
-        self.robot = None
+        self._requests: queue.Queue[tuple[Callable[[], Any], queue.Queue[tuple[bool, Any]]]] = queue.Queue()
+        self._worker = threading.Thread(
+            target=self._run_worker,
+            name="so101-follower-io",
+            daemon=True,
+        )
+        self._worker.start()
+        self._pending_observation: queue.Queue[tuple[bool, Any]] | None = None
+        self._pending_observation_started_at: float | None = None
+        self._last_observation: dict[str, Any] | None = None
+        self._closed = False
 
     @staticmethod
     def _import_lerobot_so101():
@@ -869,7 +886,42 @@ class SO101FollowerLeader:
 
         return SO101FollowerConfig, make_robot_from_config
 
+    def _run_worker(self) -> None:
+        while True:
+            operation, response = self._requests.get()
+            try:
+                response.put((True, operation()))
+            except BaseException as exc:
+                response.put((False, exc))
+
+    def _submit(self, operation: Callable[[], Any]) -> queue.Queue[tuple[bool, Any]]:
+        response: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        self._requests.put((operation, response))
+        return response
+
+    @staticmethod
+    def _result_or_raise(response: queue.Queue[tuple[bool, Any]], *, timeout_s: float, operation: str) -> Any:
+        try:
+            succeeded, result = response.get(timeout=timeout_s)
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"Follower {operation} did not return within {timeout_s:g}s. "
+                "The robot may be disconnected or its serial bus may be wedged."
+            ) from exc
+        if not succeeded:
+            raise RuntimeError(f"Follower {operation} failed: {result}") from result
+        return result
+
     def connect(self) -> None:
+        """Connect in the I/O worker, with a finite startup wait."""
+        def _connect() -> None:
+            self._connect_worker()
+
+        self._result_or_raise(
+            self._submit(_connect), timeout_s=FOLLOWER_CONNECT_TIMEOUT_S, operation="connection"
+        )
+
+    def _connect_worker(self) -> None:
         SO101FollowerConfig, make_robot_from_config = self._import_lerobot_so101()
         signature = inspect.signature(SO101FollowerConfig)
         cfg_kwargs = {"port": self.port}
@@ -883,34 +935,57 @@ class SO101FollowerLeader:
             cfg_kwargs["use_degrees"] = False
 
         cfg = SO101FollowerConfig(**cfg_kwargs)
-        self.robot = make_robot_from_config(cfg)
-        connect_signature = inspect.signature(self.robot.connect)
+        robot = make_robot_from_config(cfg)
+        connect_signature = inspect.signature(robot.connect)
         if "calibrate" in connect_signature.parameters:
-            self.robot.connect(calibrate=self.calibrate_on_connect)
+            robot.connect(calibrate=self.calibrate_on_connect)
         else:
-            self.robot.connect()
+            robot.connect()
         print(f"[INFO]: Connected follower arm '{self.robot_id}' on {self.port}.")
         if self.disable_torque:
-            self.disable_motor_torque()
+            self._disable_motor_torque(robot)
+        self._robot = robot
 
-    def disable_motor_torque(self) -> None:
-        if self.robot is None:
-            return
-        bus = getattr(self.robot, "bus", None)
+    @staticmethod
+    def _disable_motor_torque(robot: Any) -> None:
+        bus = getattr(robot, "bus", None)
         if bus is not None and hasattr(bus, "disable_torque"):
             bus.disable_torque()
             print("[INFO]: Disabled follower torque; support the arm while hand-guiding it.")
             return
-        if hasattr(self.robot, "disable_torque"):
-            self.robot.disable_torque()
+        if hasattr(robot, "disable_torque"):
+            robot.disable_torque()
             print("[INFO]: Disabled follower torque; support the arm while hand-guiding it.")
             return
         print("[WARN]: Could not find a torque-disable method on the follower arm.")
 
     def read_action(self) -> torch.Tensor:
-        if self.robot is None:
-            raise RuntimeError("Follower arm is not connected.")
-        observation = self.robot.get_observation()
+        """Return the latest observation while a new one is read asynchronously."""
+        if self._closed:
+            raise RuntimeError("Follower arm is closed.")
+        if self._pending_observation is not None and self._pending_observation.empty():
+            assert self._pending_observation_started_at is not None
+            if time.monotonic() - self._pending_observation_started_at > FOLLOWER_OBSERVATION_TIMEOUT_S:
+                raise TimeoutError(
+                    f"Follower observation did not return within {FOLLOWER_OBSERVATION_TIMEOUT_S:g}s. "
+                    "The serial bus may be wedged; shutting down teleop."
+                )
+        if self._pending_observation is not None and not self._pending_observation.empty():
+            self._last_observation = self._result_or_raise(
+                self._pending_observation, timeout_s=0.0, operation="observation"
+            )
+            self._pending_observation = None
+            self._pending_observation_started_at = None
+        if self._pending_observation is None:
+            self._pending_observation = self._submit(lambda: self._robot.get_observation())
+            self._pending_observation_started_at = time.monotonic()
+        if self._last_observation is None:
+            self._last_observation = self._result_or_raise(
+                self._pending_observation, timeout_s=FOLLOWER_OBSERVATION_TIMEOUT_S, operation="observation"
+            )
+            self._pending_observation = None
+            self._pending_observation_started_at = None
+        observation = self._last_observation
         values = []
         for joint_index, key in enumerate(LEROBOT_JOINT_FEATURE_ORDER):
             if joint_index == GRIPPER_JOINT_INDEX:
@@ -933,14 +1008,18 @@ class SO101FollowerLeader:
         pass
 
     def close(self) -> None:
-        if self.robot is None:
+        if self._closed:
             return
-        try:
-            if hasattr(self.robot, "disconnect"):
-                self.robot.disconnect()
-        except Exception as exc:
-            print(f"[WARN]: Error while disconnecting follower arm: {exc}")
-        self.robot = None
+        self._closed = True
+
+        # Do not wait here: disconnect itself is a serial operation and is one of
+        # the calls that may be stuck. The daemon worker cannot keep Python alive.
+        def _disconnect() -> None:
+            robot = getattr(self, "_robot", None)
+            if robot is not None and hasattr(robot, "disconnect"):
+                robot.disconnect()
+
+        self._submit(_disconnect)
 
 
 class SO101XboxLeader:
@@ -2726,5 +2805,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        # This also covers a timeout or Ctrl-C while the follower is connecting,
+        # before main() has entered its per-episode cleanup block.
+        simulation_app.close()

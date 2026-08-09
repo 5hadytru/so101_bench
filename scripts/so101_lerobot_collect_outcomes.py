@@ -21,10 +21,12 @@ import json
 import math
 from pathlib import Path
 import platform
+import random
 import signal
 import subprocess
 import sys
 import time
+import traceback
 from typing import Any
 
 from isaaclab.app import AppLauncher
@@ -38,6 +40,13 @@ def _str_to_bool(value: str | bool) -> bool:
     if value in ("0", "false", "f", "no", "n", "off"):
         return False
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"Expected an integer >= 1, got {value!r}.")
+    return parsed
 
 
 parser = argparse.ArgumentParser(
@@ -55,6 +64,16 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default="So101Bench-Bin-v0", help="Isaac Lab task name.")
 parser.add_argument("--seed", type=int, default=1984, help="Environment seed.")
+parser.add_argument(
+    "--contact_solver_position_iterations",
+    type=_positive_int,
+    default=64,
+    help=(
+        "PhysX solver position iteration count for the bin and object rigid bodies (default: 64). "
+        "Lowering it speeds up the simulation but changes "
+        "contact resolution, so outcome labels are only comparable across runs that used the same value."
+    ),
+)
 parser.add_argument(
     "--episodes_jsonl",
     type=Path,
@@ -202,13 +221,119 @@ parser.add_argument(
 )
 parser.add_argument(
     "--retime_strategy",
-    choices=("tracking_compensated", "action_path"),
-    default="tracking_compensated",
+    choices=("phase_governed", "tracking_compensated", "action_path"),
+    default="phase_governed",
     help=(
-        "How slowed arm targets are constructed. 'tracking_compensated' follows the recorded physical "
-        "joint-state path and retains a time-scaled fraction of the original action/state tracking offset; "
-        "'action_path' directly time-warps the original commands. The gripper always follows the original "
-        "command path so grasp/release semantics are preserved."
+        "How slowed arm targets are constructed. 'phase_governed' adds closed-loop path tracking: it slows "
+        "or pauses demonstrated phase when the arm falls behind, applies bounded feedback, and keeps the "
+        "gripper synchronized to the same phase. 'tracking_compensated' is the previous open-loop physical-path "
+        "retiming, and 'action_path' directly time-warps the original commands."
+    ),
+)
+parser.add_argument(
+    "--retime_feedback_gain",
+    type=float,
+    default=0.70,
+    help="Arm joint feedback gain for --retime_strategy phase_governed.",
+)
+parser.add_argument(
+    "--retime_recovery_integral_gain_s",
+    type=float,
+    default=1.50,
+    help=(
+        "Integral gain in 1/second used only during hard tracking-recovery pauses. "
+        "The accumulated correction is bounded by --retime_max_correction_rad."
+    ),
+)
+parser.add_argument(
+    "--retime_soft_error_rad",
+    type=float,
+    nargs=5,
+    default=(0.020, 0.020, 0.020, 0.026, 0.052),
+    metavar=("ROT", "PITCH", "ELBOW", "WRIST_PITCH", "WRIST_ROLL"),
+    help="Per-arm-joint tracking errors below which demonstrated phase advances at full speed.",
+)
+parser.add_argument(
+    "--retime_hard_error_rad",
+    type=float,
+    nargs=5,
+    default=(0.052, 0.052, 0.052, 0.070, 0.105),
+    metavar=("ROT", "PITCH", "ELBOW", "WRIST_PITCH", "WRIST_ROLL"),
+    help="Per-arm-joint tracking errors at which demonstrated phase pauses.",
+)
+parser.add_argument(
+    "--retime_hard_pause_entry_ratio",
+    type=float,
+    default=0.95,
+    help=(
+        "Enter a hysteretic recovery pause at this normalized position between "
+        "the soft and hard tracking-error bounds. Must be strictly between 0 and 1."
+    ),
+)
+parser.add_argument(
+    "--retime_minimum_advancing_phase_rate",
+    type=float,
+    default=0.10,
+    help=(
+        "Minimum phase increment while advancing below the recovery-pause boundary. "
+        "Must be in (0, 1]; prevents asymptotically slow replay."
+    ),
+)
+parser.add_argument(
+    "--retime_max_correction_rad",
+    type=float,
+    nargs=5,
+    default=(0.105, 0.105, 0.105, 0.140, 0.210),
+    metavar=("ROT", "PITCH", "ELBOW", "WRIST_PITCH", "WRIST_ROLL"),
+    help="Per-arm-joint absolute caps for phase-governor feedback corrections.",
+)
+parser.add_argument(
+    "--retime_max_joint_speed_rad_s",
+    type=float,
+    nargs=6,
+    default=(1.5, 1.7, 1.7, 1.5, 2.2, 1.5),
+    metavar=("ROT", "PITCH", "ELBOW", "WRIST_PITCH", "WRIST_ROLL", "JAW"),
+    help="Per-joint command slew limits used by the phase governor, in simulator radians/second.",
+)
+parser.add_argument(
+    "--retime_resume_frames",
+    type=int,
+    default=3,
+    help="Consecutive in-tolerance observations required to leave a hard-error phase pause.",
+)
+parser.add_argument(
+    "--retime_terminal_settle_frames",
+    type=int,
+    default=3,
+    help="Consecutive post-step terminal observations required to complete phase-governed replay.",
+)
+parser.add_argument(
+    "--retime_max_terminal_settle_frames",
+    type=int,
+    default=15,
+    help="Maximum final-command frames allowed for terminal settling.",
+)
+parser.add_argument(
+    "--retime_min_recovery_steps",
+    type=int,
+    default=60,
+    help="Minimum extra phase-governor frames allowed for tracking recovery.",
+)
+parser.add_argument(
+    "--retime_max_recovery_fraction",
+    type=float,
+    default=0.25,
+    help="Additional recovery budget as a fraction of nominal slowed frames.",
+)
+parser.add_argument(
+    "--retime_tracking_limit_policy",
+    choices=("abort", "skip", "save"),
+    default="abort",
+    help=(
+        "What to do if phase tracking cannot settle within its recovery budget. "
+        "'abort' cancels the current LeRobot episode so unsafe/truncated replay is not added to training data; "
+        "'skip' also cancels it, writes a quarantined outcome/diagnostic, and continues with the next source episode; "
+        "'save' keeps it with an explicit phase_governor_tracking_limit failure label."
     ),
 )
 parser.add_argument(
@@ -231,9 +356,29 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--resume_retime_controller_transition",
+    nargs=2,
+    default=None,
+    metavar=("FROM_SHA256", "TO_SHA256"),
+    help=(
+        "Permit a phase-governor settings/module change on resume only when the "
+        "first completed row has FROM_SHA256 and the current module has TO_SHA256. "
+        "This is an explicit, hash-pinned migration for retaining completed episodes."
+    ),
+)
+parser.add_argument(
+    "--ignore_sigint",
+    action="store_true",
+    default=False,
+    help=(
+        "Ignore SIGINT instead of pausing. Intended for detached service runs whose "
+        "command runner may send a timeout SIGINT; use SIGTERM for a graceful pause."
+    ),
+)
+parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=0.5,
+    default=1.5,
     help="Seconds to hold the initial sim joint pose before replaying the first recorded action.",
 )
 parser.add_argument(
@@ -371,7 +516,9 @@ from so101_bench.mdp import (
     grasped_object_made_contact,
 )
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
+    configure_contact_solver_position_iterations,
     configure_env_cfg_for_object_pool,
+    contact_solver_position_iterations,
 )
 from so101_bench.utils.lerobot_calibration import (
     LEROBOT_INITIAL_JOINT_POS,
@@ -391,6 +538,14 @@ from so101_bench.utils.lerobot_dataset import (
     real_compatible_camera_sources,
     recording_images,
 )
+from so101_bench.utils.phase_retiming import (
+    PhaseGovernorConfig,
+    PhaseGovernorObservation,
+    PhaseGovernorStep,
+    PhaseGovernedTrajectoryTracker,
+    build_phase_governed_paths,
+    smoothly_retime_waypoint_path,
+)
 
 
 ACTION = "action"
@@ -398,7 +553,7 @@ OBSERVATION_STATE = "observation.state"
 ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 INITIAL_ROBOT_JOINT_POS = lerobot_pose_to_sim_joint_pos(LEROBOT_INITIAL_JOINT_POS)
 BIN_NAME = "plastic_bin"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # These are deliberately stable schema names rather than implementation details of
 # the termination module.  Missing counters are written as -1, which lets older or
@@ -426,6 +581,13 @@ def _request_graceful_stop(signum, _frame) -> None:
     """Finish active replay lanes, persist them, and then stop scheduling episodes."""
 
     global STOP_REQUESTED
+    if signum == signal.SIGINT and args_cli.ignore_sigint:
+        print(
+            "\n[WARN]: Ignoring SIGINT because --ignore_sigint is enabled; "
+            "send SIGTERM for a graceful pause.",
+            flush=True,
+        )
+        return
     if not STOP_REQUESTED:
         signal_name = signal.Signals(signum).name
         print(
@@ -435,8 +597,14 @@ def _request_graceful_stop(signum, _frame) -> None:
     STOP_REQUESTED = True
 
 
-for _stop_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-    signal.signal(_stop_signal, _request_graceful_stop)
+def _install_signal_handlers() -> None:
+    """Override Isaac's SIGINT/SIGTERM handlers with collector-aware behavior."""
+
+    for stop_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop_signal, _request_graceful_stop)
+
+
+_install_signal_handlers()
 
 
 class SO101ReplayActionMapper:
@@ -527,6 +695,40 @@ class LeRobotActionEpisode:
 
 
 @dataclass(frozen=True)
+class PhaseGovernorSettings:
+    feedback_gain: float
+    recovery_integral_gain_s: float
+    soft_error_rad: tuple[float, ...]
+    hard_error_rad: tuple[float, ...]
+    hard_pause_entry_ratio: float
+    minimum_advancing_phase_rate: float
+    max_correction_rad: tuple[float, ...]
+    max_joint_speed_rad_s: tuple[float, ...]
+    pause_release_steps: int
+    terminal_settle_steps: int
+    max_final_settle_steps: int
+    min_recovery_steps: int
+    recovery_fraction: float
+
+    def make_config(
+        self,
+        *,
+        control_dt: float,
+        joint_lower_limits_rad: tuple[float, ...] | None = None,
+        joint_upper_limits_rad: tuple[float, ...] | None = None,
+    ) -> PhaseGovernorConfig:
+        return PhaseGovernorConfig(
+            control_dt=control_dt,
+            joint_lower_limits_rad=joint_lower_limits_rad,
+            joint_upper_limits_rad=joint_upper_limits_rad,
+            **asdict(self),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class UniformRetimingPlan:
     """Smooth time warp used to lengthen a replay while preserving its demonstrated path."""
 
@@ -537,6 +739,7 @@ class UniformRetimingPlan:
     source_total_episodes: int
     source_total_frames: int
     reference_repo_root: str | None
+    phase_governor: PhaseGovernorSettings | None
 
 
 @dataclass
@@ -579,6 +782,8 @@ class ReplayLane:
     last_action_sim: torch.Tensor
     last_action_clamped_mask: torch.Tensor
     last_action_delta_lerobot: torch.Tensor
+    initial_hold_action_sim: torch.Tensor
+    initial_hold_action_lerobot: torch.Tensor
     last_action_frame_index: int = -1
     last_action_phase: str = "reset"
     step: int = 0
@@ -590,6 +795,14 @@ class ReplayLane:
     trajectory_samples: list[dict[str, Any]] = field(default_factory=list)
     action_stream_exhausted: bool = False
     recorded_dataset_episode_index: int | None = None
+    phase_tracker: PhaseGovernedTrajectoryTracker | None = None
+    last_phase_step: PhaseGovernorStep | None = None
+    last_phase_observation: PhaseGovernorObservation | None = None
+    action_replay_complete: bool = False
+    recording_cancelled: bool = False
+    final_hold_steps_emitted: int = 0
+    joint_limit_clamp_steps: int = 0
+    requested_retime_scale: float | None = None
 
 
 def _now_stamp() -> str:
@@ -662,6 +875,9 @@ def _run_provenance() -> dict[str, Any]:
             "episode_layouts_jsonl": _file_sha256(args_cli.episode_layouts_jsonl),
             "dataset_info_json": _file_sha256(metadata_info_path),
             "retime_reference_info_json": _file_sha256(retime_reference_info_path),
+            "phase_retiming_module": _file_sha256(
+                Path(inspect.getfile(PhaseGovernedTrajectoryTracker)).resolve()
+            ),
         },
         "collector_script_sha256": _file_sha256(Path(__file__).resolve()),
     }
@@ -912,6 +1128,37 @@ def _build_uniform_retiming_plan(source_root: Path | None) -> UniformRetimingPla
             "Retiming only supports slowing trajectories: expected a finite scale >= 1.0, "
             f"got {scale:.9g} from source_mean={source_mean:.3f}, target_mean={target_mean:.3f}."
         )
+    phase_governor = (
+        PhaseGovernorSettings(
+            feedback_gain=float(args_cli.retime_feedback_gain),
+            recovery_integral_gain_s=float(
+                args_cli.retime_recovery_integral_gain_s
+            ),
+            soft_error_rad=tuple(float(value) for value in args_cli.retime_soft_error_rad),
+            hard_error_rad=tuple(float(value) for value in args_cli.retime_hard_error_rad),
+            hard_pause_entry_ratio=float(args_cli.retime_hard_pause_entry_ratio),
+            minimum_advancing_phase_rate=float(
+                args_cli.retime_minimum_advancing_phase_rate
+            ),
+            max_correction_rad=tuple(
+                float(value) for value in args_cli.retime_max_correction_rad
+            ),
+            max_joint_speed_rad_s=tuple(
+                float(value) for value in args_cli.retime_max_joint_speed_rad_s
+            ),
+            pause_release_steps=int(args_cli.retime_resume_frames),
+            terminal_settle_steps=int(args_cli.retime_terminal_settle_frames),
+            max_final_settle_steps=int(args_cli.retime_max_terminal_settle_frames),
+            min_recovery_steps=int(args_cli.retime_min_recovery_steps),
+            recovery_fraction=float(args_cli.retime_max_recovery_fraction),
+        )
+        if args_cli.retime_strategy == "phase_governed"
+        else None
+    )
+    if phase_governor is not None:
+        # Constructing once with a dummy positive period performs all
+        # period-independent validation before Isaac Lab starts an episode.
+        phase_governor.make_config(control_dt=1.0)
     return UniformRetimingPlan(
         scale=scale,
         strategy=args_cli.retime_strategy,
@@ -920,48 +1167,8 @@ def _build_uniform_retiming_plan(source_root: Path | None) -> UniformRetimingPla
         source_total_episodes=source_episodes,
         source_total_frames=source_frames,
         reference_repo_root=str(reference_root) if reference_root is not None else None,
+        phase_governor=phase_governor,
     )
-
-
-def smoothly_retime_waypoint_path(
-    source_waypoints: np.ndarray,
-    *,
-    initial_waypoint: np.ndarray,
-    scale: float,
-) -> np.ndarray:
-    """Time-warp a joint path with shape-preserving C1 interpolation.
-
-    PCHIP avoids the coordinate overshoot of an unconstrained cubic spline while
-    removing the velocity discontinuities introduced by repeated frames or
-    piecewise-linear targets. The final waypoint is restored exactly.
-    """
-
-    from scipy.interpolate import PchipInterpolator
-
-    waypoints = np.asarray(source_waypoints, dtype=np.float32)
-    initial = np.asarray(initial_waypoint, dtype=np.float32)
-    if waypoints.ndim != 2 or waypoints.shape[0] < 1:
-        raise ValueError(f"Expected non-empty [frames, joints] waypoints, got shape {waypoints.shape}.")
-    if initial.shape != waypoints.shape[1:]:
-        raise ValueError(
-            f"Initial waypoint shape {initial.shape} does not match joint shape {waypoints.shape[1:]}."
-        )
-    if not math.isfinite(scale) or scale < 1.0:
-        raise ValueError(f"Expected finite retime scale >= 1.0, got {scale!r}.")
-
-    source_frames = int(waypoints.shape[0])
-    target_frames = max(source_frames, int(round(source_frames * scale)))
-    if target_frames == source_frames:
-        return waypoints.copy()
-
-    path = np.concatenate((initial[None, :], waypoints), axis=0)
-    source_times = np.arange(source_frames + 1, dtype=np.float64)
-    target_times = np.arange(1, target_frames + 1, dtype=np.float64) * (
-        source_frames / target_frames
-    )
-    result = PchipInterpolator(source_times, path, axis=0)(target_times)
-    result[-1] = waypoints[-1]
-    return np.asarray(result, dtype=np.float32)
 
 
 def trajectory_preserving_retime_actions(
@@ -1146,6 +1353,7 @@ def _capture_eval_setup(
         "control_dt": float(control_dt),
         "physics_dt": float(physics_dt),
         "decimation": decimation,
+        "contact_solver_position_iterations": contact_solver_position_iterations(),
         "bin_name": BIN_NAME,
         "action_joint_names": list(ACTION_JOINT_NAMES),
         "jaw_action_index": ACTION_JOINT_NAMES.index("Jaw"),
@@ -1448,6 +1656,11 @@ def _make_env(
         env_cfg.scene.camera_overhead = None
         env_cfg.observations.visual = None
     object_asset_names = configure_env_cfg_for_object_pool(env_cfg, object_pool)
+    configure_contact_solver_position_iterations(env_cfg, args_cli.contact_solver_position_iterations)
+    print(
+        f"[INFO]: Contact solver position iterations: {contact_solver_position_iterations()} "
+        "(bin and object rigid bodies)."
+    )
     env_cfg.events.reset_benchmark_scene.params.update(
         _episode_reset_params(first_episode, first_episode_layout, object_pool, object_asset_names)
     )
@@ -1500,6 +1713,57 @@ def _restore_robot_initial_pose(env, env_ids: torch.Tensor | None = None) -> Non
     grasp_arm_jaw_pos = getattr(env.unwrapped, "_so101_grasp_arm_jaw_pos", None)
     if isinstance(grasp_arm_jaw_pos, torch.Tensor):
         grasp_arm_jaw_pos[env_ids] = joint_pos[:, ACTION_JOINT_NAMES.index("Jaw")]
+
+
+def _set_lane_robot_pose(
+    env,
+    *,
+    env_id: int,
+    joint_pos: torch.Tensor,
+) -> None:
+    """Teleport one replay lane to its demonstrated pre-command pose."""
+
+    # Isaac Lab lazily creates articulation-derived buffers (including
+    # ``joint_acc``) while env.step() is inside inference mode. Subsequent
+    # write_joint_state_to_sim() calls update those buffers in place, so the
+    # whole episode-handoff teleport must run in the same mode.
+    with torch.inference_mode():
+        robot = env.unwrapped.scene["robot"]
+        joint_ids = [
+            robot.joint_names.index(joint_name) for joint_name in ACTION_JOINT_NAMES
+        ]
+        env_ids = torch.tensor(
+            [env_id], dtype=torch.long, device=env.unwrapped.device
+        )
+        positions = joint_pos.to(
+            dtype=torch.float32, device=env.unwrapped.device
+        ).reshape(1, -1)
+        if positions.shape[1] != len(joint_ids):
+            raise ValueError(
+                f"Expected {len(joint_ids)} lane joint positions, got {positions.shape}."
+            )
+        velocities = torch.zeros_like(positions)
+        robot.write_joint_state_to_sim(
+            positions,
+            velocities,
+            joint_ids=joint_ids,
+            env_ids=env_ids,
+        )
+        robot.set_joint_position_target(
+            positions,
+            joint_ids=joint_ids,
+            env_ids=env_ids,
+        )
+        robot.write_data_to_sim()
+        grasp_arm_jaw_pos = getattr(
+            env.unwrapped, "_so101_grasp_arm_jaw_pos", None
+        )
+        if isinstance(grasp_arm_jaw_pos, torch.Tensor):
+            grasp_arm_jaw_pos[env_ids] = positions[
+                :, ACTION_JOINT_NAMES.index("Jaw")
+            ]
+        env.unwrapped.scene.write_data_to_sim()
+        env.unwrapped.sim.forward()
 
 
 def _reset_env(env, env_ids: torch.Tensor | None = None) -> tuple[dict, dict]:
@@ -2664,6 +2928,54 @@ def _write_trajectory(path: Path, samples: list[dict[str, Any]]) -> None:
         action_delta_lerobot=stack("action_delta_lerobot"),
         action_sim=stack("action_sim"),
         action_tracking_error=stack("action_tracking_error"),
+        retime_reference_sim=stack("retime_reference_sim"),
+        retime_tracking_error_rad=stack("retime_tracking_error_rad"),
+        retime_pre_step_reference_sim=stack("retime_pre_step_reference_sim"),
+        retime_pre_step_tracking_error_rad=stack(
+            "retime_pre_step_tracking_error_rad"
+        ),
+        retime_raw_command_sim=stack("retime_raw_command_sim"),
+        retime_bounded_command_sim=stack("retime_bounded_command_sim"),
+        retime_correction_rad=stack("retime_correction_rad"),
+        retime_phase=values("retime_phase", np.float32),
+        retime_proposed_phase=values("retime_proposed_phase", np.float32),
+        retime_next_phase=values("retime_next_phase", np.float32),
+        retime_governor_phase_rate=values(
+            "retime_governor_phase_rate", np.float32
+        ),
+        retime_phase_rate=values("retime_phase_rate", np.float32),
+        retime_feedforward_scale=values("retime_feedforward_scale", np.float32),
+        retime_max_normalized_arm_error=values(
+            "retime_max_normalized_arm_error", np.float32
+        ),
+        retime_phase_rate_floored=values(
+            "retime_phase_rate_floored", np.bool_
+        ),
+        retime_paused=values("retime_paused", np.bool_),
+        retime_hard_paused=values("retime_hard_paused", np.bool_),
+        retime_resume_streak=values("retime_resume_streak", np.int32),
+        retime_correction_clipped=values("retime_correction_clipped", np.bool_),
+        retime_velocity_clipped=values("retime_velocity_clipped", np.bool_),
+        retime_joint_limit_clipped=values(
+            "retime_joint_limit_clipped", np.bool_
+        ),
+        retime_correction_clipped_mask=stack(
+            "retime_correction_clipped_mask", np.bool_
+        ),
+        retime_velocity_clipped_mask=stack(
+            "retime_velocity_clipped_mask", np.bool_
+        ),
+        retime_joint_limit_clipped_mask=stack(
+            "retime_joint_limit_clipped_mask", np.bool_
+        ),
+        retime_ungoverned_slew_limited=values(
+            "retime_ungoverned_slew_limited", np.bool_
+        ),
+        retime_ungoverned_slew_limited_mask=stack(
+            "retime_ungoverned_slew_limited_mask", np.bool_
+        ),
+        retime_complete=values("retime_complete", np.bool_),
+        retime_limit_reached=values("retime_limit_reached", np.bool_),
         condition_names=np.asarray(samples[0]["condition_names"], dtype=np.str_),
         condition_kinds=np.asarray(samples[0]["condition_kinds"], dtype=np.str_),
         condition_met=stack("condition_met", np.bool_),
@@ -2812,6 +3124,34 @@ def _manual_term_evals(
     return evals
 
 
+def _lane_timeout_scale(
+    lane: ReplayLane,
+    retiming_plan: UniformRetimingPlan | None,
+) -> float:
+    """Scale benchmark timeouts to include allowed controller recovery."""
+
+    final_hold_frames = max(
+        0,
+        math.ceil(
+            args_cli.hold_last_action_time_s
+            * max(float(lane.action_episode.fps), 1.0e-9)
+        ),
+    )
+    if lane.phase_tracker is not None:
+        return max(
+            1.0,
+            float(lane.phase_tracker.max_steps + final_hold_frames)
+            / max(float(lane.source_action_num_frames), 1.0),
+        )
+    if retiming_plan is not None:
+        return max(
+            1.0,
+            float(lane.action_episode.num_frames + final_hold_frames)
+            / max(float(lane.source_action_num_frames), 1.0),
+        )
+    return 1.0
+
+
 def _success_params_for_final_eval(
     success_params: dict[str, Any],
     *,
@@ -2946,7 +3286,10 @@ def _load_resume_records(output_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _validate_resume_state(records: list[dict[str, Any]]) -> None:
+def _validate_resume_state(
+    records: list[dict[str, Any]],
+    retiming_plan: UniformRetimingPlan | None,
+) -> None:
     if not args_cli.resume:
         return
     if args_cli.overwrite:
@@ -2970,17 +3313,25 @@ def _validate_resume_state(records: list[dict[str, Any]]) -> None:
     for row_id, record in enumerate(records):
         try:
             actual_source_indices.append(int(record["dataset"]["episode_index"]))
-            actual_recorded_indices.append(int(record["recorded_sim_dataset"]["episode_index"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
-                f"Cannot resume: outcome record {row_id} lacks valid source/recorded episode indices."
+                f"Cannot resume: outcome record {row_id} lacks a valid source episode index."
+            ) from exc
+        recorded = record.get("recorded_sim_dataset")
+        if recorded is None:
+            continue
+        try:
+            actual_recorded_indices.append(int(recorded["episode_index"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot resume: outcome record {row_id} has an invalid recorded episode index."
             ) from exc
     if actual_source_indices != expected_source_indices:
         raise ValueError(
             "Cannot resume: outcome source episode indices are not contiguous from "
             f"{args_cli.dataset_episode_index}: {actual_source_indices[:10]}..."
         )
-    expected_recorded_indices = list(range(len(records)))
+    expected_recorded_indices = list(range(len(actual_recorded_indices)))
     if actual_recorded_indices != expected_recorded_indices:
         raise ValueError(
             "Cannot resume: recorded dataset episode indices are not contiguous from zero: "
@@ -2993,14 +3344,72 @@ def _validate_resume_state(records: list[dict[str, Any]]) -> None:
             raise ValueError(
                 f"Cannot resume: recorded dataset metadata is missing under {args_cli.record_repo_root}."
             )
-    elif recorded_total != len(records):
+    elif recorded_total != len(actual_recorded_indices):
         raise ValueError(
             "Cannot resume: outcome/recorded dataset counts differ: "
-            f"outcomes={len(records)}, recorded_episodes={recorded_total}."
+            f"saved_outcomes={len(actual_recorded_indices)}, "
+            f"recorded_episodes={recorded_total}, processed_outcomes={len(records)}."
         )
 
     if records:
         prior_hashes = records[0].get("provenance", {}).get("input_sha256", {})
+        previous_module_hash = prior_hashes.get("phase_retiming_module")
+        current_module_hash = _file_sha256(
+            Path(inspect.getfile(PhaseGovernedTrajectoryTracker)).resolve()
+        )
+        transition = args_cli.resume_retime_controller_transition
+        approved_controller_transition = bool(
+            transition is not None
+            and tuple(transition)
+            == (previous_module_hash, current_module_hash)
+        )
+        prior_length = records[0].get("episode_length", {})
+        expected_strategy = retiming_plan.strategy if retiming_plan is not None else None
+        if prior_length.get("retime_strategy") != expected_strategy:
+            raise ValueError(
+                "Cannot resume because the retime strategy changed: "
+                f"previous={prior_length.get('retime_strategy')!r}, "
+                f"current={expected_strategy!r}."
+            )
+        if retiming_plan is not None:
+            previous_scale = prior_length.get(
+                "requested_retime_scale",
+                prior_length.get("uniform_retime_scale"),
+            )
+            try:
+                scale_matches = math.isclose(
+                    float(previous_scale),
+                    retiming_plan.scale,
+                    rel_tol=1.0e-6,
+                    abs_tol=1.0e-9,
+                )
+            except (TypeError, ValueError):
+                scale_matches = False
+            if not scale_matches:
+                raise ValueError(
+                    "Cannot resume because the requested retime scale changed: "
+                    f"previous={previous_scale!r}, current={retiming_plan.scale!r}."
+                )
+        if retiming_plan is not None and retiming_plan.phase_governor is not None:
+            previous_config = (
+                prior_length.get("phase_governor", {}).get("config", {})
+                if isinstance(prior_length.get("phase_governor"), dict)
+                else {}
+            )
+            current_settings = _serialize_param_value(
+                retiming_plan.phase_governor.to_dict()
+            )
+            previous_settings = {
+                key: previous_config.get(key) for key in current_settings
+            }
+            if previous_settings != current_settings:
+                if not approved_controller_transition:
+                    raise ValueError(
+                        "Cannot resume because phase-governor settings changed: "
+                        f"previous={previous_settings}, current={current_settings}. "
+                        "Use --resume_retime_controller_transition FROM_SHA256 "
+                        "TO_SHA256 only for a deliberate, hash-pinned migration."
+                    )
         current_hashes = {
             "episodes_jsonl": _file_sha256(args_cli.episodes_jsonl),
             "episode_layouts_jsonl": _file_sha256(args_cli.episode_layouts_jsonl),
@@ -3013,13 +3422,28 @@ def _validate_resume_state(records: list[dict[str, Any]]) -> None:
                 else None
             ),
         }
+        if retiming_plan is not None and retiming_plan.phase_governor is not None:
+            current_hashes["phase_retiming_module"] = _file_sha256(
+                Path(inspect.getfile(PhaseGovernedTrajectoryTracker)).resolve()
+            )
         mismatches = {
             key: {"previous": prior_hashes.get(key), "current": value}
             for key, value in current_hashes.items()
             if prior_hashes.get(key) != value
         }
+        if approved_controller_transition:
+            mismatches.pop("phase_retiming_module", None)
         if mismatches:
             raise ValueError(f"Cannot resume because replay inputs changed: {mismatches}")
+        if approved_controller_transition:
+            print(
+                "[WARN]: Resuming across the explicitly approved phase-governor "
+                "transition "
+                f"{args_cli.resume_retime_controller_transition[0]} -> "
+                f"{args_cli.resume_retime_controller_transition[1]}. Existing "
+                "episodes retain their recorded per-episode controller provenance.",
+                flush=True,
+            )
 
 
 def _make_output_dir() -> Path:
@@ -3127,10 +3551,14 @@ def _start_replay_lane(
         episode_index=dataset_episode_index,
         device=env.unwrapped.device,
         load_observed_states=(
-            retiming_plan is not None and retiming_plan.strategy == "tracking_compensated"
+            retiming_plan is not None
+            and retiming_plan.strategy in ("tracking_compensated", "phase_governed")
         ),
     )
     source_action_num_frames = action_episode.num_frames
+    phase_tracker = None
+    lane_hold_action = hold_action
+    lane_hold_action_lerobot = hold_action_lerobot
     if retiming_plan is not None:
         source_actions = mapper.clamp_lerobot_positions(action_episode.actions)
         source_observed_states = (
@@ -3138,22 +3566,95 @@ def _start_replay_lane(
             if action_episode.observed_states is not None
             else None
         )
-        retimed_actions = trajectory_preserving_retime_actions(
-            source_actions.detach().cpu().numpy(),
-            source_observed_states=(
-                source_observed_states.detach().cpu().numpy()
-                if source_observed_states is not None
-                else None
-            ),
-            initial_action=hold_action_lerobot.detach().cpu().numpy(),
-            scale=retiming_plan.scale,
-            strategy=retiming_plan.strategy,
-        )
+        if retiming_plan.strategy == "phase_governed":
+            if source_observed_states is None or retiming_plan.phase_governor is None:
+                raise RuntimeError("Phase-governed retiming was created without observed states/config.")
+            source_actions_sim = mapper.lerobot_positions_to_sim_radians(source_actions)
+            source_states_sim = mapper.lerobot_positions_to_sim_radians(source_observed_states)
+            # LeRobot state row 0 is post-step and, in these demonstrations,
+            # represents the episode-specific pre-motion pose far more closely
+            # than the collector's generic reset pose. Starting the governed
+            # path there avoids manufacturing a large, unobserved approach move.
+            lane_hold_action = source_states_sim[0].clone()
+            lane_hold_action_lerobot = mapper.sim_radians_to_lerobot_positions(
+                lane_hold_action
+            )
+            reference_nodes, command_nodes = build_phase_governed_paths(
+                source_actions_sim.detach().cpu().numpy(),
+                source_states_sim.detach().cpu().numpy(),
+                lane_hold_action.detach().cpu().numpy(),
+                retiming_plan.scale,
+            )
+            retimed_reference_sim = reference_nodes[1:]
+            retimed_nominal_sim = command_nodes[1:]
+            phase_tracker = PhaseGovernedTrajectoryTracker(
+                reference_nodes,
+                command_nodes,
+                retiming_plan.phase_governor.make_config(
+                    control_dt=control_dt,
+                    joint_lower_limits_rad=tuple(
+                        float(value)
+                        for value in (
+                            (mapper.usd_mins_deg + SIM_LIMIT_MARGIN_DEG)
+                            * torch.pi
+                            / 180.0
+                        )
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    joint_upper_limits_rad=tuple(
+                        float(value)
+                        for value in (
+                            (mapper.usd_maxs_deg - SIM_LIMIT_MARGIN_DEG)
+                            * torch.pi
+                            / 180.0
+                        )
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                ),
+            )
+            retimed_actions_tensor_sim = torch.as_tensor(
+                retimed_nominal_sim,
+                dtype=torch.float32,
+                device=env.unwrapped.device,
+            )
+            retimed_actions = (
+                mapper.sim_radians_to_lerobot_positions(retimed_actions_tensor_sim)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            retimed_observed_states = (
+                mapper.sim_radians_to_lerobot_positions(
+                    torch.as_tensor(
+                        retimed_reference_sim,
+                        dtype=torch.float32,
+                        device=env.unwrapped.device,
+                    )
+                )
+            )
+        else:
+            retimed_actions = trajectory_preserving_retime_actions(
+                source_actions.detach().cpu().numpy(),
+                source_observed_states=(
+                    source_observed_states.detach().cpu().numpy()
+                    if source_observed_states is not None
+                    else None
+                ),
+                initial_action=hold_action_lerobot.detach().cpu().numpy(),
+                scale=retiming_plan.scale,
+                strategy=retiming_plan.strategy,
+            )
+            retimed_observed_states = None
         action_episode = LeRobotActionEpisode(
             episode_index=action_episode.episode_index,
             fps=1.0 / control_dt,
             action_names=action_episode.action_names,
             actions=torch.as_tensor(retimed_actions, dtype=torch.float32, device=env.unwrapped.device),
+            observed_states=retimed_observed_states,
         )
         print(
             f"[INFO]: Lane {env_id}: retimed {source_action_num_frames} source action frame(s) to "
@@ -3172,6 +3673,12 @@ def _start_replay_lane(
     _configure_env_for_episode(env, episode, episode_layout, object_pool, object_asset_names)
     env_ids = torch.tensor([env_id], dtype=torch.long, device=env.unwrapped.device)
     _reset_env(env, env_ids)
+    if phase_tracker is not None:
+        _set_lane_robot_pose(
+            env,
+            env_id=env_id,
+            joint_pos=lane_hold_action,
+        )
     policy_control_active = getattr(env.unwrapped, "_so101_policy_control_active", None)
     if not isinstance(policy_control_active, torch.Tensor) or tuple(policy_control_active.shape) != (
         env.unwrapped.num_envs,
@@ -3183,7 +3690,7 @@ def _start_replay_lane(
         )
     policy_control_active[env_ids] = False
     env.unwrapped._so101_policy_control_active = policy_control_active
-    actions[env_id] = hold_action
+    actions[env_id] = lane_hold_action
     setup = _episode_setup(env, env_id=env_id)
     instruction = getattr(env.unwrapped, "_so101_instruction_text", [""])[env_id]
     print(f"[INFO]: Lane {env_id}: episode instruction: {instruction}")
@@ -3220,11 +3727,15 @@ def _start_replay_lane(
         initial_scene=_scene_state(env, object_asset_names, object_pool, env_id=env_id),
         initial_frame_path=initial_frame_path,
         final_frame_path=final_frame_path,
-        last_action_lerobot_raw=hold_action_lerobot.clone(),
-        last_action_lerobot=hold_action_lerobot.clone(),
-        last_action_sim=hold_action.clone(),
+        last_action_lerobot_raw=lane_hold_action_lerobot.clone(),
+        last_action_lerobot=lane_hold_action_lerobot.clone(),
+        last_action_sim=lane_hold_action.clone(),
         last_action_clamped_mask=torch.zeros_like(hold_action_lerobot, dtype=torch.bool),
         last_action_delta_lerobot=torch.zeros_like(hold_action_lerobot),
+        initial_hold_action_sim=lane_hold_action.clone(),
+        initial_hold_action_lerobot=lane_hold_action_lerobot.clone(),
+        phase_tracker=phase_tracker,
+        requested_retime_scale=retiming_plan.scale if retiming_plan is not None else None,
     )
     if args_cli.save_trajectory:
         lane.final_eval = TermEval(
@@ -3253,16 +3764,14 @@ def _prepare_lane_action(
     object_asset_names: list[str],
     mapper: SO101ReplayActionMapper,
     actions: torch.Tensor,
-    hold_action: torch.Tensor,
-    hold_action_lerobot: torch.Tensor,
     initial_hold_steps: int,
     hold_last_steps: int,
 ) -> None:
     if lane.step < initial_hold_steps:
-        actions[lane.env_id] = hold_action
-        lane.last_action_lerobot_raw = hold_action_lerobot.clone()
-        lane.last_action_lerobot = hold_action_lerobot.clone()
-        lane.last_action_sim = hold_action.clone()
+        actions[lane.env_id] = lane.initial_hold_action_sim
+        lane.last_action_lerobot_raw = lane.initial_hold_action_lerobot.clone()
+        lane.last_action_lerobot = lane.initial_hold_action_lerobot.clone()
+        lane.last_action_sim = lane.initial_hold_action_sim.clone()
         lane.last_action_clamped_mask.zero_()
         lane.last_action_delta_lerobot.zero_()
         lane.last_action_frame_index = -1
@@ -3273,6 +3782,61 @@ def _prepare_lane_action(
         env_ids = torch.tensor([lane.env_id], dtype=torch.long, device=env.unwrapped.device)
         _begin_robot_control(env, object_asset_names, env_ids=env_ids)
         lane.robot_control_started = True
+
+    if lane.phase_tracker is not None:
+        if not lane.action_replay_complete:
+            robot = env.unwrapped.scene["robot"]
+            joint_ids = [
+                robot.joint_names.index(joint_name) for joint_name in ACTION_JOINT_NAMES
+            ]
+            actual_sim = robot.data.joint_pos[lane.env_id, joint_ids]
+            phase_step = lane.phase_tracker.step(
+                actual_sim.detach().cpu().numpy(),
+                lane.last_action_sim.detach().cpu().numpy(),
+            )
+            requested_sim = torch.as_tensor(
+                phase_step.command,
+                dtype=torch.float32,
+                device=env.unwrapped.device,
+            )
+            action_lerobot_raw = mapper.sim_radians_to_lerobot_positions(requested_sim)
+            action_lerobot = mapper.clamp_lerobot_positions(action_lerobot_raw)
+            action_sim = mapper.lerobot_positions_to_sim_radians(action_lerobot)
+            joint_limit_clamped_mask = ~torch.isclose(
+                requested_sim,
+                action_sim,
+                rtol=0.0,
+                atol=1.0e-6,
+            )
+            joint_limit_clamped_mask |= torch.as_tensor(
+                phase_step.joint_limit_clipped_mask,
+                dtype=torch.bool,
+                device=env.unwrapped.device,
+            )
+            actions[lane.env_id] = action_sim
+            lane.last_action_delta_lerobot = action_lerobot - lane.last_action_lerobot
+            lane.last_action_lerobot_raw = action_lerobot_raw.clone()
+            lane.last_action_lerobot = action_lerobot.clone()
+            lane.last_action_sim = action_sim.clone()
+            lane.last_action_clamped_mask = joint_limit_clamped_mask
+            lane.last_action_frame_index = lane.frame_index
+            lane.last_action_phase = "dataset"
+            lane.last_phase_step = phase_step
+            lane.frame_index += 1
+            if bool(torch.any(joint_limit_clamped_mask).item()):
+                lane.joint_limit_clamp_steps += 1
+            lane.action_replay_complete = lane.phase_tracker.complete
+        elif lane.final_hold_steps_emitted < hold_last_steps:
+            actions[lane.env_id] = lane.last_action_sim
+            lane.last_action_delta_lerobot.zero_()
+            lane.last_action_phase = "final_hold"
+            lane.final_hold_steps_emitted += 1
+        else:
+            raise RuntimeError(
+                f"Lane {lane.env_id} was stepped after phase-governed replay episode "
+                f"{lane.dataset_episode_index} finished."
+            )
+        return
 
     replay_step = lane.step - initial_hold_steps
     if replay_step < lane.action_episode.num_frames:
@@ -3299,6 +3863,128 @@ def _prepare_lane_action(
         )
 
 
+def _phase_governor_sample(lane: ReplayLane) -> dict[str, Any]:
+    phase_step = lane.last_phase_step
+    phase_observation = lane.last_phase_observation
+    tracker = lane.phase_tracker
+    if (
+        phase_step is None
+        or phase_observation is None
+        or lane.last_action_phase != "dataset"
+    ):
+        return {
+            "retime_reference_sim": np.full(len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32),
+            "retime_tracking_error_rad": np.full(
+                len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32
+            ),
+            "retime_pre_step_reference_sim": np.full(
+                len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32
+            ),
+            "retime_pre_step_tracking_error_rad": np.full(
+                len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32
+            ),
+            "retime_raw_command_sim": np.full(
+                len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32
+            ),
+            "retime_bounded_command_sim": np.full(
+                len(ACTION_JOINT_NAMES), np.nan, dtype=np.float32
+            ),
+            "retime_correction_rad": np.zeros(len(ACTION_JOINT_NAMES), dtype=np.float32),
+            "retime_phase": math.nan,
+            "retime_proposed_phase": math.nan,
+            "retime_next_phase": math.nan,
+            "retime_governor_phase_rate": math.nan,
+            "retime_phase_rate": math.nan,
+            "retime_feedforward_scale": math.nan,
+            "retime_max_normalized_arm_error": math.nan,
+            "retime_phase_rate_floored": False,
+            "retime_paused": False,
+            "retime_hard_paused": False,
+            "retime_resume_streak": 0,
+            "retime_correction_clipped": False,
+            "retime_velocity_clipped": False,
+            "retime_joint_limit_clipped": False,
+            "retime_correction_clipped_mask": np.zeros(
+                len(ACTION_JOINT_NAMES), dtype=np.bool_
+            ),
+            "retime_velocity_clipped_mask": np.zeros(
+                len(ACTION_JOINT_NAMES), dtype=np.bool_
+            ),
+            "retime_joint_limit_clipped_mask": np.zeros(
+                len(ACTION_JOINT_NAMES), dtype=np.bool_
+            ),
+            "retime_ungoverned_slew_limited": False,
+            "retime_ungoverned_slew_limited_mask": np.zeros(
+                len(ACTION_JOINT_NAMES), dtype=np.bool_
+            ),
+            "retime_complete": bool(tracker.complete) if tracker is not None else False,
+            "retime_limit_reached": (
+                bool(tracker.limit_reached) if tracker is not None else False
+            ),
+        }
+    return {
+        # The primary reference/error pair is post-step aligned with the
+        # trajectory sample's joint_pos. The pre-step pair records the evidence
+        # used to govern phase for this command.
+        "retime_reference_sim": np.asarray(
+            phase_step.target_reference, dtype=np.float32
+        ),
+        "retime_tracking_error_rad": np.asarray(
+            phase_observation.tracking_error, dtype=np.float32
+        ),
+        "retime_pre_step_reference_sim": np.asarray(
+            phase_step.reference, dtype=np.float32
+        ),
+        "retime_pre_step_tracking_error_rad": np.asarray(
+            phase_step.tracking_error, dtype=np.float32
+        ),
+        "retime_raw_command_sim": np.asarray(phase_step.raw_command, dtype=np.float32),
+        "retime_bounded_command_sim": np.asarray(
+            phase_step.command, dtype=np.float32
+        ),
+        "retime_correction_rad": np.asarray(phase_step.correction, dtype=np.float32),
+        "retime_phase": float(phase_step.phase),
+        "retime_proposed_phase": float(phase_step.proposed_phase),
+        "retime_next_phase": float(phase_step.next_phase),
+        "retime_governor_phase_rate": float(phase_step.governor_phase_rate),
+        "retime_phase_rate": float(phase_step.phase_rate),
+        "retime_feedforward_scale": float(phase_step.feedforward_scale),
+        "retime_max_normalized_arm_error": float(
+            getattr(phase_step, "normalized_arm_error", math.nan)
+        ),
+        "retime_phase_rate_floored": bool(
+            getattr(phase_step, "phase_rate_floored", False)
+        ),
+        "retime_paused": bool(phase_step.paused),
+        "retime_hard_paused": bool(getattr(phase_step, "hard_paused", False)),
+        "retime_resume_streak": int(
+            getattr(phase_step, "pause_release_streak", 0)
+        ),
+        "retime_correction_clipped": bool(phase_step.correction_clipped),
+        "retime_velocity_clipped": bool(phase_step.velocity_clipped),
+        "retime_joint_limit_clipped": bool(phase_step.joint_limit_clipped),
+        "retime_correction_clipped_mask": np.asarray(
+            phase_step.correction_clipped_mask, dtype=np.bool_
+        ),
+        "retime_velocity_clipped_mask": np.asarray(
+            phase_step.velocity_clipped_mask, dtype=np.bool_
+        ),
+        "retime_joint_limit_clipped_mask": np.asarray(
+            phase_step.joint_limit_clipped_mask, dtype=np.bool_
+        ),
+        "retime_ungoverned_slew_limited": bool(
+            phase_step.ungoverned_slew_limited
+        ),
+        "retime_ungoverned_slew_limited_mask": np.asarray(
+            phase_step.ungoverned_slew_limited_mask, dtype=np.bool_
+        ),
+        "retime_complete": bool(tracker.complete) if tracker is not None else False,
+        "retime_limit_reached": (
+            bool(tracker.limit_reached) if tracker is not None else False
+        ),
+    }
+
+
 def _append_trajectory_sample(
     env,
     lane: ReplayLane,
@@ -3311,8 +3997,7 @@ def _append_trajectory_sample(
 ) -> None:
     if lane.final_eval is None:
         raise RuntimeError(f"Lane {lane.env_id} has no termination evaluation for trajectory capture.")
-    lane.trajectory_samples.append(
-        _trajectory_sample(
+    sample = _trajectory_sample(
             env,
             object_asset_names,
             step=lane.step,
@@ -3333,7 +4018,8 @@ def _append_trajectory_sample(
             final_scoring_override_applied=final_scoring_override_applied,
             env_id=lane.env_id,
         )
-    )
+    sample.update(_phase_governor_sample(lane))
+    lane.trajectory_samples.append(sample)
 
 
 def _upsert_final_trajectory_sample(
@@ -3347,7 +4033,7 @@ def _upsert_final_trajectory_sample(
     final_scoring_override_applied: bool = False,
 ) -> None:
     if lane.trajectory_samples and int(lane.trajectory_samples[-1]["step"]) == lane.step:
-        lane.trajectory_samples[-1] = _trajectory_sample(
+        sample = _trajectory_sample(
             env,
             object_asset_names,
             step=lane.step,
@@ -3368,6 +4054,8 @@ def _upsert_final_trajectory_sample(
             final_scoring_override_applied=final_scoring_override_applied,
             env_id=lane.env_id,
         )
+        sample.update(_phase_governor_sample(lane))
+        lane.trajectory_samples[-1] = sample
     else:
         _append_trajectory_sample(
             env,
@@ -4546,7 +5234,22 @@ def _episode_explanation(
             ),
             "maximum_saved_step_gap": int(np.max(sample_step_gaps)) if len(sample_step_gaps) else 0,
             "expected_maximum_saved_step_gap": int(args_cli.trajectory_stride),
-            "dataset_frames_complete": int(lane.frame_index) == int(lane.action_episode.num_frames),
+            "dataset_frames_complete": (
+                bool(lane.action_replay_complete)
+                and not bool(lane.phase_tracker.limit_reached)
+                if lane.phase_tracker is not None
+                else int(lane.frame_index) == int(lane.action_episode.num_frames)
+            ),
+            "phase_governor_limit_reached": (
+                bool(lane.phase_tracker.limit_reached)
+                if lane.phase_tracker is not None
+                else False
+            ),
+            "phase_governor_frame_count_matches": (
+                lane.frame_index == lane.phase_tracker.emitted_frames
+                if lane.phase_tracker is not None
+                else True
+            ),
             "nonfinite_raw_action_values": int(np.count_nonzero(~np.isfinite(raw_actions))),
             "nonfinite_object_position_values": int(np.count_nonzero(~np.isfinite(object_positions))),
             "nonfinite_joint_position_values": int(np.count_nonzero(~np.isfinite(joint_positions))),
@@ -4714,6 +5417,15 @@ def _finalize_replay_lane(
         final_label["reason"] = "action_stream_exhausted"
         if args_cli.label_source == "final":
             label = final_label
+    if (
+        lane.phase_tracker is not None
+        and lane.phase_tracker.limit_reached
+    ):
+        final_label["success"] = False
+        final_label["failure_reason"] = "phase_governor_tracking_limit"
+        final_label["reason"] = "phase_governor_tracking_limit"
+        if args_cli.label_source == "final":
+            label = final_label
 
     event_ledger, best_achieved, closest_miss, outcome_quality = _episode_explanation(
         lane,
@@ -4760,6 +5472,25 @@ def _finalize_replay_lane(
     if isinstance(raw_attribution, dict):
         outcome_quality["behavioral_attribution_confidence"] = raw_attribution.get("confidence")
         outcome_quality["behavioral_attribution_version"] = raw_attribution.get("classification_version")
+    outcome_quality["training_data_admitted"] = (
+        lane.recorded_dataset_episode_index is not None
+    )
+    outcome_quality["training_data_quarantine_reason"] = (
+        "phase_governor_tracking_limit"
+        if lane.recorded_dataset_episode_index is None
+        and lane.phase_tracker is not None
+        and lane.phase_tracker.limit_reached
+        else None
+    )
+
+    phase_governor_metadata = None
+    if lane.phase_tracker is not None:
+        phase_governor_metadata = {
+            "config": lane.phase_tracker.config.to_dict(),
+            "diagnostics": lane.phase_tracker.diagnostics(),
+            "joint_limit_clamp_steps": lane.joint_limit_clamp_steps,
+            "initial_pose_source": "source_observation.state[0]",
+        }
 
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -4823,8 +5554,14 @@ def _finalize_replay_lane(
         ),
         "episode_length": {
             "source_dataset_frames": lane.source_action_num_frames,
+            "requested_retime_scale": (
+                lane.requested_retime_scale
+            ),
             "uniform_retime_scale": (
                 lane.action_episode.num_frames / max(lane.source_action_num_frames, 1)
+            ),
+            "realized_retime_scale": (
+                lane.frame_index / max(lane.source_action_num_frames, 1)
             ),
             "retime_strategy": (
                 args_cli.retime_strategy
@@ -4838,21 +5575,27 @@ def _finalize_replay_lane(
             ),
             "timeout_scale": (
                 (
-                    float(args_cli.retime_scale)
-                    if args_cli.retime_scale is not None
-                    else lane.action_episode.num_frames / max(lane.source_action_num_frames, 1)
+                    (lane.phase_tracker.max_steps + hold_last_steps)
+                    / max(lane.source_action_num_frames, 1)
+                    if lane.phase_tracker is not None
+                    else (
+                        (lane.action_episode.num_frames + hold_last_steps)
+                        / max(lane.source_action_num_frames, 1)
+                    )
                 )
                 if args_cli.retime_reference_repo_root is not None or args_cli.retime_scale is not None
                 else 1.0
             ),
-            "dataset_frames": lane.action_episode.num_frames,
-            "dataset_seconds": lane.action_episode.num_frames / max(lane.action_episode.fps, 1.0e-6),
+            "nominal_retimed_frames": lane.action_episode.num_frames,
+            "dataset_frames": lane.frame_index,
+            "dataset_seconds": lane.frame_index / max(lane.action_episode.fps, 1.0e-6),
             "frames_played": lane.frame_index,
             "sim_steps": lane.step,
             "sim_seconds": lane.step * control_dt,
             "initial_hold_steps": initial_hold_steps,
             "hold_last_steps": hold_last_steps,
             "action_stream_exhausted": lane.action_stream_exhausted,
+            "phase_governor": phase_governor_metadata,
         },
         "paths": {
             "overhead_initial": (
@@ -4886,7 +5629,28 @@ def _finalize_replay_lane(
             "contact_force_units": "N",
             "contact_impulse_semantics": "force sample multiplied by control_dt; approximate N*s",
             "action_lerobot_semantics": "post-calibration-range-clamp (v1-compatible)",
-            "action_lerobot_raw_semantics": "dataset command before any collector clamp",
+            "action_lerobot_raw_semantics": (
+                "source dataset command before collector clamp for fixed replay; "
+                "calibrated representation of the phase-governor command for closed-loop replay"
+            ),
+            "phase_governor_trace_semantics": {
+                "retime_reference_sim": (
+                    "post-step reference aligned with joint_pos and "
+                    "retime_tracking_error_rad"
+                ),
+                "retime_pre_step_reference_sim": (
+                    "current-phase reference used to govern the command emitted "
+                    "before this post-step sample"
+                ),
+                "retime_raw_command_sim": (
+                    "nominal next-phase simulator-radian command plus bounded feedback, "
+                    "before slew and position bounds"
+                ),
+                "retime_bounded_command_sim": (
+                    "command after governor slew/position bounds and before the "
+                    "calibration mapper round trip"
+                ),
+            },
             "missing_float_state_encoding": "NaN with a companion *_observed/*_available mask",
             "finite_difference_velocity_semantics": (
                 "average velocity between saved samples; temporal spacing is recorded in time_s"
@@ -4946,8 +5710,12 @@ def main():
     episode_specs = load_episode_jsonl(args_cli.episodes_jsonl)
     output_dir = _make_output_dir()
     resume_records = _load_resume_records(output_dir)
-    _validate_resume_state(resume_records)
+    _validate_resume_state(resume_records, retiming_plan)
     resume_count = len(resume_records)
+    resume_saved_count = sum(
+        record.get("recorded_sim_dataset") is not None
+        for record in resume_records
+    )
     selected_dataset_indices = (
         _parse_episode_indices(
             args_cli.dataset_episode_indices,
@@ -5041,7 +5809,13 @@ def main():
             f"target_mean={retiming_plan.target_mean_frames:.3f}, "
             f"scale={retiming_plan.scale:.9f}, strategy={retiming_plan.strategy}."
         )
+        if retiming_plan.phase_governor is not None:
+            print(
+                "[INFO]: Closed-loop phase governor enabled: "
+                f"{retiming_plan.phase_governor.to_dict()}"
+            )
 
+    random.seed(args_cli.seed)
     torch.manual_seed(args_cli.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args_cli.seed)
@@ -5106,10 +5880,12 @@ def main():
             video_files_size_mb=args_cli.dataset_video_files_size_mb,
         )
         recorder.init_dataset()
-        if args_cli.resume and recorder.num_saved_episodes != resume_count:
+        if args_cli.resume and recorder.num_saved_episodes != resume_saved_count:
             raise RuntimeError(
                 "Cannot resume: recorder metadata changed during initialization: "
-                f"outcomes={resume_count}, recorded_episodes={recorder.num_saved_episodes}."
+                f"saved_outcomes={resume_saved_count}, "
+                f"recorded_episodes={recorder.num_saved_episodes}, "
+                f"processed_outcomes={resume_count}."
             )
     else:
         print("[INFO]: Simulated LeRobot dataset recording disabled. Pass --record_dataset to enable it.")
@@ -5188,8 +5964,6 @@ def main():
                             object_asset_names=object_asset_names,
                             mapper=mapper,
                             actions=actions,
-                            hold_action=hold_action,
-                            hold_action_lerobot=hold_action_lerobot,
                             initial_hold_steps=initial_hold_steps,
                             hold_last_steps=hold_last_steps,
                         )
@@ -5197,6 +5971,27 @@ def main():
                     obs, _rewards, _terminated, _truncated, _info = env.step(actions)
                     for lane in active_lanes.values():
                         lane.step += 1
+                        if (
+                            lane.phase_tracker is not None
+                            and lane.last_action_phase == "dataset"
+                        ):
+                            if not lane.phase_tracker.awaiting_post_step:
+                                raise RuntimeError(
+                                    f"Lane {lane.env_id} emitted a phase-governed dataset "
+                                    "command without a pending post-step observation."
+                                )
+                            robot = env.unwrapped.scene["robot"]
+                            joint_ids = [
+                                robot.joint_names.index(joint_name)
+                                for joint_name in ACTION_JOINT_NAMES
+                            ]
+                            actual_sim = robot.data.joint_pos[lane.env_id, joint_ids]
+                            lane.last_phase_observation = (
+                                lane.phase_tracker.observe_post_step(
+                                    actual_sim.detach().cpu().numpy()
+                                )
+                            )
+                            lane.action_replay_complete = lane.phase_tracker.complete
                         if recorder is not None and lane.last_action_phase == "dataset":
                             assert recording_camera_sources is not None
                             observation_lerobot = mapper.sim_radians_to_lerobot_positions(
@@ -5213,8 +6008,9 @@ def main():
                         control_dt=control_dt,
                         success_params=success_params,
                         failure_params=failure_params,
-                        timeout_scale=(
-                            retiming_plan.scale if retiming_plan is not None else 1.0
+                        timeout_scale=max(
+                            _lane_timeout_scale(lane, retiming_plan)
+                            for lane in active_lanes.values()
                         ),
                     )
 
@@ -5249,9 +6045,19 @@ def main():
                             f"success={lane.final_eval.success}, reason={lane.final_eval.reason}"
                         )
 
-                    natural_end_step = initial_hold_steps + lane.action_episode.num_frames + hold_last_steps
-                    if lane.step >= natural_end_step:
-                        lane.action_stream_exhausted = True
+                    if lane.phase_tracker is not None:
+                        lane.action_stream_exhausted = (
+                            lane.action_replay_complete
+                            and lane.final_hold_steps_emitted >= hold_last_steps
+                        )
+                    else:
+                        natural_end_step = (
+                            initial_hold_steps
+                            + lane.action_episode.num_frames
+                            + hold_last_steps
+                        )
+                        if lane.step >= natural_end_step:
+                            lane.action_stream_exhausted = True
                     if (
                         lane.action_stream_exhausted
                         or (args_cli.stop_on_done and lane.final_eval.done)
@@ -5260,7 +6066,77 @@ def main():
 
                 for env_id in finished_env_ids:
                     lane = active_lanes.pop(env_id)
-                    if recorder is not None:
+                    if lane.phase_tracker is not None:
+                        if lane.phase_tracker.awaiting_post_step:
+                            raise RuntimeError(
+                                f"Lane {lane.env_id} finished with an unconsumed "
+                                "phase-governor command."
+                            )
+                        if lane.frame_index != lane.phase_tracker.emitted_frames:
+                            raise RuntimeError(
+                                f"Lane {lane.env_id} emitted-frame mismatch: "
+                                f"collector={lane.frame_index}, "
+                                f"governor={lane.phase_tracker.emitted_frames}."
+                            )
+                        if recorder is not None:
+                            recorder_frame_count = getattr(recorder, "_frame_count", None)
+                            if (
+                                recorder_frame_count is not None
+                                and int(recorder_frame_count) != lane.frame_index
+                            ):
+                                raise RuntimeError(
+                                    f"Lane {lane.env_id} recorder-frame mismatch: "
+                                    f"recorder={recorder_frame_count}, "
+                                    f"governor={lane.frame_index}."
+                                )
+                        if (
+                            lane.phase_tracker.limit_reached
+                            and args_cli.retime_tracking_limit_policy != "save"
+                        ):
+                            if recorder is not None:
+                                recorder.cancel_episode()
+                                lane.recording_cancelled = True
+                            failure_path = (
+                                output_dir
+                                / "state"
+                                / (
+                                    f"phase_governor_failure_episode_"
+                                    f"{lane.dataset_episode_index:06d}.json"
+                                )
+                            )
+                            failure_path.write_text(
+                                json.dumps(
+                                    {
+                                        "created_at": _json_now(),
+                                        "dataset_episode_index": lane.dataset_episode_index,
+                                        "benchmark_episode_index": lane.benchmark_index,
+                                        "instruction": lane.episode.instruction,
+                                        "diagnostics": lane.phase_tracker.diagnostics(),
+                                    },
+                                    indent=2,
+                                    allow_nan=False,
+                                ),
+                                encoding="utf-8",
+                            )
+                            if args_cli.retime_tracking_limit_policy == "abort":
+                                raise RuntimeError(
+                                    "Phase-governed replay exhausted its tracking recovery "
+                                    f"budget for dataset episode {lane.dataset_episode_index}; "
+                                    "the current recording was cancelled so it cannot enter "
+                                    f"training data. Diagnostics: {failure_path}. Pass "
+                                    "--retime_tracking_limit_policy skip to quarantine it and "
+                                    "continue, or save only if retaining this explicitly failed "
+                                    "trajectory is intentional."
+                                )
+                            print(
+                                "[WARN]: Quarantined source dataset episode "
+                                f"{lane.dataset_episode_index} after its phase governor "
+                                "exhausted the tracking recovery budget. The recording was "
+                                f"cancelled and will not enter training data. Diagnostics: "
+                                f"{failure_path}",
+                                flush=True,
+                            )
+                    if recorder is not None and not lane.recording_cancelled:
                         recorded_episode_index = recorder.num_saved_episodes
                         instruction = str(
                             getattr(env.unwrapped, "_so101_instruction_text", [""])[env_id]
@@ -5303,6 +6179,12 @@ def main():
                         f"eta={_format_duration(remaining_s)}, "
                         f"expected_completion={expected_completion.isoformat(timespec='seconds')}"
                     )
+                    # Persist the outcome before resetting the simulator for the
+                    # next lane.  A saved LeRobot episode and its outcome row are
+                    # the resume transaction; delaying this flush until after
+                    # start_lane() left the two roots inconsistent when Kit was
+                    # interrupted during the next reset.
+                    flush_ready_records()
                     if next_offset < run_planned_count and not STOP_REQUESTED:
                         start_lane(env_id)
 
@@ -5329,6 +6211,16 @@ def main():
             int(record["episode_length"]["dataset_frames"])
             for record in summary_records
         )
+        saved_training_records = [
+            record
+            for record in summary_records
+            if record.get("recorded_sim_dataset") is not None
+        ]
+        quarantined_records = [
+            record
+            for record in summary_records
+            if record.get("recorded_sim_dataset") is None
+        ]
         failure_counts: dict[str, int] = {}
         behavioral_failure_counts: dict[str, int] = {}
         for record in summary_records:
@@ -5359,6 +6251,12 @@ def main():
             "planned_episodes": total_planned_count,
             "completed_episodes": len(summary_records),
             "collection_complete": len(summary_records) == total_planned_count,
+            "saved_training_episodes": len(saved_training_records),
+            "quarantined_episodes": len(quarantined_records),
+            "quarantined_dataset_episode_indices": [
+                int(record["dataset"]["episode_index"])
+                for record in quarantined_records
+            ],
             "missing_dataset_episode_indices": sorted(
                 set(
                     range(
@@ -5390,7 +6288,20 @@ def main():
                     retiming_plan.strategy if retiming_plan is not None else None
                 ),
                 "interpolation": "pchip" if retiming_plan is not None else None,
-                "timeout_scale": retiming_plan.scale if retiming_plan is not None else 1.0,
+                "timeout_scale": (
+                    max(
+                        float(record["episode_length"]["timeout_scale"])
+                        for record in summary_records
+                    )
+                    if summary_records
+                    else (retiming_plan.scale if retiming_plan is not None else 1.0)
+                ),
+                "phase_governor": (
+                    retiming_plan.phase_governor.to_dict()
+                    if retiming_plan is not None
+                    and retiming_plan.phase_governor is not None
+                    else None
+                ),
                 "reference_repo_root": (
                     retiming_plan.reference_repo_root if retiming_plan is not None else None
                 ),
@@ -5437,9 +6348,28 @@ def main():
 
 if __name__ == "__main__":
     exit_code = 0
+    # Some lazily imported simulator/recording modules install their own handlers.
+    # Reassert ours immediately before the long-running collection starts.
+    _install_signal_handlers()
     try:
-        if not main():
-            exit_code = 130 if STOP_REQUESTED else 1
+        try:
+            if not main():
+                exit_code = 130 if STOP_REQUESTED else 1
+        except SystemExit as exc:
+            print(
+                f"[ERROR]: Unexpected SystemExit while collection was active: code={exc.code!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc()
+            exit_code = exc.code if isinstance(exc.code, int) and exc.code != 0 else 1
+        except BaseException:
+            # Print before SimulationApp.close(): Kit disables its logging
+            # framework during shutdown, which can otherwise swallow the only
+            # useful traceback and leave a native-looking status-0 exit.
+            print("[ERROR]: Collector failed while collection was active.", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            exit_code = 1
     finally:
         simulation_app.close()
     raise SystemExit(exit_code)

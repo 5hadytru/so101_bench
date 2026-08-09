@@ -31,6 +31,13 @@ def _str_to_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"Expected an integer >= 1, got {value!r}.")
+    return parsed
+
+
 parser = argparse.ArgumentParser(
     description=(
         "Replay one or more LeRobot dataset episodes in SO-101 Bench by applying the recorded action stream "
@@ -41,6 +48,15 @@ parser.add_argument("--disable_fabric", action="store_true", default=False, help
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="So101Bench-Bin-v0", help="Isaac Lab task name.")
 parser.add_argument("--seed", type=int, default=1984, help="Environment seed.")
+parser.add_argument(
+    "--contact_solver_position_iterations",
+    type=_positive_int,
+    default=64,
+    help=(
+        "PhysX solver position iteration count for the bin and object rigid bodies (default: 64). "
+        "Lowering it speeds up the simulation but changes contact resolution."
+    ),
+)
 parser.add_argument(
     "--episodes_jsonl",
     type=Path,
@@ -104,7 +120,7 @@ parser.add_argument(
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=0.5,
+    default=1.5,
     help="Seconds to hold the initial sim joint pose before replaying the first recorded action.",
 )
 parser.add_argument(
@@ -174,6 +190,7 @@ from so101_bench.layouts import normalize_layout_object_slots
 from so101_bench.mdp import benchmark_object_positions, mark_benchmark_robot_start
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
     OBJECT_LABELS,
+    configure_contact_solver_position_iterations,
     configure_env_cfg_for_object_pool,
 )
 from so101_bench.utils.lerobot_calibration import (
@@ -740,6 +757,11 @@ def _make_env(
     env_cfg.seed = args_cli.seed
     env_cfg.scene.robot.init_state.joint_pos = dict(INITIAL_ROBOT_JOINT_POS)
     object_asset_names = configure_env_cfg_for_object_pool(env_cfg, object_pool)
+    configure_contact_solver_position_iterations(env_cfg, args_cli.contact_solver_position_iterations)
+    print(
+        f"[INFO]: Contact solver position iterations: {args_cli.contact_solver_position_iterations} "
+        "(bin and object rigid bodies)."
+    )
     env_cfg.events.reset_benchmark_scene.params.update(
         _episode_reset_params(first_episode, first_episode_layout, object_pool, object_asset_names)
     )

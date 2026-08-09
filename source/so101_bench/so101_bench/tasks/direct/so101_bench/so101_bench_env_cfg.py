@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 
 from isaacsim.core.utils.rotations import euler_angles_to_quat
 
@@ -106,7 +107,7 @@ SO101_BOUNDING_BOX = [
 
 MIN_RESET_TIME_S = 0.5
 MIN_FAILURE_TIME_S = 1.0
-SUCCESS_CONFIRM_TIME_S = 3.0
+SUCCESS_CONFIRM_TIME_S = 5.0
 FAILURE_CONFIRM_TIME_S = 5.0
 CONTACT_GRACE_TIME_S = 5.0
 PHYSICS_DT = 1.0 / 240.0
@@ -116,6 +117,12 @@ CONTACT_OFFSET = 0.002
 REST_OFFSET = 0.0
 CONTACT_SOLVER_POSITION_ITERATIONS = 64
 CONTACT_SOLVER_VELOCITY_ITERATIONS = 4
+# Active value used when building bin/object rigid bodies. Overriding it is a
+# physics change: it alters contact resolution, so replays and outcome labels
+# produced under different values are not comparable. See
+# ``configure_contact_solver_position_iterations``.
+_ACTIVE_CONTACT_SOLVER_POSITION_ITERATIONS = CONTACT_SOLVER_POSITION_ITERATIONS
+_OBJECT_SLOT_PATTERN = re.compile(r"object_\d+")
 MAX_DEPENETRATION_VELOCITY = 0.25
 MAX_BIN_LINEAR_VELOCITY = 1.0
 MAX_BIN_ANGULAR_VELOCITY = 360.0
@@ -182,12 +189,62 @@ def _robot_cfg() -> ArticulationCfg:
 
 def _contact_rigid_props(max_linear_velocity: float, max_angular_velocity: float) -> sim_utils.RigidBodyPropertiesCfg:
     return sim_utils.RigidBodyPropertiesCfg(
-        solver_position_iteration_count=CONTACT_SOLVER_POSITION_ITERATIONS,
+        solver_position_iteration_count=_ACTIVE_CONTACT_SOLVER_POSITION_ITERATIONS,
         solver_velocity_iteration_count=CONTACT_SOLVER_VELOCITY_ITERATIONS,
         max_depenetration_velocity=MAX_DEPENETRATION_VELOCITY,
         max_linear_velocity=max_linear_velocity,
         max_angular_velocity=max_angular_velocity,
     )
+
+
+def contact_solver_position_iterations() -> int:
+    """Return the solver position iteration count bin/object rigid bodies are built with."""
+
+    return _ACTIVE_CONTACT_SOLVER_POSITION_ITERATIONS
+
+
+def _contact_solver_slot_names(scene_cfg: So101BenchSceneCfg) -> list[str]:
+    """Scene slots whose rigid bodies come from :func:`_contact_rigid_props`.
+
+    The robot is deliberately excluded: its solver iterations live on
+    ``articulation_props`` in ``SO101_CFG`` and are a separate knob.
+    """
+
+    slot_names = ["plastic_bin"]
+    slot_names.extend(name for name in scene_cfg.__dict__ if _OBJECT_SLOT_PATTERN.fullmatch(name))
+    return slot_names
+
+
+def configure_contact_solver_position_iterations(
+    env_cfg: So101BenchEnvCfg,
+    iterations: int,
+) -> int:
+    """Set the PhysX solver position iteration count for bin and object rigid bodies.
+
+    This both updates the value future ``_contact_rigid_props()`` calls use and
+    rewrites the already-built scene slots, so it is safe to call before or
+    after the object pool has been configured.
+
+    This changes contact resolution and therefore simulated dynamics. Outcome
+    labels produced under different values are not comparable, and replays are
+    only reproducible against the value they were recorded with.
+    """
+
+    global _ACTIVE_CONTACT_SOLVER_POSITION_ITERATIONS
+
+    iterations = int(iterations)
+    if iterations < 1:
+        raise ValueError(f"Expected contact solver position iterations >= 1, got {iterations}.")
+    _ACTIVE_CONTACT_SOLVER_POSITION_ITERATIONS = iterations
+
+    for slot_name in _contact_solver_slot_names(env_cfg.scene):
+        slot_cfg = getattr(env_cfg.scene, slot_name, None)
+        rigid_props = getattr(getattr(slot_cfg, "spawn", None), "rigid_props", None)
+        if rigid_props is None:
+            # Empty pool slot, deformable object, or a spawn without rigid props.
+            continue
+        rigid_props.solver_position_iteration_count = iterations
+    return iterations
 
 
 def _contact_collision_props() -> sim_utils.CollisionPropertiesCfg:

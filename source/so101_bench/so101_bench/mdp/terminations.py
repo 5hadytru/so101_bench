@@ -361,17 +361,41 @@ def grasped_object_made_contact(
     return step_state.grasped_object_made_contact
 
 
+def _non_bin_object_contact(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return current union, grasp-tracked, and target contact masks."""
+
+    grasped_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    target_contact = target_object_made_contact(env, object_asset_names, step_state)
+    if hasattr(env, "_so101_task_family"):
+        non_bin_task = ~(_task_is(env, TASK_BIN) | _task_is(env, TASK_NAMED_BIN))
+    else:
+        non_bin_task = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    return (grasped_contact | target_contact) & non_bin_task, grasped_contact, target_contact
+
+
 def grasped_object_contact_exceeded_grace_period(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
     step_state: _TerminationStepState | None = None,
     grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
 ) -> torch.Tensor:
-    """Return whether uninterrupted grasped-object contact has exceeded the allowed duration."""
+    """Return whether uninterrupted non-bin target contact exceeded the grace period.
+
+    The legacy counter name is retained for outcome/resume compatibility, but
+    it now tracks the union of contact on the grasp-tracked object and contact
+    on the instructed target.  The latter matters when manipulation is real
+    but the heuristic grasp tracker never declares an acquisition.
+    """
 
     if step_state is None:
         step_state = _termination_step_state(env, object_asset_names)
-    made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    made_contact, _grasped_contact, _target_contact = _non_bin_object_contact(
+        env, object_asset_names, step_state
+    )
     if not hasattr(env, "_so101_grasped_object_contact_steps"):
         env._so101_grasped_object_contact_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     if not hasattr(env, "_so101_grasped_object_contact_last_episode_steps"):
@@ -529,19 +553,21 @@ def _grasped_object_contact_allows_success(
     step_state: _TerminationStepState,
     grace_time_s: float,
 ) -> torch.Tensor:
-    """Require no grasped contact and no target contact earlier in the episode."""
+    """Pause success during contact without permanently latching a brief touch."""
 
     grasped_object_contact_exceeded_grace_period(env, object_asset_names, step_state, grace_time_s)
-    target_contact = target_object_made_contact(env, object_asset_names, step_state)
+    current_contact, grasped_contact, target_contact = _non_bin_object_contact(
+        env, object_asset_names, step_state
+    )
     target_contact_ever = getattr(env, "_so101_target_object_contact_ever", None)
     if not isinstance(target_contact_ever, torch.Tensor) or tuple(target_contact_ever.shape) != (env.num_envs,):
         target_contact_ever = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    non_bin_task = ~_task_is(env, TASK_BIN)
+    non_bin_task = ~(_task_is(env, TASK_BIN) | _task_is(env, TASK_NAMED_BIN))
     env._so101_target_object_contact_ever = target_contact_ever | (target_contact & non_bin_task)
-    return (
-        ~grasped_object_made_contact(env, object_asset_names, step_state)
-        & ~env._so101_target_object_contact_ever
-    )
+    # Contact resets the success-confirmation counter while it is present.  On
+    # separation, success can begin confirming again; only the independent
+    # continuous-contact timer above can turn contact into a failure.
+    return ~current_contact
 
 
 def _target_contact_ever_mask(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -1407,9 +1433,8 @@ def task_success(
     confirmed_success = success & _episode_age_at_least(env, min_episode_time_s)
 
     # Persist the actual configured confirmation requirement and confirmed
-    # state for postmortem attribution.  The benchmark commonly uses a much
-    # shorter confirmation window than this function's default, so inferring
-    # it later from a hard-coded duration would silently mislabel successes.
+    # state for postmortem attribution. Inferring the configured requirement
+    # later from a hard-coded duration would silently mislabel successes.
     required_steps = _confirmation_steps(env, confirm_time_s)
     episode_steps = env.episode_length_buf.to(device=env.device, dtype=torch.long)
     last_steps = getattr(env, "_so101_success_confirmation_last_episode_step", None)
@@ -1550,10 +1575,12 @@ def _next_to_task_diagnostic(
             env, object_asset_names, positions, yaws, env_id, target_id, ref_id
         ).item()
     )
-    made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    current_contact, made_contact, target_contact = _non_bin_object_contact(
+        env, object_asset_names, step_state
+    )
     target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
-    contact_rule_breached = bool((made_contact | target_contact_ever)[env_id].item())
+    contact_rule_breached = bool(current_contact[env_id].item())
     instant = (surface_distance <= SPATIAL_SUCCESS_DISTANCE_M) and not contact_rule_breached
     return _confirmed_success_diagnostic(
         "target_next_to_referent",
@@ -1566,6 +1593,7 @@ def _next_to_task_diagnostic(
         f"surface_distance={surface_distance:.4f}m "
         f"(required <={SPATIAL_SUCCESS_DISTANCE_M:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
@@ -1608,11 +1636,13 @@ def _between_task_diagnostic(
     line_fraction = torch.sum((target - ref_a) * segment, dim=1) / segment_len_sq
     projection = ref_a + line_fraction.unsqueeze(1) * segment
     perpendicular = float(torch.linalg.vector_norm(target - projection, dim=1)[env_id].item())
-    made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    current_contact, made_contact, target_contact = _non_bin_object_contact(
+        env, object_asset_names, step_state
+    )
     target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
     centered = BETWEEN_CENTER_FRACTION_MIN <= fraction <= BETWEEN_CENTER_FRACTION_MAX
-    contact_rule_breached = bool((made_contact | target_contact_ever)[env_id].item())
+    contact_rule_breached = bool(current_contact[env_id].item())
     instant = centered and (perpendicular <= BETWEEN_LINE_TOLERANCE_M) and not contact_rule_breached
     return _confirmed_success_diagnostic(
         "target_between_referents",
@@ -1628,6 +1658,7 @@ def _between_task_diagnostic(
         f"perpendicular_distance={perpendicular:.4f}m "
         f"(required <={BETWEEN_LINE_TOLERANCE_M:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
@@ -1647,7 +1678,9 @@ def _move_task_diagnostic(
     distance_to_boundary, progress, lateral, _target = _move_boundary_distance(
         env, object_asset_names, table_bounds, step_state
     )
-    made_contact = grasped_object_made_contact(env, object_asset_names, step_state)
+    current_contact, made_contact, target_contact = _non_bin_object_contact(
+        env, object_asset_names, step_state
+    )
     target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
     # Matches move_success: a boundary only applies while its directional gap is defined; an
@@ -1661,8 +1694,7 @@ def _move_task_diagnostic(
             (progress > 0.0)
             & reached_goal
             & (lateral <= straightness_tolerance)
-            & (~made_contact)
-            & (~target_contact_ever)
+            & (~current_contact)
         )[env_id].item()
     )
     boundary_id = int(env._so101_move_boundary_ids[env_id].item())
@@ -1685,6 +1717,7 @@ def _move_task_diagnostic(
         f"current_lateral_error={float(lateral[env_id].item()):.4f}m "
         f"(required <={straightness_tolerance:.4f}m), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
+        f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
         f"contact_grace_exceeded={bool(contact_exceeded[env_id].item())}",
     )
@@ -3286,10 +3319,10 @@ def benchmark_failure(
     )
 
     made_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if active_families & {TASK_NAMED_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
+    if active_families & {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
         made_contact = grasped_object_contact_exceeded_grace_period(
             env, object_asset_names, step_state, contact_grace_time_s
-        ) & (~_task_is(env, TASK_BIN))
+        )
 
     timeout_confirmation_failure = getattr(env, "_so101_timeout_success_confirmation_failed", None)
     if timeout_confirmation_failure is None:
@@ -3537,8 +3570,13 @@ def _failure_diagnostics(
             )
         )
 
-    if env._so101_task_family[env_id] in {TASK_NAMED_BIN, TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
-        made_contact = bool(grasped_object_made_contact(env, object_asset_names, step_state)[env_id].item())
+    if env._so101_task_family[env_id] in {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
+        current_contact_mask, grasped_contact_mask, target_contact_mask = _non_bin_object_contact(
+            env, object_asset_names, step_state
+        )
+        made_contact = bool(current_contact_mask[env_id].item())
+        grasped_contact = bool(grasped_contact_mask[env_id].item())
+        target_contact = bool(target_contact_mask[env_id].item())
         contact_step_counts = getattr(env, "_so101_grasped_object_contact_steps", None)
         if contact_step_counts is None:
             contact_step_counts = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -3558,6 +3596,7 @@ def _failure_diagnostics(
                 age_ready,
                 baseline_recorded,
                 f"grasped_object={grasped_object_name}, current_contact={made_contact}, "
+                f"grasped_object_contact={grasped_contact}, target_object_contact={target_contact}, "
                 f"continuous_contact={contact_steps * _env_step_dt(env):.4f}s "
                 f"(failure if >{contact_grace_time_s:.4f}s)",
             )

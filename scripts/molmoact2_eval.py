@@ -75,7 +75,7 @@ parser.add_argument(
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=0.5,
+    default=1.5,
     help="Seconds to hold the initial joint pose before querying MolmoAct2.",
 )
 parser.add_argument(

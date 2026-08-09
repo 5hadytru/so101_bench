@@ -48,7 +48,7 @@ parser.add_argument("--action_horizon", type=int, default=8, help="Action steps 
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=0.5,
+    default=1.5,
     help="Seconds to hold the initial joint pose before recording overhead_init and querying GR00T.",
 )
 parser.add_argument(
@@ -1302,7 +1302,6 @@ def main():
             end_reason = _episode_end_reason(env, terminated, truncated, term_log)
             failure_reasons = getattr(env.unwrapped, "_so101_failure_reasons", None)
             live_failure_reason = failure_reasons[0] if failure_reasons else "none"
-            _save_recording()
             episodes += 1
             successes += int(is_success)
             end_reason_counts[end_reason] += 1
@@ -1332,7 +1331,11 @@ def main():
                 elif postmortem is not None:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     message += f", live_failure_reason={live_failure_reason}"
-            print(message)
+            # Emit the already-computed outcome before finalizing video. A
+            # recorder/encoder shutdown must not erase the episode result from
+            # the log after the environment has definitively ended the episode.
+            print(message, flush=True)
+            _save_recording()
 
             if episodes >= episode_count:
                 _print_final_score()

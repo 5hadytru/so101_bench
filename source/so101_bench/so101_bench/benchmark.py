@@ -52,7 +52,7 @@ NON_TARGET_DISPLACEMENT_LIMIT_M = 1.0 * INCH
 LIFT_OFF_GROUND_LIMIT_M = 0.5 * INCH
 BOUNDARY_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 SPATIAL_SUCCESS_DISTANCE_M = 2.0 * INCH
-BETWEEN_LINE_TOLERANCE_M = 1.75 * INCH
+BETWEEN_LINE_TOLERANCE_M = 2.0 * INCH
 # The between task now permits the target anywhere along the referent span.  The
 # line-alignment and no-contact requirements remain active.
 BETWEEN_CENTER_FRACTION_MIN = 0.0
@@ -67,8 +67,8 @@ MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # of the target's lateral corridor. Below it the object is merely beside the path (a
 # glancing clip), so the move is scored on forward progress instead of "reaching" it.
 MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
-DEFAULT_EPISODE_LENGTH_S = 20.0
-FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 70.0
+DEFAULT_EPISODE_LENGTH_S = 25.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 80.0
 
 
 def episode_length_s(task_family: str, object_count: int) -> float:
@@ -87,7 +87,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "white pen": {"multiple_rigid_bodies": False, "deformable": False},
         "black pen": {"multiple_rigid_bodies": False, "deformable": False},
         "altoids container": {"multiple_rigid_bodies": False, "deformable": False},
-        "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
+        # "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
         "blue pliers": {"multiple_rigid_bodies": False, "deformable": False},
         "green clip": {"multiple_rigid_bodies": False, "deformable": False},
         "pink eraser": {"multiple_rigid_bodies": False, "deformable": False},

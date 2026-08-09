@@ -105,6 +105,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--skipped_episodes_jsonl",
+    type=Path,
+    default=None,
+    help=(
+        "Optional persistent skip ledger. Pressing N/terminal 'next' appends the skipped "
+        "zero-based task-row index; automatic resume then counts saved plus skipped rows."
+    ),
+)
+parser.add_argument(
     "--resume_from_dataset",
     nargs="?",
     const=True,
@@ -257,7 +266,7 @@ parser.add_argument(
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=0.0,
+    default=1.5,
     help="Seconds to hold the initial sim joint pose before teleoperation starts.",
 )
 parser.add_argument(
@@ -567,7 +576,7 @@ class _TeleopControls:
             )
             print(
                 "[INFO]: Keyboard controls: S start episode, C cancel, R retry, Enter save/next, "
-                "N next, Q finish, Up opens gripper, Down closes gripper."
+                "N skip, Q finish, Up opens gripper, Down closes gripper."
             )
         except Exception as exc:
             print(f"[WARN]: Keyboard controls unavailable: {exc}")
@@ -589,7 +598,7 @@ class _TeleopControls:
         thread = threading.Thread(target=_read_stdin, daemon=True)
         thread.start()
         print(
-            "[INFO]: Terminal controls: start, stop, save, cancel, retry, next, finish "
+            "[INFO]: Terminal controls: start, stop, save, cancel, retry, next (skip), finish "
             "(type command then Enter; blank Enter saves and advances)."
         )
 
@@ -913,15 +922,13 @@ class SO101FollowerLeader:
         return result
 
     def connect(self) -> None:
-        """Connect in the I/O worker, with a finite startup wait."""
-        def _connect() -> None:
-            self._connect_worker()
+        """Construct on the main thread, then connect in the serial I/O worker."""
 
-        self._result_or_raise(
-            self._submit(_connect), timeout_s=FOLLOWER_CONNECT_TIMEOUT_S, operation="connection"
-        )
-
-    def _connect_worker(self) -> None:
+        # scservo_sdk's PortHandler construction can deadlock when first created
+        # on a Python worker after Isaac/Kit has initialized its plugin threads.
+        # Construction performs no bus I/O, so do it here; all connect/read/
+        # disconnect operations remain confined to the daemon worker.
+        print("[INFO]: Follower connection: loading LeRobot SO-101 driver...", flush=True)
         SO101FollowerConfig, make_robot_from_config = self._import_lerobot_so101()
         signature = inspect.signature(SO101FollowerConfig)
         cfg_kwargs = {"port": self.port}
@@ -934,14 +941,25 @@ class SO101FollowerLeader:
         if "use_degrees" in signature.parameters:
             cfg_kwargs["use_degrees"] = False
 
-        cfg = SO101FollowerConfig(**cfg_kwargs)
-        robot = make_robot_from_config(cfg)
+        print("[INFO]: Follower connection: creating robot and motor bus...", flush=True)
+        self._robot = make_robot_from_config(SO101FollowerConfig(**cfg_kwargs))
+
+        def _connect() -> None:
+            self._connect_worker()
+
+        self._result_or_raise(
+            self._submit(_connect), timeout_s=FOLLOWER_CONNECT_TIMEOUT_S, operation="connection"
+        )
+
+    def _connect_worker(self) -> None:
+        robot = self._robot
         connect_signature = inspect.signature(robot.connect)
+        print("[INFO]: Follower connection: handshaking and applying motor configuration...", flush=True)
         if "calibrate" in connect_signature.parameters:
             robot.connect(calibrate=self.calibrate_on_connect)
         else:
             robot.connect()
-        print(f"[INFO]: Connected follower arm '{self.robot_id}' on {self.port}.")
+        print(f"[INFO]: Connected follower arm '{self.robot_id}' on {self.port}.", flush=True)
         if self.disable_torque:
             self._disable_motor_torque(robot)
         self._robot = robot
@@ -2244,6 +2262,33 @@ def main():
     if not args_cli.no_record:
         existing_dataset_episodes = _existing_lerobot_episode_count(args_cli.repo_root)
 
+    persisted_skips: list[dict[str, Any]] = []
+    if args_cli.skipped_episodes_jsonl is not None and args_cli.skipped_episodes_jsonl.exists():
+        for line_number, line in enumerate(
+            args_cli.skipped_episodes_jsonl.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            row_index = int(row["task_row_index"])
+            if row_index < 0 or row_index >= episode_limit:
+                raise ValueError(
+                    f"{args_cli.skipped_episodes_jsonl}:{line_number}: task row {row_index} is out of range"
+                )
+            persisted_skips.append(row)
+        skip_indices = [int(row["task_row_index"]) for row in persisted_skips]
+        if len(skip_indices) != len(set(skip_indices)):
+            raise ValueError(f"{args_cli.skipped_episodes_jsonl} contains duplicate task-row indices")
+        if skip_indices != sorted(skip_indices):
+            raise ValueError(f"{args_cli.skipped_episodes_jsonl} task-row indices are not ordered")
+    persisted_skip_indices = {int(row["task_row_index"]) for row in persisted_skips}
+
+    if persisted_skips and args_cli.n_skipped:
+        raise ValueError(
+            "Do not combine --n_skipped with --skipped_episodes_jsonl; the persistent ledger "
+            "already supplies the skipped-row resume offset."
+        )
+
     if args_cli.start_episode is not None:
         if args_cli.start_episode < 1:
             raise ValueError(f"--start_episode is 1-based and must be >= 1, got {args_cli.start_episode}.")
@@ -2254,12 +2299,21 @@ def main():
                 f"{existing_dataset_episodes} episode(s), but teleop will start at JSONL episode "
                 f"{args_cli.start_episode}. New recordings will append to the dataset."
             )
-        if args_cli.n_skipped:
-            print("[WARN]: --start_episode was provided, so --n_skipped is ignored.")
+        if args_cli.n_skipped or persisted_skips:
+            print("[WARN]: --start_episode was provided, so saved and persisted skip offsets are ignored.")
     elif args_cli.resume_from_dataset and not args_cli.no_record:
-        episode_start_index = existing_dataset_episodes + args_cli.n_skipped
+        episode_start_index = existing_dataset_episodes + args_cli.n_skipped + len(persisted_skips)
     else:
-        episode_start_index = args_cli.n_skipped
+        episode_start_index = args_cli.n_skipped + len(persisted_skips)
+
+    if args_cli.start_episode is None and persisted_skip_indices:
+        invalid_skip_indices = sorted(index for index in persisted_skip_indices if index >= episode_start_index)
+        if invalid_skip_indices:
+            raise ValueError(
+                f"{args_cli.skipped_episodes_jsonl} is inconsistent with the output dataset: "
+                f"saved + skipped implies {episode_start_index} processed task row(s), but the ledger "
+                f"contains unprocessed row index {invalid_skip_indices[0]}."
+            )
 
     if episode_start_index >= episode_limit:
         print(
@@ -2276,7 +2330,7 @@ def main():
         "[INFO]: Teleop episode range: "
         f"{episode_start_index + 1}-{episode_end_index} of {episode_count} "
         f"(dataset already has {existing_dataset_episodes} episode(s), "
-        f"n_skipped={args_cli.n_skipped})."
+        f"persisted_skips={len(persisted_skips)}, n_skipped={args_cli.n_skipped})."
     )
 
     random.seed(args_cli.seed)
@@ -2373,16 +2427,42 @@ def main():
         )
     else:
         print("[INFO]: Action velocity limiter disabled.")
-    controls = _TeleopControls(
-        terminal_enabled=args_cli.terminal_control_stdin,
-        debug=args_cli.keyboard_debug,
-    )
+
+    # Initialize LeRobot before starting the follower I/O worker or terminal
+    # reader.  Dataset construction probes video/torch backends and can hang
+    # when those background threads already exist inside Isaac/Kit.
+    recorder = None
+    if not args_cli.no_record:
+        print(f"[INFO]: Initializing LeRobot dataset at {args_cli.repo_root}...", flush=True)
+        recorder = LeRobotSimDatasetRecorder(
+            repo_id=args_cli.repo_id,
+            dataset_root=args_cli.repo_root,
+            fps=max(1, round(1.0 / control_dt)),
+            cameras=dataset_cameras,
+            streaming_encoding=args_cli.dataset_streaming_encoding,
+            vcodec=args_cli.dataset_vcodec,
+            encoder_queue_size=args_cli.dataset_encoder_queue_size,
+            encoder_threads=None if args_cli.dataset_encoder_threads == 0 else args_cli.dataset_encoder_threads,
+            image_writer_processes=args_cli.dataset_image_writer_processes,
+            image_writer_threads_per_camera=args_cli.dataset_image_writer_threads_per_camera,
+            video_files_size_mb=args_cli.dataset_video_files_size_mb,
+        )
+        recorder.init_dataset()
+        print("[INFO]: LeRobot dataset initialization complete.", flush=True)
+    else:
+        print("[INFO]: Dataset recording disabled by --no_record.")
+
     xbox_initial_action_lerobot = torch.tensor(
         [LEROBOT_INITIAL_JOINT_POS[joint_name] for joint_name in LEROBOT_JOINT_ORDER],
         dtype=torch.float32,
         device=env.unwrapped.device,
     )
     if args_cli.leader == "xbox":
+        # Xbox connection consumes queued UI events, so controls must exist first.
+        controls = _TeleopControls(
+            terminal_enabled=args_cli.terminal_control_stdin,
+            debug=args_cli.keyboard_debug,
+        )
         leader = SO101XboxLeader(
             mapper=mapper,
             initial_action_lerobot=xbox_initial_action_lerobot,
@@ -2404,7 +2484,19 @@ def main():
             disable_torque=args_cli.disable_follower_torque,
             calibrate_on_connect=args_cli.calibrate_on_connect,
         )
+        print(
+            f"[INFO]: Connecting follower arm '{args_cli.follower_id}' on "
+            f"{args_cli.follower_port}; respond to any LeRobot calibration prompt in this terminal."
+        )
     leader.connect()
+    if args_cli.leader != "xbox":
+        # LeRobot may prompt on stdin to apply or regenerate a saved motor
+        # calibration during connect().  Starting the terminal-command reader
+        # before this point races for that same input and can deadlock startup.
+        controls = _TeleopControls(
+            terminal_enabled=args_cli.terminal_control_stdin,
+            debug=args_cli.keyboard_debug,
+        )
     first_leader_action = _clamp_lerobot_positions(mapper, leader.read_action())
     if args_cli.leader == "xbox":
         print(f"[INFO]: Initial Xbox/gamepad virtual pose: {_format_lerobot_pose(first_leader_action)}")
@@ -2417,25 +2509,6 @@ def main():
         speed=args_cli.keyboard_gripper_speed,
     )
     print("[INFO]: Leader gripper/jaw input is ignored; use keyboard Up to open and Down to close.")
-
-    recorder = None
-    if not args_cli.no_record:
-        recorder = LeRobotSimDatasetRecorder(
-            repo_id=args_cli.repo_id,
-            dataset_root=args_cli.repo_root,
-            fps=max(1, round(1.0 / control_dt)),
-            cameras=dataset_cameras,
-            streaming_encoding=args_cli.dataset_streaming_encoding,
-            vcodec=args_cli.dataset_vcodec,
-            encoder_queue_size=args_cli.dataset_encoder_queue_size,
-            encoder_threads=None if args_cli.dataset_encoder_threads == 0 else args_cli.dataset_encoder_threads,
-            image_writer_processes=args_cli.dataset_image_writer_processes,
-            image_writer_threads_per_camera=args_cli.dataset_image_writer_threads_per_camera,
-            video_files_size_mb=args_cli.dataset_video_files_size_mb,
-        )
-        recorder.init_dataset()
-    else:
-        print("[INFO]: Dataset recording disabled by --no_record.")
 
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
     hold_action_lerobot = first_leader_action.clone()
@@ -2584,6 +2657,36 @@ def main():
             recorder.cancel_episode()
             cancelled_episodes += 1
 
+    def _record_skipped_episode() -> None:
+        task_row_index = episode_start_index + episode_index
+        if task_row_index in persisted_skip_indices:
+            raise RuntimeError(f"Task row {task_row_index} is already present in the skip ledger.")
+        if args_cli.skipped_episodes_jsonl is None:
+            print(
+                f"[WARN]: Skipped task {_current_episode_label()}, but no --skipped_episodes_jsonl "
+                "was provided; pass --n_skipped manually when resuming."
+            )
+            return
+
+        skip_path = args_cli.skipped_episodes_jsonl
+        skip_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "task_row_index": task_row_index,
+            "task_episode_number": task_row_index + 1,
+            "instruction": _current_task(),
+            "created_at": datetime.now().astimezone().isoformat(),
+        }
+        with skip_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        persisted_skip_indices.add(task_row_index)
+        print(
+            f"[INFO]: Skipped task {task_row_index + 1}/{episode_count}; "
+            f"recorded it in {skip_path}."
+        )
+
     def _finish_session() -> bool:
         nonlocal saved_episodes
         if recorder is not None and recorder.recording:
@@ -2620,6 +2723,7 @@ def main():
                 _reset_current_episode()
             elif event == "next_episode":
                 _cancel_recording()
+                _record_skipped_episode()
                 skipped_episodes += 1
                 if not _advance_episode():
                     return False

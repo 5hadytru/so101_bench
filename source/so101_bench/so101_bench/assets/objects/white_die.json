@@ -1,0 +1,16 @@
+{
+  "boxes": [
+    [
+      -0.008,
+      -0.008,
+      0.009,
+      0.009
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/Sketchfab_model/a4e74802e5c548dfbfa547e7967b4e3e_fbx/RootNode/dice_low/physics/dice_low_lambert1_0_001"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "white_die.usdc"
+}

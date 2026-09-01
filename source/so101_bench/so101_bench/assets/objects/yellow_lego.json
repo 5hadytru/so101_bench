@@ -1,0 +1,16 @@
+{
+  "boxes": [
+    [
+      -0.008,
+      -0.016,
+      0.009,
+      0.017
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/Sketchfab_model/lego_brick_fbx/RootNode/_2x2_Brick_162/physics/_2x2_Brick_162_Lego_Brick_0_003"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "yellow_lego.usdc"
+}

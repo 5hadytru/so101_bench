@@ -1,0 +1,3 @@
+{"objects":["pink eraser","cooking spoon","black screwdriver","yellow screwdriver"],"ood_key":"seen","trial_id":5,"n_objects":4,"instruction":"Move the eraser forwards","target":"pink eraser"}
+{"objects":["yellow screwdriver","yellow toy car","black screwdriver","white pen"],"ood_key":"seen","trial_id":7,"n_objects":4,"instruction":"Move the yellow screwdriver forwards","target":"yellow screwdriver"}
+{"objects":["black tape","red tape","pink eraser","flower pot"],"ood_key":"seen","trial_id":8,"n_objects":4,"instruction":"Move the black tape left","target":"black tape"}

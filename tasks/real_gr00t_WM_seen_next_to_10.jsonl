@@ -1,0 +1,2 @@
+{"objects":["grey toy car","yellow screwdriver","silver glasses","green clip"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place the toy car next to the green clip","target":"grey toy car","referents":["green clip"]}
+{"objects":["blue bowl","silver glasses","yellow screwdriver","yellow toy car"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place the blue bowl next to the silver glasses","target":"blue bowl","referents":["silver glasses"]}

@@ -1,0 +1,11 @@
+{"objects":["blue scissors","green clip","black pen","altoids container"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["blue pliers","blue scissors","altoids container","yellow toy car"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["blue pliers","green clip","silver glasses","yellow screwdriver"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["cooking spoon","red tape","silver glasses","altoids container"],"ood_key":"seen","trial_id":3,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["grey toy car","flower pot","yellow screwdriver","silver glasses"],"ood_key":"seen","trial_id":4,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["red tape","flower pot","grey toy car","silver glasses"],"ood_key":"seen","trial_id":5,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["black pen","cooking spoon","pink eraser","green clip"],"ood_key":"seen","trial_id":6,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["yellow screwdriver","altoids container","cooking spoon","pink eraser"],"ood_key":"seen","trial_id":7,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["blue pliers","black tape","silver glasses","green clip"],"ood_key":"seen","trial_id":8,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["yellow toy car","altoids container","black pen","pink eraser"],"ood_key":"seen","trial_id":9,"n_objects":4,"instruction":"Place each object in the plastic bin"}
+{"objects":["cooking spoon","black screwdriver","blue bowl","white pen"],"ood_key":"seen","trial_id":10,"n_objects":4,"instruction":"Place each object in the plastic bin"}

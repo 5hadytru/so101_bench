@@ -22,6 +22,7 @@ import sys
 import struct
 import threading
 import time
+import traceback
 from typing import Any
 import weakref
 
@@ -32,7 +33,8 @@ DEFAULT_ACTION_VELOCITY_LIMIT_UNITS_PER_S = (110.0, 140.0, 150.0, 125.0, 110.0, 
 ACTION_VELOCITY_LIMIT_JOINT_COUNT = 6
 DEBUG_TASKS_PRINT_INTERVAL_S = 5.0
 TASK_STATUS_UI_UPDATE_INTERVAL_S = 0.1
-FOLLOWER_CONNECT_TIMEOUT_S = 15.0
+# This includes time spent responding to LeRobot's interactive calibration prompts.
+FOLLOWER_CONNECT_TIMEOUT_S = 120.0
 FOLLOWER_OBSERVATION_TIMEOUT_S = 2.0
 
 
@@ -266,7 +268,7 @@ parser.add_argument(
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
-    default=1.5,
+    default=0.25,
     help="Seconds to hold the initial sim joint pose before teleoperation starts.",
 )
 parser.add_argument(
@@ -312,8 +314,10 @@ parser.add_argument(
     default=True,
     type=_str_to_bool,
     help=(
-        "Encode LeRobot videos while recording instead of after each episode. "
-        "Accepts either '--dataset_streaming_encoding' or '--dataset_streaming_encoding false'."
+        "Encode LeRobot videos while recording instead of after each episode. Enabled by default so "
+        "episode saves do not block on a post-episode encode; pass "
+        "'--dataset_streaming_encoding false' to fall back to the post-episode subprocess encoders if "
+        "in-process PyAV/SVT encoder threads destabilize Isaac Sim on this build."
     ),
 )
 parser.add_argument(
@@ -331,6 +335,17 @@ parser.add_argument(
     type=int,
     default=2,
     help="Threads per streaming video encoder. Use 0 to let the codec choose.",
+)
+parser.add_argument(
+    "--dataset_parallel_encoding",
+    nargs="?",
+    const=True,
+    default=True,
+    type=_str_to_bool,
+    help=(
+        "Encode each camera's post-episode video concurrently (one clean subprocess per camera) "
+        "instead of one after another. Halves save time with two cameras."
+    ),
 )
 parser.add_argument(
     "--dataset_encoder_queue_size",
@@ -895,12 +910,56 @@ class SO101FollowerLeader:
 
         return SO101FollowerConfig, make_robot_from_config
 
+    def _resolve_calibration_dir(self) -> Path:
+        """Use the SO-101 calibration without relying on a possibly remote HF_HOME."""
+
+        # LeRobot renamed the consolidated SO-100/SO-101 implementation from
+        # ``so101_follower`` to ``so_follower``. Accept calibration layouts
+        # written by either version, preferring the current generic name.
+        model_relative_dirs = (
+            Path("robots") / "so_follower",
+            Path("robots") / "so101_follower",
+        )
+        candidates: list[Path] = []
+        if calibration_root := os.environ.get("HF_LEROBOT_CALIBRATION"):
+            candidates.extend(Path(calibration_root).expanduser() / relative for relative in model_relative_dirs)
+        if lerobot_home := os.environ.get("HF_LEROBOT_HOME"):
+            candidates.extend(
+                Path(lerobot_home).expanduser() / "calibration" / relative
+                for relative in model_relative_dirs
+            )
+        if hf_home := os.environ.get("HF_HOME"):
+            candidates.extend(
+                Path(hf_home).expanduser() / "lerobot" / "calibration" / relative
+                for relative in model_relative_dirs
+            )
+
+        local_default = (
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "lerobot"
+            / "calibration"
+            / model_relative_dirs[0]
+        )
+        candidates.append(local_default)
+        calibration_filename = f"{self.robot_id}.json"
+        for candidate in candidates:
+            if (candidate / calibration_filename).is_file():
+                return candidate
+
+        # A hardware teleop session should not inherit an unwritable RunPod path.
+        # If no calibration exists yet, LeRobot can create one in the local cache.
+        return local_default
+
     def _run_worker(self) -> None:
         while True:
             operation, response = self._requests.get()
             try:
                 response.put((True, operation()))
             except BaseException as exc:
+                print("[ERROR]: Follower serial worker failed:", file=sys.stderr, flush=True)
+                traceback.print_exception(exc, file=sys.stderr)
                 response.put((False, exc))
 
     def _submit(self, operation: Callable[[], Any]) -> queue.Queue[tuple[bool, Any]]:
@@ -940,6 +999,10 @@ class SO101FollowerLeader:
             cfg_kwargs["disable_torque_on_disconnect"] = True
         if "use_degrees" in signature.parameters:
             cfg_kwargs["use_degrees"] = False
+        if "calibration_dir" in signature.parameters:
+            calibration_dir = self._resolve_calibration_dir()
+            cfg_kwargs["calibration_dir"] = calibration_dir
+            print(f"[INFO]: Follower calibration directory: {calibration_dir}", flush=True)
 
         print("[INFO]: Follower connection: creating robot and motor bus...", flush=True)
         self._robot = make_robot_from_config(SO101FollowerConfig(**cfg_kwargs))
@@ -2443,6 +2506,7 @@ def main():
             vcodec=args_cli.dataset_vcodec,
             encoder_queue_size=args_cli.dataset_encoder_queue_size,
             encoder_threads=None if args_cli.dataset_encoder_threads == 0 else args_cli.dataset_encoder_threads,
+            parallel_encoding=args_cli.dataset_parallel_encoding,
             image_writer_processes=args_cli.dataset_image_writer_processes,
             image_writer_threads_per_camera=args_cli.dataset_image_writer_threads_per_camera,
             video_files_size_mb=args_cli.dataset_video_files_size_mb,
@@ -2911,6 +2975,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except BaseException as exc:
+        # Isaac shutdown can block before Python prints an unhandled exception.
+        # Emit it first so startup failures do not look like silent freezes.
+        print("[ERROR]: Teleoperation terminated with an exception:", file=sys.stderr, flush=True)
+        traceback.print_exception(exc, file=sys.stderr)
+        raise
     finally:
         # This also covers a timeout or Ctrl-C while the follower is connecting,
         # before main() has entered its per-episode cleanup block.

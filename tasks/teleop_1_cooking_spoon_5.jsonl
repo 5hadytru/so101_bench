@@ -1,0 +1,4 @@
+{"objects": ["silver glasses", "green clip", "cooking spoon", "blue scissors"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the cooking spoon left", "target": "cooking spoon", "direction": "left"}
+{"objects": ["grey wires", "black screwdriver", "yellow screwdriver", "cooking spoon"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the cooking spoon right", "target": "cooking spoon", "direction": "right"}
+{"objects": ["cooking spoon", "blue pliers", "black pen", "altoids container"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the cooking spoon forwards", "target": "cooking spoon", "direction": "forward"}
+{"objects": ["cooking spoon", "white pen", "blue scissors", "grey toy car"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the cooking spoon backwards", "target": "cooking spoon", "direction": "backward"}

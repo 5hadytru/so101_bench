@@ -1,0 +1,2 @@
+{"objects": ["white glasses", "blue screwdriver", "red pen", "pink bowl"], "ood_key": "unseen_seen_class", "trial_id": 0, "n_objects": 4, "instruction": "Move the glasses left", "target": "white glasses"}
+{"objects": ["blue clip", "orange toy car", "white bowl", "yellow tape"], "ood_key": "unseen_seen_class", "trial_id": 1, "n_objects": 4, "instruction": "Move the blue clip backwards", "target": "blue clip"}

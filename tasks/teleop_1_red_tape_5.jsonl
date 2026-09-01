@@ -1,0 +1,4 @@
+{"objects": ["red tape", "cardboard box", "flower pot", "black tape"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the red tape left", "target": "red tape", "direction": "left"}
+{"objects": ["red tape", "yellow toy car", "grey toy car", "blue bowl"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the tape right", "target": "red tape", "direction": "right"}
+{"objects": ["red tape", "yellow wires", "black screwdriver", "grey wires"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the tape forwards", "target": "red tape", "direction": "forward"}
+{"objects": ["yellow toy car", "red tape", "flower pot", "cooking spoon"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the tape backwards", "target": "red tape", "direction": "backward"}

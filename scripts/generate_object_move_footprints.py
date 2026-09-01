@@ -2,7 +2,7 @@
 
 Run with:
 
-    /home/truman/env_isaaclab/bin/python scripts/generate_object_move_footprints.py
+    /home/truman/env_isaaclab_51/bin/python scripts/generate_object_move_footprints.py
 
 The output is a raster-derived union of local XY rectangles. This preserves
 concavities and holes without requiring mesh processing dependencies at runtime.

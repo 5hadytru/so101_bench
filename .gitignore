@@ -81,3 +81,21 @@ scratch.*
 tasks/layouts/*
 
 checkpoints/
+
+# Local length-scaling helper
+/scale_length.py
+
+# Local datasets, reference papers, and Codex workspace marker
+/data/
+/*.pdf
+/.codex
+
+# Generated and historical task snapshots
+/tasks/*.bak
+/tasks/*.before_*
+/tasks/*.pre_*
+/tasks/*.wrong_*
+/tasks/*_deleted_*.jsonl
+/tasks/*_index_*.jsonl
+/tasks/*_rebalance_*.jsonl
+/tasks/test*.jsonl*

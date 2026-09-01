@@ -1,0 +1,5 @@
+{"objects":["black pen","white pen","red tape","green clip"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Move the black pen right","target":"black pen"}
+{"objects":["altoids container","flower pot","blue scissors","black pen"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Move the altoids container forwards","target":"altoids container"}
+{"objects":["blue pliers","pink eraser","flower pot","silver glasses"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Move the blue pliers right","target":"blue pliers"}
+{"objects":["blue pliers","grey toy car","yellow screwdriver","white pen"],"ood_key":"seen","trial_id":3,"n_objects":4,"instruction":"Move the pliers backwards","target":"blue pliers"}
+{"objects":["green clip","blue bowl","yellow screwdriver","black pen"],"ood_key":"seen","trial_id":4,"n_objects":4,"instruction":"Move the green clip forwards","target":"green clip"}

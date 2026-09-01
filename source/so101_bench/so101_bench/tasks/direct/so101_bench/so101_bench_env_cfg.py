@@ -9,7 +9,7 @@ import re
 from isaacsim.core.utils.rotations import euler_angles_to_quat
 
 import numpy as np
-from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics
+from pxr import PhysxSchema, Usd, UsdGeom, UsdLux, UsdPhysics
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg
@@ -29,6 +29,7 @@ from so101_bench.benchmark import (
     BenchmarkEpisodeSpec,
     FOUR_OBJECT_BIN_EPISODE_LENGTH_S,
     MOVE_STRAIGHTNESS_TOLERANCE_M,
+    OBJECT_SCALES,
     SPATIAL_SUCCESS_DISTANCE_M,
     TASK_BETWEEN,
     TASK_BIN,
@@ -51,7 +52,7 @@ BEDROOM_TABLETOP_USD = f"{ASSETS_PATH}/usd/room_scan.usdc"
 BEDROOM_TABLETOP_SCALE = (1.0, 1.0, 1.0)
 
 OBJECT_ASSET_NAMES = ["object_1", "object_2", "object_3", "object_4"]
-OBJECT_LABELS = ["blue bowl", "silver glasses", "yellow screwdriver", "black tape"]
+OBJECT_LABELS = ["blue bowl", "white pen", "yellow screwdriver", "black tape"]
 TABLE_BOUNDS = {"x": (-0.14, 0.25), "y": (-0.1, 0.155)}
 INACTIVE_OBJECT_BASE_POS = (20.06628, 20.0, -10.0)
 INACTIVE_OBJECT_SPACING = 0.25
@@ -117,6 +118,18 @@ CONTACT_OFFSET = 0.002
 REST_OFFSET = 0.0
 CONTACT_SOLVER_POSITION_ITERATIONS = 64
 CONTACT_SOLVER_VELOCITY_ITERATIONS = 4
+# Bound on the jaw drive error, in radians. Currently UNUSED: ``ActionsCfg`` runs the
+# stock joint-position term, so nothing reads this. Kept so re-enabling the limiter is
+# a one-line change -- see the note in ``ActionsCfg``.
+#
+# When it is wired up, ``apply_actions`` re-clamps against the
+# measured jaw angle every physics step, so this is really a torque cap of
+# ``jaw_stiffness * error`` (0.60 N-m here, ~13 N at the fingertip) and a jaw-speed
+# cap of roughly ``5.4 * error`` rad/s. Sized from so101_bench_sim_6: measured jaw
+# speed there is p99 = 1.57 rad/s, needing >= 0.29 rad, so 0.30 leaves 99.3% of
+# recorded jaw motion untouched while cutting peak squeeze torque 3.6x (the
+# unclamped worst case in that dataset is 1.08 rad -> 2.17 N-m -> ~48 N).
+JAW_MAX_TARGET_POSITION_ERROR = 0.30
 # Active value used when building bin/object rigid bodies. Overriding it is a
 # physics change: it alters contact resolution, so replays and outcome labels
 # produced under different values are not comparable. See
@@ -266,6 +279,40 @@ def _enable_body_ccd(root_prim: Usd.Prim) -> None:
         physx_rigid_body_api.CreateEnableSpeculativeCCDAttr().Set(True)
 
 
+def _disable_embedded_dome_lights(root_prim: Usd.Prim) -> None:
+    """Prevent Blender-exported asset lights from overriding the scene light."""
+
+    for prim in Usd.PrimRange(root_prim):
+        if not prim.IsA(UsdLux.DomeLight):
+            continue
+        UsdGeom.Imageable(prim).MakeInvisible()
+        UsdLux.DomeLight(prim).CreateIntensityAttr().Set(0.0)
+
+
+def _spawn_usd_without_embedded_lights(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn a USD while disabling any environment lights bundled inside it."""
+
+    prim = sim_utils.spawn_from_usd(
+        prim_path,
+        cfg,
+        translation=translation,
+        orientation=orientation,
+        **kwargs,
+    )
+    stage = sim_utils.get_current_stage()
+    for spawned_prim_path in sim_utils.find_matching_prim_paths(prim_path):
+        spawned_prim = stage.GetPrimAtPath(spawned_prim_path)
+        if spawned_prim.IsValid():
+            _disable_embedded_dome_lights(spawned_prim)
+    return prim
+
+
 def _spawn_ccd_usd(
     prim_path: str,
     cfg: sim_utils.UsdFileCfg,
@@ -275,7 +322,7 @@ def _spawn_ccd_usd(
 ) -> Usd.Prim:
     """Spawn a rigid USD and enable CCD on all rigid bodies under it."""
 
-    prim = sim_utils.spawn_from_usd(
+    prim = _spawn_usd_without_embedded_lights(
         prim_path,
         cfg,
         translation=translation,
@@ -353,7 +400,7 @@ def _spawn_split_rigid_body_usd(
     cfg.mass_props = None
     cfg.activate_contact_sensors = False
     try:
-        prim = sim_utils.spawn_from_usd(
+        prim = _spawn_usd_without_embedded_lights(
             prim_path,
             cfg,
             translation=translation,
@@ -406,7 +453,7 @@ def _spawn_sensor_safe_bin_usd(
 ) -> Usd.Prim:
     """Spawn the bin USD and make its authored material opaque for camera sensors."""
 
-    prim = sim_utils.spawn_from_usd(
+    prim = _spawn_usd_without_embedded_lights(
         prim_path,
         cfg,
         translation=translation,
@@ -504,7 +551,10 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
             raise ValueError(f"Object {object_name!r} cannot be both deformable and multi-rigid-body.")
         return DeformableObjectCfg(
             prim_path=f"{{ENV_REGEX_NS}}/Object_{object_id + 1}",
-            spawn=sim_utils.UsdFileCfg(usd_path=usd_path),
+            spawn=sim_utils.UsdFileCfg(
+                usd_path=usd_path,
+                func=_spawn_usd_without_embedded_lights,
+            ),
             init_state=DeformableObjectCfg.InitialStateCfg(
                 pos=init_pos,
                 rot=init_rot,
@@ -521,6 +571,8 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
         "collision_props": _contact_collision_props(),
         "func": _spawn_ccd_usd,
     }
+    if object_name in OBJECT_SCALES:
+        spawn_kwargs["scale"] = OBJECT_SCALES[object_name]
     if metadata["multiple_rigid_bodies"]:
         spawn_kwargs["func"] = _spawn_split_rigid_body_usd
     return cfg_type(
@@ -539,8 +591,14 @@ def _object_body_prim_paths(object_id: int, object_name: str) -> list[str]:
     return [f"{root_path}/{child_name}" for child_name in child_names] if child_names else [root_path]
 
 
+SO101_RIGID_BODY_PRIM_PATHS = tuple(
+    f"{{ENV_REGEX_NS}}/Robot/{body_name}"
+    for body_name in ("base", "shoulder", "upper_arm", "lower_arm", "wrist", "gripper", "jaw")
+)
+
+
 def _object_contact_sensor_cfgs(object_names: list[str] | tuple[str, ...]) -> dict[str, ContactSensorCfg]:
-    """Create per-body sensors filtered to contacts with other tabletop objects only."""
+    """Create separate per-body object-object and object-robot contact sensors."""
 
     body_paths_by_object = [
         []
@@ -556,15 +614,19 @@ def _object_contact_sensor_cfgs(object_names: list[str] | tuple[str, ...]) -> di
             if other_object_id != object_id
             for body_path in other_body_paths
         ]
-        if not filter_paths:
-            continue
         for body_path in body_paths:
             body_name = body_path.rsplit("/", maxsplit=1)[-1]
             suffix = "" if body_name == f"Object_{object_id + 1}" else f"_{body_name}"
-            sensor_cfgs[f"object_{object_id + 1}{suffix}_contacts"] = ContactSensorCfg(
+            if filter_paths:
+                sensor_cfgs[f"object_{object_id + 1}{suffix}_contacts"] = ContactSensorCfg(
+                    prim_path=body_path,
+                    update_period=0.0,
+                    filter_prim_paths_expr=filter_paths,
+                )
+            sensor_cfgs[f"object_{object_id + 1}{suffix}_robot_contact"] = ContactSensorCfg(
                 prim_path=body_path,
                 update_period=0.0,
-                filter_prim_paths_expr=filter_paths,
+                filter_prim_paths_expr=list(SO101_RIGID_BODY_PRIM_PATHS),
             )
     return sensor_cfgs
 
@@ -574,7 +636,9 @@ def _configure_scene_object_contact_sensors(
     object_names: list[str] | tuple[str, ...],
 ) -> None:
     for attr_name in list(scene_cfg.__dict__):
-        if attr_name.startswith("object_") and attr_name.endswith("_contacts"):
+        if attr_name.startswith("object_") and (
+            attr_name.endswith("_contacts") or attr_name.endswith("_robot_contact")
+        ):
             setattr(scene_cfg, attr_name, None)
     for attr_name, sensor_cfg in _object_contact_sensor_cfgs(object_names).items():
         setattr(scene_cfg, attr_name, sensor_cfg)
@@ -609,6 +673,7 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=BEDROOM_TABLETOP_USD,
             scale=BEDROOM_TABLETOP_SCALE,
+            func=_spawn_usd_without_embedded_lights,
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.0),
@@ -647,6 +712,10 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
     object_2_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_2_contacts"]
     object_3_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_3_contacts"]
     object_4_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_4_contacts"]
+    object_1_robot_contact = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_1_robot_contact"]
+    object_2_robot_contact = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_2_robot_contact"]
+    object_3_robot_contact = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_3_robot_contact"]
+    object_4_robot_contact = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_4_robot_contact"]
 
     camera_wrist = _camera_cfg(
         width=INNOMAKER_WRIST_CAMERA_WIDTH,
@@ -689,6 +758,15 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Absolute joint-position actions matching the SO-101 workshop and GR00T runner."""
 
+    # Jaw drive-error limiting is currently DISABLED: the jaw target passes through
+    # unbounded, as it did before ``JawErrorLimitedJointPositionAction`` was added.
+    # The implementation is still live in ``so101_bench.mdp.actions``; to re-enable,
+    # swap this term back to::
+    #
+    #     mdp.JawErrorLimitedJointPositionActionCfg(
+    #         ...,
+    #         max_jaw_position_error=JAW_MAX_TARGET_POSITION_ERROR,
+    #     )
     joint_positions = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw"],
@@ -976,6 +1054,7 @@ class So101BenchEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.num_envs = 1
         self.sim.dt = PHYSICS_DT
         self.sim.physx.enable_ccd = True
+        self.sim.physx.solve_articulation_contact_last = True
         self.sim.render_interval = self.decimation
         self.sim.render.rendering_mode = "quality"
         if os.environ.get(UI_CPU_PHYSICS_ENV_VAR, "").lower() in {"1", "true", "yes", "on"}:

@@ -1,0 +1,1 @@
+{"objects":["green clip","blue scissors","pink eraser","blue pliers"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the clip next to the pliers","target":"green clip","referents":["blue pliers"]}

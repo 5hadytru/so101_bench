@@ -1,0 +1,22 @@
+{
+  "boxes": [
+    [
+      -0.029,
+      -0.005,
+      -0.017,
+      0.006
+    ],
+    [
+      -0.017,
+      -0.007,
+      0.029,
+      0.008
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/Sketchfab_model/root/GLTF_SceneRootNode/Base_4/physics/Object_5_001"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "grey_flash_drive.usdc"
+}

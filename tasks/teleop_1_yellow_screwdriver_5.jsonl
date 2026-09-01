@@ -1,0 +1,4 @@
+{"objects": ["yellow screwdriver", "cooking spoon", "grey toy car", "yellow toy car"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the yellow screwdriver left", "target": "yellow screwdriver", "direction": "left"}
+{"objects": ["yellow screwdriver", "white pen", "blue scissors", "silver glasses"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the yellow screwdriver right", "target": "yellow screwdriver", "direction": "right"}
+{"objects": ["black screwdriver", "red tape", "grey wires", "yellow screwdriver"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the yellow screwdriver forwards", "target": "yellow screwdriver", "direction": "forward"}
+{"objects": ["yellow toy car", "grey toy car", "yellow screwdriver", "blue bowl"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the screwdriver backwards", "target": "yellow screwdriver", "direction": "backward"}

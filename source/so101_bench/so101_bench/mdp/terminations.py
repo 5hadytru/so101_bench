@@ -26,7 +26,9 @@ from so101_bench.benchmark import (
     MOVE_NO_BOUNDARY_MIN_PROGRESS_M,
     MOVE_PAST_BOUNDARY_TOLERANCE_M,
     MOVE_STRAIGHTNESS_TOLERANCE_M,
+    NON_BIN_TARGET_MIN_DISPLACEMENT_M,
     NON_TARGET_DISPLACEMENT_LIMIT_M,
+    ROBOT_CONTACT_FORCE_THRESHOLD_N,
     SPATIAL_SUCCESS_DISTANCE_M,
     TASK_BETWEEN,
     TASK_BIN,
@@ -35,7 +37,12 @@ from so101_bench.benchmark import (
     TASK_NEXT_TO,
     episode_length_s,
 )
-from .resets import benchmark_object_positions, benchmark_object_yaws, mark_benchmark_robot_start
+from .resets import (
+    benchmark_object_positions,
+    benchmark_object_yaws,
+    mark_benchmark_robot_start,
+    slots_live_in_any_env,
+)
 
 FAILURE_REASON_NONE = "none"
 FAILURE_REASON_MAX_GRASP_ATTEMPTS = "max_grasp_attempts"
@@ -125,6 +132,7 @@ class _TerminationStepState:
     yaws: torch.Tensor | None = None
     footprint_vertices: torch.Tensor | None = None
     contact_by_object: torch.Tensor | None = None
+    robot_contact_by_object: torch.Tensor | None = None
     grasped_object_made_contact: torch.Tensor | None = None
 
 
@@ -146,6 +154,16 @@ class TaskDiagnostics:
     task_family: str
     episode_age_s: float
     conditions: tuple[TaskConditionDiagnostic, ...]
+
+
+def _rotate_into_bin_frame(bin_quat_inv: torch.Tensor, rel: torch.Tensor) -> torch.Tensor:
+    """Rotate per-object bin-relative offsets into the bin frame in one call.
+
+    Shape is (num_envs, num_objects, 3); doing this one object at a time costs a
+    Python-level loop over every pre-spawned pool slot on every step.
+    """
+
+    return math_utils.quat_apply(bin_quat_inv.unsqueeze(1).expand(-1, rel.shape[1], -1), rel)
 
 
 def _active_mask(env: ManagerBasedRLEnv, object_asset_names: list[str]) -> torch.Tensor:
@@ -245,6 +263,20 @@ def _gather_by_index(values: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     return values[torch.arange(values.shape[0], device=values.device), ids]
 
 
+def _target_displacement_from_initial(env: ManagerBasedRLEnv, positions: torch.Tensor) -> torch.Tensor:
+    """Return each target's current planar displacement from its reset pose."""
+    initial_positions = getattr(env, "_so101_initial_object_pos_w", None)
+    if initial_positions is None:
+        # Production benchmark resets always install this baseline.  Treat its absence
+        # as unavailable evidence so lightweight diagnostic/mocking callers retain
+        # their historical behavior rather than being reported as zero displacement.
+        return torch.full((env.num_envs,), float("inf"), dtype=positions.dtype, device=positions.device)
+    target_ids = _target_indices(env)
+    current_target = _gather_by_index(positions, target_ids)[..., :2]
+    initial_target = _gather_by_index(initial_positions, target_ids)[..., :2]
+    return torch.linalg.vector_norm(current_target - initial_target, dim=1)
+
+
 def _state_object_yaws(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
@@ -270,31 +302,68 @@ def _state_footprint_vertices(
     return step_state.footprint_vertices
 
 
-def _object_contact_mask(
+def _contact_sensors_by_object(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
-    step_state: _TerminationStepState,
-    force_threshold: float = 0.0,
-) -> torch.Tensor:
-    """Return an env-by-object mask for contact with another tabletop object."""
+    suffix: str,
+) -> list[list]:
+    """Resolve each object slot's contact sensors once instead of per step.
 
-    if step_state.contact_by_object is not None:
-        return step_state.contact_by_object
+    A pre-spawned pool has two contact sensors per object, so matching sensor names
+    against slot names inline costs O(slots x sensors) string comparisons on every
+    termination call - over a million of them per step for a 150-object task file.
+    """
+
+    signature = (tuple(object_asset_names), suffix)
+    cache = getattr(env, "_so101_contact_sensors_by_object", None)
+    if cache is None:
+        cache = {}
+        env._so101_contact_sensors_by_object = cache
+    cached = cache.get(suffix)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    sensors = getattr(getattr(env, "scene", None), "sensors", {})
+    sensors_by_object = []
+    for asset_name in object_asset_names:
+        exact_name = f"{asset_name}{suffix}"
+        split_prefix = f"{asset_name}_"
+        sensors_by_object.append(
+            [
+                sensor
+                for sensor_name, sensor in sensors.items()
+                if sensor_name == exact_name
+                or (sensor_name.startswith(split_prefix) and sensor_name.endswith(suffix))
+            ]
+        )
+    cache[suffix] = (signature, sensors_by_object)
+    return sensors_by_object
+
+
+def _filtered_contact_mask(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    suffix: str,
+    force_threshold: float,
+) -> torch.Tensor:
+    """Env-by-object mask over one family of filtered contact sensors.
+
+    Slots no env has on the table are skipped. The reset parks them 20 m away where
+    nothing they could touch is part of the task, and reading their filtered contact
+    buffer costs a PhysX round trip per parked slot per step - the dominant cost of a
+    task JSONL with a large pre-spawned object pool.
+    """
 
     contact_by_object = torch.zeros(
         (env.num_envs, len(object_asset_names)),
         dtype=torch.bool,
         device=env.device,
     )
-    sensors = getattr(env.scene, "sensors", {})
-    for object_id, asset_name in enumerate(object_asset_names):
-        exact_sensor_name = f"{asset_name}_contacts"
-        split_sensor_prefix = f"{asset_name}_"
-        for sensor_name, sensor in sensors.items():
-            if sensor_name != exact_sensor_name and not (
-                sensor_name.startswith(split_sensor_prefix) and sensor_name.endswith("_contacts")
-            ):
-                continue
+    live_slots = slots_live_in_any_env(env, len(object_asset_names))
+    for object_id, sensors in enumerate(_contact_sensors_by_object(env, object_asset_names, suffix)):
+        if live_slots is not None and not live_slots[object_id]:
+            continue
+        for sensor in sensors:
             force_matrix_w = sensor.data.force_matrix_w
             if force_matrix_w is None:
                 continue
@@ -303,8 +372,52 @@ def _object_contact_mask(
                 force_magnitudes > force_threshold,
                 dim=tuple(range(1, force_magnitudes.ndim)),
             )
-    step_state.contact_by_object = contact_by_object
     return contact_by_object
+
+
+def _object_contact_mask(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState,
+    force_threshold: float = 0.0,
+) -> torch.Tensor:
+    """Return an env-by-object mask for contact with another tabletop object."""
+
+    if step_state.contact_by_object is None:
+        step_state.contact_by_object = _filtered_contact_mask(
+            env, object_asset_names, "_contacts", force_threshold
+        )
+    return step_state.contact_by_object
+
+
+def _object_robot_contact_mask(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState,
+    force_threshold: float = ROBOT_CONTACT_FORCE_THRESHOLD_N,
+) -> torch.Tensor:
+    """Return an env-by-object mask for force-bearing contact with any robot link."""
+
+    if step_state.robot_contact_by_object is None:
+        step_state.robot_contact_by_object = _filtered_contact_mask(
+            env, object_asset_names, "_robot_contact", force_threshold
+        )
+    return step_state.robot_contact_by_object
+
+
+def _scored_objects_clear_of_robot(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    step_state: _TerminationStepState,
+) -> torch.Tensor:
+    """Require robot separation from every object whose state determines success."""
+
+    active = _active_mask(env, object_asset_names)
+    target_mask = torch.zeros_like(active)
+    target_mask[torch.arange(env.num_envs, device=env.device), _target_indices(env)] = True
+    scored = torch.where(_task_is(env, TASK_BIN).unsqueeze(1), active, target_mask)
+    robot_contact = _object_robot_contact_mask(env, object_asset_names, step_state)
+    return ~torch.any(robot_contact & scored, dim=1)
 
 
 def target_object_made_contact(
@@ -605,10 +718,7 @@ def bin_success(
     bin_quat_inv = math_utils.quat_inv(bin_asset.data.root_quat_w)
 
     rel = object_pos_w - bin_pos_w.unsqueeze(1)
-    rel_local = torch.stack(
-        [math_utils.quat_apply(bin_quat_inv, rel[:, object_id, :]) for object_id in range(rel.shape[1])],
-        dim=1,
-    )
+    rel_local = _rotate_into_bin_frame(bin_quat_inv, rel)
 
     footprint_half_extents = _bin_footprint_half_extents(env)
     footprint_center_offsets = _bin_footprint_center_offsets(env)
@@ -622,6 +732,7 @@ def bin_success(
     success_now = (all_active_inside & _task_is(env, TASK_BIN)) | (
         target_inside & _task_is(env, TASK_NAMED_BIN)
     )
+    success_now &= _scored_objects_clear_of_robot(env, object_asset_names, step_state)
 
     if not hasattr(env, "_so101_bin_success_counter"):
         env._so101_bin_success_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -658,8 +769,12 @@ def next_to_success(
         _referent_indices(env)[:, 0],
         is_next_to,
     )
-    success_now = (surface_distance <= success_distance) & _grasped_object_contact_allows_success(
-        env, object_asset_names, step_state, contact_grace_time_s
+    target_displacement = _target_displacement_from_initial(env, positions)
+    success_now = (
+        (surface_distance <= success_distance)
+        & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+        & _scored_objects_clear_of_robot(env, object_asset_names, step_state)
+        & _grasped_object_contact_allows_success(env, object_asset_names, step_state, contact_grace_time_s)
     )
     success_now &= is_next_to
 
@@ -688,40 +803,40 @@ def between_success(
     if step_state is None:
         step_state = _termination_step_state(env, object_asset_names)
     positions = step_state.positions
-    yaws = _state_object_yaws(env, object_asset_names, step_state)
     is_between = _task_is(env, TASK_BETWEEN)
     target_ids = _target_indices(env)
     refs = _referent_indices(env)
-
-    # The fraction is retained as a diagnostic. With the configured [0.0, 1.0]
-    # band it does not restrict success; line alignment below does.
-    distance_to_first = _pairwise_object_surface_distance(
-        env, object_asset_names, positions, yaws, target_ids, refs[:, 0], is_between
-    )
-    distance_to_second = _pairwise_object_surface_distance(
-        env, object_asset_names, positions, yaws, target_ids, refs[:, 1], is_between
-    )
-    total_distance = distance_to_first + distance_to_second
-    fraction = torch.where(
-        torch.isfinite(total_distance) & (total_distance > 0.0),
-        distance_to_first / total_distance,
-        torch.full_like(distance_to_first, 0.5),
-    )
-    centered = (fraction >= min_segment_fraction) & (fraction <= BETWEEN_CENTER_FRACTION_MAX)
-
+    # Kept in the public signature for compatibility with existing task configs;
+    # the legacy surface-distance fraction is diagnostic-only now.
+    _ = min_segment_fraction
     # The target must also lie on the line between the two referents, judged from the
     # target's root center (not its footprint surface).
     target = _gather_by_index(positions, target_ids)[:, :2]
     ref_a = _gather_by_index(positions, refs[:, 0])[:, :2]
     ref_b = _gather_by_index(positions, refs[:, 1])[:, :2]
     segment = ref_b - ref_a
-    segment_len_sq = torch.clamp(torch.sum(segment * segment, dim=1), min=1.0e-6)
+    referent_distance_sq = torch.sum(segment.square(), dim=1)
+    segment_len_sq = torch.clamp(referent_distance_sq, min=1.0e-6)
     t = torch.sum((target - ref_a) * segment, dim=1) / segment_len_sq
     projection = ref_a + t.unsqueeze(1) * segment
     perpendicular = torch.linalg.vector_norm(target - projection, dim=1)
+    # The intersection of these two open radius-|A-B| disks is a conservative
+    # betweenness lens.  In particular, it guarantees that the target projection
+    # lies strictly between the perpendicular planes through A and B.  Compare
+    # squared distances to avoid square roots in the live success path.
+    target_to_a_sq = torch.sum((target - ref_a).square(), dim=1)
+    target_to_b_sq = torch.sum((target - ref_b).square(), dim=1)
+    between_referents = (target_to_a_sq < referent_distance_sq) & (
+        target_to_b_sq < referent_distance_sq
+    )
+    target_displacement = _target_displacement_from_initial(env, positions)
 
-    success_now = centered & (perpendicular <= centered_tolerance) & _grasped_object_contact_allows_success(
-        env, object_asset_names, step_state, contact_grace_time_s
+    success_now = (
+        between_referents
+        & (perpendicular <= centered_tolerance)
+        & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+        & _scored_objects_clear_of_robot(env, object_asset_names, step_state)
+        & _grasped_object_contact_allows_success(env, object_asset_names, step_state, contact_grace_time_s)
     )
     success_now &= is_between
 
@@ -1314,11 +1429,14 @@ def move_success(
     # window requires it to hold, so a transient excursion that recovers is permitted.
     close_to_boundary = distance_to_boundary < boundary_distance
     reached_goal = torch.where(has_boundary, close_to_boundary, progress >= no_boundary_min_progress)
+    target_displacement = torch.sqrt(progress.square() + lateral.square())
 
     success_now = (
         (progress > 0.0)
         & reached_goal
         & (lateral <= straightness_tolerance)
+        & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+        & _scored_objects_clear_of_robot(env, object_asset_names, step_state)
         & _grasped_object_contact_allows_success(env, object_asset_names, step_state, contact_grace_time_s)
         & _task_is(env, TASK_MOVE)
     )
@@ -1522,10 +1640,7 @@ def _bin_task_diagnostic(
     bin_asset: RigidObject = env.scene[bin_name]
     bin_quat_inv = math_utils.quat_inv(bin_asset.data.root_quat_w)
     rel = step_state.positions - bin_asset.data.root_pos_w.unsqueeze(1)
-    rel_local = torch.stack(
-        [math_utils.quat_apply(bin_quat_inv, rel[:, object_id, :]) for object_id in range(rel.shape[1])],
-        dim=1,
-    )
+    rel_local = _rotate_into_bin_frame(bin_quat_inv, rel)
     footprint_half_extents = _bin_footprint_half_extents(env)
     footprint_center_offsets = _bin_footprint_center_offsets(env)
     rel_footprint = rel_local[..., :2] - footprint_center_offsets.unsqueeze(1)
@@ -1543,7 +1658,12 @@ def _bin_task_diagnostic(
         f"{float(rel_footprint[env_id, object_id, 1].item()):.4f})m"
         for object_id in scored_ids
     )
-    instant = bool(torch.all(inside[env_id, scored_ids]).item())
+    robot_contact_by_object = _object_robot_contact_mask(env, object_asset_names, step_state)
+    robot_contact_ids = [
+        object_id for object_id in scored_ids if bool(robot_contact_by_object[env_id, object_id].item())
+    ]
+    robot_clear = not robot_contact_ids
+    instant = bool(torch.all(inside[env_id, scored_ids]).item()) and robot_clear
     return _confirmed_success_diagnostic(
         "target_root_in_bin" if named_bin else "all_active_object_roots_in_bin",
         instant,
@@ -1551,7 +1671,9 @@ def _bin_task_diagnostic(
         _confirmation_steps(env, confirm_time_s),
         bool(_episode_age_at_least(env, min_episode_time_s)[env_id].item()),
         f"required |x|<={float(footprint_half_extents[env_id, 0].item()):.4f}m and "
-        f"|y|<={float(footprint_half_extents[env_id, 1].item()):.4f}m; {scored_roots}",
+        f"|y|<={float(footprint_half_extents[env_id, 1].item()):.4f}m; "
+        f"robot_contact_object_ids={robot_contact_ids} "
+        f"(force threshold >{ROBOT_CONTACT_FORCE_THRESHOLD_N:.3f}N); {scored_roots}",
     )
 
 
@@ -1581,7 +1703,16 @@ def _next_to_task_diagnostic(
     target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
     contact_rule_breached = bool(current_contact[env_id].item())
-    instant = (surface_distance <= SPATIAL_SUCCESS_DISTANCE_M) and not contact_rule_breached
+    target_robot_contact = bool(
+        _object_robot_contact_mask(env, object_asset_names, step_state)[env_id, target_id].item()
+    )
+    target_displacement = float(_target_displacement_from_initial(env, positions)[env_id].item())
+    instant = (
+        (surface_distance <= SPATIAL_SUCCESS_DISTANCE_M)
+        and (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+        and not target_robot_contact
+        and not contact_rule_breached
+    )
     return _confirmed_success_diagnostic(
         "target_next_to_referent",
         instant,
@@ -1592,6 +1723,10 @@ def _next_to_task_diagnostic(
         f"referent={_debug_object_name(env, object_asset_names, env_id, ref_id)}, "
         f"surface_distance={surface_distance:.4f}m "
         f"(required <={SPATIAL_SUCCESS_DISTANCE_M:.4f}m), "
+        f"target_displacement={target_displacement:.4f}m "
+        f"(required >={NON_BIN_TARGET_MIN_DISPLACEMENT_M:.4f}m), "
+        f"target_robot_contact={target_robot_contact} "
+        f"(force threshold >{ROBOT_CONTACT_FORCE_THRESHOLD_N:.3f}N), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
         f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
@@ -1636,14 +1771,29 @@ def _between_task_diagnostic(
     line_fraction = torch.sum((target - ref_a) * segment, dim=1) / segment_len_sq
     projection = ref_a + line_fraction.unsqueeze(1) * segment
     perpendicular = float(torch.linalg.vector_norm(target - projection, dim=1)[env_id].item())
+    target_to_a = float(torch.linalg.vector_norm(target - ref_a, dim=1)[env_id].item())
+    target_to_b = float(torch.linalg.vector_norm(target - ref_b, dim=1)[env_id].item())
+    referent_distance = float(torch.linalg.vector_norm(segment, dim=1)[env_id].item())
+    between_referents = (
+        target_to_a < referent_distance and target_to_b < referent_distance
+    )
     current_contact, made_contact, target_contact = _non_bin_object_contact(
         env, object_asset_names, step_state
     )
     target_contact_ever = _target_contact_ever_mask(env)
     contact_exceeded = _grasped_object_contact_exceeded_from_counter(env, contact_grace_time_s)
-    centered = BETWEEN_CENTER_FRACTION_MIN <= fraction <= BETWEEN_CENTER_FRACTION_MAX
     contact_rule_breached = bool(current_contact[env_id].item())
-    instant = centered and (perpendicular <= BETWEEN_LINE_TOLERANCE_M) and not contact_rule_breached
+    target_robot_contact = bool(
+        _object_robot_contact_mask(env, object_asset_names, step_state)[env_id, target_id].item()
+    )
+    target_displacement = float(_target_displacement_from_initial(env, positions)[env_id].item())
+    instant = (
+        between_referents
+        and (perpendicular <= BETWEEN_LINE_TOLERANCE_M)
+        and (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+        and not target_robot_contact
+        and not contact_rule_breached
+    )
     return _confirmed_success_diagnostic(
         "target_between_referents",
         instant,
@@ -1653,10 +1803,17 @@ def _between_task_diagnostic(
         f"target={_debug_object_name(env, object_asset_names, env_id, target_id)}, "
         f"referents=({_debug_object_name(env, object_asset_names, env_id, ref_a_id)}, "
         f"{_debug_object_name(env, object_asset_names, env_id, ref_b_id)}), "
-        f"segment_fraction={fraction:.4f} (required 0.10..0.90; "
+        f"legacy_surface_distance_fraction={fraction:.4f} (diagnostic only; "
         f"surface_distances referent1={distance_to_first:.4f}m, referent2={distance_to_second:.4f}m), "
+        f"center_distances target_to_referent1={target_to_a:.4f}m, "
+        f"target_to_referent2={target_to_b:.4f}m, referent_to_referent={referent_distance:.4f}m "
+        f"(both target distances must be strictly smaller), "
         f"perpendicular_distance={perpendicular:.4f}m "
         f"(required <={BETWEEN_LINE_TOLERANCE_M:.4f}m), "
+        f"target_displacement={target_displacement:.4f}m "
+        f"(required >={NON_BIN_TARGET_MIN_DISPLACEMENT_M:.4f}m), "
+        f"target_robot_contact={target_robot_contact} "
+        f"(force threshold >{ROBOT_CONTACT_FORCE_THRESHOLD_N:.3f}N), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
         f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
@@ -1689,11 +1846,19 @@ def _move_task_diagnostic(
     has_boundary = (env._so101_move_boundary_ids >= 0) & torch.isfinite(distance_to_boundary)
     close_to_boundary = distance_to_boundary < MOVE_BOUNDARY_SUCCESS_DISTANCE_M
     reached_goal = torch.where(has_boundary, close_to_boundary, progress >= MOVE_NO_BOUNDARY_MIN_PROGRESS_M)
+    target_displacement = torch.sqrt(progress.square() + lateral.square())
+    target_id = int(_target_indices(env)[env_id].item())
+    target_robot_contact = bool(
+        _object_robot_contact_mask(env, object_asset_names, step_state)[env_id, target_id].item()
+    )
+    robot_clear = _scored_objects_clear_of_robot(env, object_asset_names, step_state)
     instant = bool(
         (
             (progress > 0.0)
             & reached_goal
             & (lateral <= straightness_tolerance)
+            & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+            & robot_clear
             & (~current_contact)
         )[env_id].item()
     )
@@ -1716,6 +1881,10 @@ def _move_task_diagnostic(
         f"(no-boundary requirement >={MOVE_NO_BOUNDARY_MIN_PROGRESS_M:.4f}m), "
         f"current_lateral_error={float(lateral[env_id].item()):.4f}m "
         f"(required <={straightness_tolerance:.4f}m), "
+        f"target_displacement={float(target_displacement[env_id].item()):.4f}m "
+        f"(required >={NON_BIN_TARGET_MIN_DISPLACEMENT_M:.4f}m), "
+        f"target_robot_contact={target_robot_contact} "
+        f"(force threshold >{ROBOT_CONTACT_FORCE_THRESHOLD_N:.3f}N), "
         f"grasped_object_made_contact={bool(made_contact[env_id].item())}, "
         f"target_object_contact_current={bool(target_contact[env_id].item())}, "
         f"target_object_contact_ever={bool(target_contact_ever[env_id].item())}, "
@@ -2018,6 +2187,8 @@ def _postmortem_goal_step(
 
     positions = step_state.positions
     families = set(getattr(env, "_so101_task_family", ()))
+    robot_contact_by_object = _object_robot_contact_mask(env, object_asset_names, step_state)
+    robot_clear = _scored_objects_clear_of_robot(env, object_asset_names, step_state)
     yaws: torch.Tensor | None = None
     if families & {TASK_NEXT_TO, TASK_BETWEEN, TASK_MOVE}:
         yaws = _state_object_yaws(env, object_asset_names, step_state)
@@ -2026,46 +2197,59 @@ def _postmortem_goal_step(
         bin_asset: RigidObject = env.scene[bin_name]
         rel = positions - bin_asset.data.root_pos_w.unsqueeze(1)
         bin_quat_inv = math_utils.quat_inv(bin_asset.data.root_quat_w)
-        rel_local = torch.stack(
-            [math_utils.quat_apply(bin_quat_inv, rel[:, object_id, :]) for object_id in range(rel.shape[1])],
-            dim=1,
-        )
+        rel_local = _rotate_into_bin_frame(bin_quat_inv, rel)
         rel_footprint = rel_local[..., :2] - _bin_footprint_center_offsets(env).unsqueeze(1)
         inside_bin = torch.all(
             torch.abs(rel_footprint) <= _bin_footprint_half_extents(env).unsqueeze(1), dim=-1
         )
         bin_tasks = _task_is(env, TASK_BIN)
         named_bin_tasks = _task_is(env, TASK_NAMED_BIN)
-        met |= torch.all(torch.where(active, inside_bin, torch.ones_like(inside_bin)), dim=1) & bin_tasks
+        bin_met = (
+            torch.all(torch.where(active, inside_bin, torch.ones_like(inside_bin)), dim=1)
+            & robot_clear
+            & bin_tasks
+        )
+        met |= bin_met
         for env_id in torch.nonzero(bin_tasks, as_tuple=False).flatten().tolist():
             active_count = int(active[env_id].sum().item())
             inside_count = int((inside_bin[env_id] & active[env_id]).sum().item())
+            robot_contact_ids = torch.nonzero(
+                robot_contact_by_object[env_id] & active[env_id], as_tuple=False
+            ).flatten().tolist()
             metrics[env_id] = {
                 "name": "objects_inside_bin",
                 "value": float(inside_count),
                 "threshold": float(active_count),
                 "margin": float(inside_count - active_count),
-                "instant": inside_count == active_count,
+                "instant": bool(bin_met[env_id].item()),
+                "robot_contact_object_ids": robot_contact_ids,
+                "robot_contact_force_threshold_n": ROBOT_CONTACT_FORCE_THRESHOLD_N,
             }
         target_ids = _target_indices(env)
         target_inside = inside_bin[
             torch.arange(env.num_envs, device=env.device),
             target_ids,
         ]
-        met |= target_inside & named_bin_tasks
+        named_bin_met = target_inside & robot_clear & named_bin_tasks
+        met |= named_bin_met
         for env_id in torch.nonzero(named_bin_tasks, as_tuple=False).flatten().tolist():
             is_inside = bool(target_inside[env_id].item())
+            target_id = int(target_ids[env_id].item())
+            target_robot_contact = bool(robot_contact_by_object[env_id, target_id].item())
             metrics[env_id] = {
                 "name": "target_inside_bin",
                 "value": 1.0 if is_inside else 0.0,
                 "threshold": 1.0,
                 "margin": 0.0 if is_inside else -1.0,
-                "instant": is_inside,
-                "target_object_id": int(target_ids[env_id].item()),
+                "instant": bool(named_bin_met[env_id].item()),
+                "target_object_id": target_id,
+                "target_robot_contact": target_robot_contact,
+                "robot_contact_force_threshold_n": ROBOT_CONTACT_FORCE_THRESHOLD_N,
             }
 
     if TASK_NEXT_TO in families:
         next_tasks = _task_is(env, TASK_NEXT_TO)
+        target_displacement = _target_displacement_from_initial(env, positions)
         distances = _pairwise_object_surface_distance(
             env,
             object_asset_names,
@@ -2075,19 +2259,36 @@ def _postmortem_goal_step(
             _referent_indices(env)[:, 0],
             next_tasks,
         )
-        met |= (distances <= SPATIAL_SUCCESS_DISTANCE_M) & next_tasks
+        next_met = (
+            (distances <= SPATIAL_SUCCESS_DISTANCE_M)
+            & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+            & robot_clear
+            & next_tasks
+        )
+        met |= next_met
         for env_id in torch.nonzero(next_tasks, as_tuple=False).flatten().tolist():
             value = float(distances[env_id].item())
+            displacement = float(target_displacement[env_id].item())
+            target_id = int(_target_indices(env)[env_id].item())
+            target_robot_contact = bool(robot_contact_by_object[env_id, target_id].item())
             metrics[env_id] = {
                 "name": "target_referent_surface_distance_m",
                 "value": value,
                 "threshold": SPATIAL_SUCCESS_DISTANCE_M,
-                "margin": SPATIAL_SUCCESS_DISTANCE_M - value,
-                "instant": value <= SPATIAL_SUCCESS_DISTANCE_M,
+                "margin": min(
+                    SPATIAL_SUCCESS_DISTANCE_M - value,
+                    displacement - NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                ),
+                "instant": bool(next_met[env_id].item()),
+                "target_displacement_m": displacement,
+                "min_target_displacement_m": NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                "target_robot_contact": target_robot_contact,
+                "robot_contact_force_threshold_n": ROBOT_CONTACT_FORCE_THRESHOLD_N,
             }
 
     if TASK_BETWEEN in families:
         between_tasks = _task_is(env, TASK_BETWEEN)
+        target_displacement = _target_displacement_from_initial(env, positions)
         target_ids = _target_indices(env)
         refs = _referent_indices(env)
         distance_a = _pairwise_object_surface_distance(
@@ -2100,7 +2301,6 @@ def _postmortem_goal_step(
         fraction = torch.where(
             torch.isfinite(total) & (total > 0.0), distance_a / total, torch.full_like(total, 0.5)
         )
-        centered = (fraction >= BETWEEN_CENTER_FRACTION_MIN) & (fraction <= BETWEEN_CENTER_FRACTION_MAX)
         target = _gather_by_index(positions, target_ids)[:, :2]
         ref_a = _gather_by_index(positions, refs[:, 0])[:, :2]
         ref_b = _gather_by_index(positions, refs[:, 1])[:, :2]
@@ -2109,26 +2309,56 @@ def _postmortem_goal_step(
         projection_fraction = torch.sum((target - ref_a) * segment, dim=1) / segment_len_sq
         projection = ref_a + projection_fraction.unsqueeze(1) * segment
         perpendicular = torch.linalg.vector_norm(target - projection, dim=1)
-        between_met = centered & (perpendicular <= BETWEEN_LINE_TOLERANCE_M) & between_tasks
+        target_to_a = torch.linalg.vector_norm(target - ref_a, dim=1)
+        target_to_b = torch.linalg.vector_norm(target - ref_b, dim=1)
+        referent_distance = torch.linalg.vector_norm(segment, dim=1)
+        between_referents = (target_to_a < referent_distance) & (
+            target_to_b < referent_distance
+        )
+        between_met = (
+            between_referents
+            & (perpendicular <= BETWEEN_LINE_TOLERANCE_M)
+            & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+            & robot_clear
+            & between_tasks
+        )
         met |= between_met
         for env_id in torch.nonzero(between_tasks, as_tuple=False).flatten().tolist():
             value = float(perpendicular[env_id].item())
             frac = float(fraction[env_id].item())
-            centered_margin = min(
-                frac - BETWEEN_CENTER_FRACTION_MIN,
-                BETWEEN_CENTER_FRACTION_MAX - frac,
+            displacement = float(target_displacement[env_id].item())
+            target_to_a_value = float(target_to_a[env_id].item())
+            target_to_b_value = float(target_to_b[env_id].item())
+            referent_distance_value = float(referent_distance[env_id].item())
+            betweenness_margin = referent_distance_value - max(
+                target_to_a_value,
+                target_to_b_value,
             )
+            target_id = int(target_ids[env_id].item())
+            target_robot_contact = bool(robot_contact_by_object[env_id, target_id].item())
             line_margin = BETWEEN_LINE_TOLERANCE_M - value
             metrics[env_id] = {
                 "name": "between_geometry",
                 "value": value,
                 "threshold": BETWEEN_LINE_TOLERANCE_M,
-                "margin": min(line_margin, centered_margin),
+                "margin": min(
+                    line_margin,
+                    betweenness_margin,
+                    displacement - NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                ),
                 "instant": bool(between_met[env_id].item()),
                 "perpendicular_distance_m": value,
                 "center_fraction": frac,
                 "center_fraction_min": BETWEEN_CENTER_FRACTION_MIN,
                 "center_fraction_max": BETWEEN_CENTER_FRACTION_MAX,
+                "target_to_referent_a_m": target_to_a_value,
+                "target_to_referent_b_m": target_to_b_value,
+                "referent_distance_m": referent_distance_value,
+                "betweenness_margin_m": betweenness_margin,
+                "target_displacement_m": displacement,
+                "min_target_displacement_m": NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                "target_robot_contact": target_robot_contact,
+                "robot_contact_force_threshold_n": ROBOT_CONTACT_FORCE_THRESHOLD_N,
             }
 
     if TASK_MOVE in families:
@@ -2140,8 +2370,14 @@ def _postmortem_goal_step(
             gap < MOVE_BOUNDARY_SUCCESS_DISTANCE_M,
             progress >= MOVE_NO_BOUNDARY_MIN_PROGRESS_M,
         )
+        target_displacement = torch.sqrt(progress.square() + lateral.square())
         move_met = (
-            (progress > 0.0) & reached & (lateral <= move_straightness_tolerance) & move_tasks
+            (progress > 0.0)
+            & reached
+            & (lateral <= move_straightness_tolerance)
+            & (target_displacement >= NON_BIN_TARGET_MIN_DISPLACEMENT_M)
+            & robot_clear
+            & move_tasks
         )
         met |= move_met
         for env_id in torch.nonzero(move_tasks, as_tuple=False).flatten().tolist():
@@ -2154,17 +2390,28 @@ def _postmortem_goal_step(
                 else value - MOVE_NO_BOUNDARY_MIN_PROGRESS_M
             )
             lateral_margin = move_straightness_tolerance - float(lateral[env_id].item())
+            displacement = float(target_displacement[env_id].item())
+            target_id = int(_target_indices(env)[env_id].item())
+            target_robot_contact = bool(robot_contact_by_object[env_id, target_id].item())
             metrics[env_id] = {
                 "name": "move_boundary_gap_m" if boundary else "move_directional_progress_m",
                 "value": value,
                 "threshold": threshold,
-                "margin": min(goal_margin, lateral_margin),
+                "margin": min(
+                    goal_margin,
+                    lateral_margin,
+                    displacement - NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                ),
                 "instant": bool(move_met[env_id].item()),
                 "directional_progress_m": float(progress[env_id].item()),
                 "lateral_error_m": float(lateral[env_id].item()),
                 "boundary_gap_m": float(gap[env_id].item()),
                 "has_boundary": boundary,
                 "overshot": bool(overshot[env_id].item()),
+                "target_displacement_m": displacement,
+                "min_target_displacement_m": NON_BIN_TARGET_MIN_DISPLACEMENT_M,
+                "target_robot_contact": target_robot_contact,
+                "robot_contact_force_threshold_n": ROBOT_CONTACT_FORCE_THRESHOLD_N,
             }
 
     return _PostmortemGoalStep(met, overshot, inside_bin, metrics)

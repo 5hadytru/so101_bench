@@ -16,6 +16,30 @@ from typing import Any
 INCH = 0.0254
 MULTI_RIGID_BODY_CHILD_NAMES = ("left", "right")
 
+# Per-axis scale applied when benchmark object USDs are spawned.  Footprint
+# metadata stores the source-USD dimensions, so its XY coordinates are scaled
+# by the same factors when loaded below.
+OBJECT_SCALES = {
+    "black skateboard tool": (0.13, 0.13, 0.13),
+    "blue kazoo": (0.9, 0.9, 0.9),
+    "blue sponge": (1.0, 1.0, 1.0),
+    "green air pump": (1.15, 1.15, 1.15),
+    "white pill planner": (1.1, 1.1, 1.1),
+    "white corkscrew": (1.4, 1.4, 1.4),
+    "yellow die": (17.0 / 13.0, 17.0 / 13.0, 17.0 / 13.0),
+    "green sponge": (0.75, 0.75, 0.75),
+    "grey scissors": (1.0, 1.0, 1.3),
+    "green spool": (1.0, 1.0, 0.9),
+    "purple spool": (0.9, 0.9, 1.0),
+    "brown trimmer": (1.2, 1.2, 1.2),
+    "yellow juice box": (0.9, 0.9, 0.9),
+    "green juice box": (0.9, 0.9, 0.9),
+    "name plate": (1.1, 1.1, 1.1),
+    "white toy boat": (1.2, 1.2, 1.2),
+    "red pepper": (1.3, 1.3, 1.3),
+    "red pliers": (1.25, 1.25, 1.25),
+}
+
 TASK_BIN = "bin"
 TASK_NAMED_BIN = "named_bin"
 TASK_NEXT_TO = "next_to"
@@ -31,6 +55,7 @@ COLORS = {
     "black",
     "blue",
     "brown",
+    "gold",
     "gray",
     "green",
     "grey",
@@ -39,22 +64,65 @@ COLORS = {
     "purple",
     "red",
     "silver",
+    "tan",
     "white",
-    "yellow",
+    "yellow"
 }
+# Color words that may appear as the first token of an object label.  ``COLORS``
+# is the authoritative registered subset used by task generation.  Keeping the
+# broader vocabulary separate lets the parser reject, for example, ``teal mug``
+# instead of silently treating "teal" as part of the object class.
+KNOWN_LEADING_COLORS = COLORS | {
+    "aqua",
+    "aquamarine",
+    "beige",
+    "burgundy",
+    "cyan",
+    "gold",
+    "golden",
+    "indigo",
+    "ivory",
+    "lavender",
+    "magenta",
+    "maroon",
+    "navy",
+    "ochre",
+    "teal",
+    "turquoise",
+    "violet",
+}
+
+
+def _leading_color(label: str) -> str | None:
+    words = label.split()
+    if not words:
+        return None
+    leading_word = words[0].lower()
+    if leading_word in COLORS:
+        return leading_word
+    if leading_word in KNOWN_LEADING_COLORS:
+        raise ValueError(
+            f"Unregistered leading color {leading_word!r} in object label {label!r}. "
+            "Add it to COLORS before using it in an object label."
+        )
+    return None
+
 
 MAX_GRASP_ATTEMPTS = 3
 GRASP_ATTEMPT_OBJECT_DISTANCE_M = 4.0 * INCH
 BIN_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 NON_TARGET_DISPLACEMENT_LIMIT_M = 1.0 * INCH
+NON_BIN_TARGET_MIN_DISPLACEMENT_M = 1.0 * INCH
+ROBOT_CONTACT_FORCE_THRESHOLD_N = 0.05
 # A non-bin object only counts as "lifted off the ground" for postmortem failure
 # classification once its root rises this far above its settled resting height.
 LIFT_OFF_GROUND_LIMIT_M = 0.5 * INCH
 BOUNDARY_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 SPATIAL_SUCCESS_DISTANCE_M = 2.0 * INCH
-BETWEEN_LINE_TOLERANCE_M = 2.0 * INCH
-# The between task now permits the target anywhere along the referent span.  The
-# line-alignment and no-contact requirements remain active.
+BETWEEN_LINE_TOLERANCE_M = 1.75 * INCH
+# Retained as diagnostic bounds for the legacy surface-distance fraction.  Live
+# success instead uses the center-distance lens constraint: the target must be
+# closer to each referent than the referents are to each other.
 BETWEEN_CENTER_FRACTION_MIN = 0.0
 BETWEEN_CENTER_FRACTION_MAX = 1.0
 MOVE_BOUNDARY_SUCCESS_DISTANCE_M = 2.0 * INCH
@@ -67,8 +135,8 @@ MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # of the target's lateral corridor. Below it the object is merely beside the path (a
 # glancing clip), so the move is scored on forward progress instead of "reaching" it.
 MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
-DEFAULT_EPISODE_LENGTH_S = 25.0
-FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 80.0
+DEFAULT_EPISODE_LENGTH_S = 30.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 90.0
 
 
 def episode_length_s(task_family: str, object_count: int) -> float:
@@ -78,51 +146,118 @@ def episode_length_s(task_family: str, object_count: int) -> float:
         return FOUR_OBJECT_BIN_EPISODE_LENGTH_S
     return DEFAULT_EPISODE_LENGTH_S
 
-# Each object has an indication for whether its USD contains multiple rigid bodies
-# In that case, the object cannot be initialized with RigidObjectCfg and must use AssetBaseCfg instead
-OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
+# Each object records its supported task categories and whether its USD contains
+# multiple rigid bodies. In that case, the object cannot be initialized with
+# RigidObjectCfg and must use AssetBaseCfg instead.
+OBJECT_SPLITS: dict[str, dict[str, dict[str, bool | list[str]]]] = {
     "seen": {
-        "black glasses": {"multiple_rigid_bodies": False, "deformable": False},
-        "silver glasses": {"multiple_rigid_bodies": False, "deformable": False},
-        "white pen": {"multiple_rigid_bodies": False, "deformable": False},
-        "black pen": {"multiple_rigid_bodies": False, "deformable": False},
-        "altoids container": {"multiple_rigid_bodies": False, "deformable": False},
+        # "black glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        # "silver glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "white pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "altoids container": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black remote": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         # "brown stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue pliers": {"multiple_rigid_bodies": False, "deformable": False},
-        "green clip": {"multiple_rigid_bodies": False, "deformable": False},
-        "pink eraser": {"multiple_rigid_bodies": False, "deformable": False},
-        "yellow wires": {"multiple_rigid_bodies": False, "deformable": False},
-        "grey wires": {"multiple_rigid_bodies": False, "deformable": False},
-        "black screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
-        "yellow screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
-        "red tape": {"multiple_rigid_bodies": False, "deformable": False},
-        "black tape": {"multiple_rigid_bodies": False, "deformable": False},
-        "cardboard box": {"multiple_rigid_bodies": False, "deformable": False},
-        "flower pot": {"multiple_rigid_bodies": False, "deformable": False},
-        "cooking spoon": {"multiple_rigid_bodies": False, "deformable": False},
-        "yellow toy car": {"multiple_rigid_bodies": False, "deformable": False},
-        "grey toy car": {"multiple_rigid_bodies": False, "deformable": False},
-        "green shoes": {"multiple_rigid_bodies": True, "deformable": False},
-        "black shoes": {"multiple_rigid_bodies": True, "deformable": False},
-        "blue bowl": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue scissors": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue pliers": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green clip": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "pink eraser": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow wires": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "grey wires": {"multiple_rigid_bodies": False, "deformable": False},
+        # "black screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
+        "yellow screwdriver": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "cardboard box": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "flower pot": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "cooking spoon": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["BIN"]},
+        "yellow toy car": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey toy car": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green shoes": {"multiple_rigid_bodies": True, "deformable": False, "tasks": ["BIN"]},
+        "blue bowl": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue scissors": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "silver battery": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red pepper": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green sponge": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white die": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "pink pacifier": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green spool": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple mouthguard": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red whistle": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue kazoo": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown bottle opener": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown bow tie": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white air pump": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "pink harmonica": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple pill planner": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "orange walkie talkie": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red candy cane": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red button": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black bike lock": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown ice cream scoop": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey toy boat": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue paintbrush": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown sunglasses case": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown trimmer": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey flash drive": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey camera": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "red skateboard tool": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue hand brush": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue torpedo": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "hose splitter": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow lego": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "tan corkscrew": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow juice box": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
     },
     "unseen_seen_class": {
-        "orange glasses": {"multiple_rigid_bodies": False, "deformable": False},
-        "white glasses": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue clip": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue tape": {"multiple_rigid_bodies": False, "deformable": False},
-        "yellow tape": {"multiple_rigid_bodies": False, "deformable": False},
-        "white stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue screwdriver": {"multiple_rigid_bodies": False, "deformable": False},
-        "pink bowl": {"multiple_rigid_bodies": False, "deformable": False},
-        "white bowl": {"multiple_rigid_bodies": False, "deformable": False},
-        "black wires": {"multiple_rigid_bodies": False, "deformable": False},
-        "brown wires": {"multiple_rigid_bodies": False, "deformable": False},
-        "orange toy car": {"multiple_rigid_bodies": False, "deformable": False},
-        "blue pen": {"multiple_rigid_bodies": False, "deformable": False},
-        "red pen": {"multiple_rigid_bodies": False, "deformable": False},
-        "white shoes": {"multiple_rigid_bodies": True, "deformable": False},
+        # "orange glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        # "white glasses": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue clip": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "white stuffed animal": {"multiple_rigid_bodies": False, "deformable": False},
+        "blue screwdriver": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "pink bowl": {"multiple_rigid_bodies": False, "deformable": False},
+        "white bowl": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black wires": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown wires": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "orange toy car": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white shoes": {"multiple_rigid_bodies": True, "deformable": False, "tasks": ["BIN"]},
+        "red pliers": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey scissors": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green battery": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "grey remote": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green pepper": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue sponge": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow die": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple pacifier": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple spool": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "orange mouthguard": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black whistle": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple bottle opener": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "pink bow tie": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green air pump": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow flash drive": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white pill planner": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "yellow walkie talkie": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green kazoo": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue harmonica": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "gold candy cane": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue button": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "pink bike lock": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black ice cream scoop": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white toy boat": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "brown paintbrush": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green sunglasses case": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black trimmer": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "black camera": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        # "black skateboard tool": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "green juice box": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red lego": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "red torpedo": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white corkscrew": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "white eraser": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
     },
     "unseen_unseen_class": {
         "blue headband": {"multiple_rigid_bodies": False, "deformable": False},
@@ -145,12 +280,14 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
 BENCHMARK_OBJECT_NAMES: tuple[str, ...] = tuple(
     object_name for split in OBJECT_SPLITS.values() for object_name in split
 )
-OBJECT_METADATA: dict[str, dict[str, bool]] = {
+OBJECT_METADATA: dict[str, dict[str, bool | list[str]]] = {
     object_name: metadata for split in OBJECT_SPLITS.values() for object_name, metadata in split.items()
 }
+for _object_name in OBJECT_METADATA:
+    _leading_color(_object_name)
 MOVE_FOOTPRINT_SCHEMA_VERSION = 1
 MOVE_FOOTPRINT_GENERATOR_COMMAND = (
-    "/home/truman/env_isaaclab/bin/python scripts/generate_object_move_footprints.py"
+    "/home/truman/env_isaaclab_51/bin/python scripts/generate_object_move_footprints.py"
 )
 OBJECT_MOVE_FOOTPRINT_DIR = Path(__file__).resolve().parent / "assets" / "objects"
 
@@ -255,7 +392,7 @@ class BenchmarkEpisodeSpec:
         }
 
 
-def object_metadata(object_name: str) -> dict[str, bool]:
+def object_metadata(object_name: str) -> dict[str, bool | list[str]]:
     """Return validated metadata for an object name from ``OBJECT_SPLITS``."""
 
     try:
@@ -339,7 +476,11 @@ def load_object_move_footprint_boxes(
                 f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
             )
         boxes.append(box)
-    return tuple(boxes)
+    scale_x, scale_y, _ = OBJECT_SCALES.get(object_name, (1.0, 1.0, 1.0))
+    return tuple(
+        (min_x * scale_x, min_y * scale_y, max_x * scale_x, max_y * scale_y)
+        for min_x, min_y, max_x, max_y in boxes
+    )
 
 
 def validate_move_episode_footprints(episodes: list[BenchmarkEpisodeSpec]) -> None:
@@ -371,7 +512,7 @@ def _normalized_object_label(label: str) -> str:
 
 def _colorless_label(object_name: str) -> str:
     words = object_name.split()
-    if words and words[0] in COLORS:
+    if _leading_color(object_name) is not None:
         return " ".join(words[1:])
     return object_name
 

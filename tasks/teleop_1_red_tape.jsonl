@@ -1,0 +1,9 @@
+{"objects": ["red tape"], "ood_key": "seen", "trial_id": 0, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape"], "ood_key": "seen", "trial_id": 1, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape"], "ood_key": "seen", "trial_id": 2, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape"], "ood_key": "seen", "trial_id": 3, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape"], "ood_key": "seen", "trial_id": 4, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["white pen", "red tape", "altoids container", "black pen"], "ood_key": "seen", "trial_id": 5, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["silver glasses", "blue bowl", "red tape", "blue scissors"], "ood_key": "seen", "trial_id": 6, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["grey toy car", "yellow toy car", "cooking spoon", "red tape"], "ood_key": "seen", "trial_id": 7, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["flower pot", "cardboard box", "black tape", "red tape"], "ood_key": "seen", "trial_id": 8, "n_objects": 4, "instruction": "Place each object in the plastic bin"}

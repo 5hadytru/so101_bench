@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import nullcontext
+from dataclasses import asdict
 from datetime import datetime
 import json
 import math
@@ -97,6 +99,15 @@ parser.add_argument(
         "Optional JSONL file with precomputed object and bin initial poses to apply as-is. "
         "Rows are matched to episodes by trial_id when present; otherwise they are consumed in episode order. "
         "Provided layouts are not revalidated."
+    ),
+)
+parser.add_argument(
+    "--object_pool_episodes_jsonl",
+    type=Path,
+    default=None,
+    help=(
+        "Optional task JSONL used only to choose every object asset pre-spawned in the environment. "
+        "This lets a short profile preserve the full evaluation run's simulation object pool."
     ),
 )
 parser.add_argument(
@@ -231,6 +242,39 @@ parser.add_argument(
     help="Local root directory for the optional LeRobot dataset.",
 )
 parser.add_argument(
+    "--episode_diagnostics_jsonl",
+    type=Path,
+    default=None,
+    help=(
+        "Optional append-only JSONL path for the complete already-computed postmortem diagnostic "
+        "object from every completed episode. No additional diagnostic geometry is evaluated."
+    ),
+)
+parser.add_argument(
+    "--profile_output_json",
+    type=Path,
+    default=None,
+    help=(
+        "Enable low-overhead evaluation profiling and atomically update this aggregate JSON file. "
+        "Precomputed layout loading/generation is deliberately outside the profiler."
+    ),
+)
+parser.add_argument(
+    "--profile_episodes_jsonl",
+    type=Path,
+    default=None,
+    help="Optional per-episode profiler JSONL path; defaults beside --profile_output_json.",
+)
+parser.add_argument(
+    "--profile_cuda_sync",
+    action="store_true",
+    default=False,
+    help=(
+        "Synchronize CUDA at evaluator and instrumented Isaac boundaries. This is intrusive and should only be "
+        "used for a short diagnostic run; internal policy/recorder submetrics remain host-observed."
+    ),
+)
+parser.add_argument(
     "--task_name",
     type=str,
     default=None,
@@ -331,6 +375,7 @@ from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
     VALID_OBJECT_SPAWN_REGIONS,
     configure_env_cfg_for_object_pool,
 )
+from so101_bench.utils.eval_profiler import EvalProfiler
 from so101_bench.utils.groot import GR00TRemotePolicy
 from so101_bench.utils.lerobot_calibration import (
     LEROBOT_INITIAL_JOINT_POS,
@@ -1024,6 +1069,25 @@ def main():
     episode_count = len(episode_plan)
     print(f"[INFO]: Loaded {len(episode_specs)} validated JSONL episode(s) from {args_cli.episodes_jsonl}.")
 
+    object_pool_specs = episode_plan
+    if args_cli.object_pool_episodes_jsonl is not None:
+        object_pool_specs = load_episode_jsonl(args_cli.object_pool_episodes_jsonl)
+        print(
+            f"[INFO]: Building the simulation object pool from {len(object_pool_specs)} episode(s) in "
+            f"{args_cli.object_pool_episodes_jsonl}."
+        )
+
+    diagnostics_jsonl = args_cli.episode_diagnostics_jsonl
+    if diagnostics_jsonl is not None:
+        diagnostics_jsonl = diagnostics_jsonl.expanduser().resolve()
+        diagnostics_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        if diagnostics_jsonl.exists() and diagnostics_jsonl.stat().st_size > 0:
+            raise FileExistsError(
+                f"Refusing to append duplicate episode diagnostics to non-empty file: {diagnostics_jsonl}"
+            )
+        diagnostics_jsonl.touch()
+        print(f"[INFO]: Detailed episode diagnostics JSONL: {diagnostics_jsonl}")
+
     random.seed(args_cli.seed)
     np.random.seed(args_cli.seed)
     torch.manual_seed(args_cli.seed)
@@ -1035,10 +1099,49 @@ def main():
     else:
         episode_layouts, _layout_path = _generate_and_save_episode_layouts(episode_plan)
 
-    object_pool = _episode_object_pool(episode_plan)
+    object_pool = _episode_object_pool(object_pool_specs)
+
+    # Start profiling only after all layout work is complete. Layout generation,
+    # loading, normalization, and validation are intentionally excluded.
+    profiler = None
+    if args_cli.profile_output_json is not None:
+        profiler = EvalProfiler(
+            args_cli.profile_output_json,
+            episodes_jsonl=args_cli.profile_episodes_jsonl,
+            cuda_synchronize=args_cli.profile_cuda_sync,
+            metadata={
+                "task": args_cli.task,
+                "episodes_jsonl": str(args_cli.episodes_jsonl.expanduser().resolve()),
+                "episode_count": episode_count,
+                "action_horizon": args_cli.action_horizon,
+                "record_dataset": args_cli.record_dataset,
+                "object_pool_episode_count": len(object_pool_specs),
+                "object_asset_count": len(object_pool),
+                "object_pool_episodes_jsonl": (
+                    str(args_cli.object_pool_episodes_jsonl.expanduser().resolve())
+                    if args_cli.object_pool_episodes_jsonl is not None
+                    else None
+                ),
+                "layout_profiling_excluded": True,
+                "timing_clock": "host perf_counter wall time",
+                "cuda_sync_scope": "evaluator and instrumented Isaac boundaries only",
+                "server_handler_scope": "request handler: preprocessing + model + action decoding",
+            },
+        )
+        print(f"[INFO]: Evaluation profile summary: {profiler.output_json}")
+        print(f"[INFO]: Per-episode evaluation profile: {profiler.episodes_jsonl}")
+        if args_cli.profile_cuda_sync:
+            print("[WARN]: CUDA-synchronized profiling is intrusive and will alter evaluation throughput.")
+
+    def _profile(name: str):
+        return profiler.measure(name) if profiler is not None else nullcontext()
+
     print(f"[INFO]: Pre-spawning {len(object_pool)} benchmark object asset(s): {', '.join(object_pool)}")
 
-    env, object_asset_names = _make_env(object_pool, episode_plan[0], episode_layouts[0])
+    with _profile("setup.environment_create"):
+        env, object_asset_names = _make_env(object_pool, episode_plan[0], episode_layouts[0])
+    if profiler is not None:
+        profiler.install_simulation_instrumentation(env)
     print(f"[INFO]: Gym observation space: {env.observation_space}")
     print(f"[INFO]: Gym action space: {env.action_space}")
     control_dt = float(env.unwrapped.step_dt)
@@ -1055,38 +1158,61 @@ def main():
     if args_cli.hold_init:
         print("[INFO]: Hold-init mode enabled: GR00T policy connection and queries are disabled.")
 
-    cameras = _discover_cameras(env)
+    with _profile("setup.camera_discovery"):
+        cameras = _discover_cameras(env)
     if not cameras:
         raise RuntimeError("No cameras were found. GR00T inference requires visual observations.")
 
+    if profiler is not None:
+        profiler.metadata.update(
+            {
+                "device": str(env.unwrapped.device),
+                "physics_dt_s": physics_dt,
+                "physics_hz": 1.0 / physics_dt,
+                "control_dt_s": control_dt,
+                "control_hz": 1.0 / control_dt,
+                "decimation": int(env.unwrapped.cfg.decimation),
+                "render_interval": int(env.unwrapped.cfg.sim.render_interval),
+                "render_dt_s": render_dt,
+                "cameras": cameras,
+            }
+        )
+        profiler.write_snapshot()
+
     if args_cli.inspect_initial_scene:
-        _reset_env(env)
+        with _profile("episode.explicit_reset"):
+            _reset_env(env)
         _print_initial_scene(env, object_asset_names)
         print("[INFO]: Inspecting initial scene. Close the Isaac app window to exit; physics is not being stepped.")
         while simulation_app.is_running():
             simulation_app.update()
-        env.close()
+        with _profile("cleanup.environment_close"):
+            env.close()
+        if profiler is not None:
+            profiler.finish(status="inspection_completed")
         return
 
     recorder = None
     recorder_mapper = None
     recording_camera_sources = None
     if args_cli.record_dataset:
-        recording_camera_sources = real_compatible_camera_sources(cameras)
-        recorder_mapper = SO101CalibrationMapper(device=env.unwrapped.device)
-        recorder = LeRobotSimDatasetRecorder(
-            repo_id=args_cli.repo_id,
-            dataset_root=args_cli.repo_root,
-            fps=max(1, round(1.0 / control_dt)),
-            cameras=dataset_cameras(cameras, recording_camera_sources),
-            streaming_encoding=args_cli.dataset_streaming_encoding,
-            vcodec=args_cli.dataset_vcodec,
-            encoder_queue_size=args_cli.dataset_encoder_queue_size,
-            encoder_threads=None if args_cli.dataset_encoder_threads == 0 else args_cli.dataset_encoder_threads,
-            image_writer_processes=args_cli.dataset_image_writer_processes,
-            image_writer_threads_per_camera=args_cli.dataset_image_writer_threads_per_camera,
-            video_files_size_mb=args_cli.dataset_video_files_size_mb,
-        )
+        with _profile("setup.recording_construct"):
+            recording_camera_sources = real_compatible_camera_sources(cameras)
+            recorder_mapper = SO101CalibrationMapper(device=env.unwrapped.device)
+            recorder = LeRobotSimDatasetRecorder(
+                repo_id=args_cli.repo_id,
+                dataset_root=args_cli.repo_root,
+                fps=max(1, round(1.0 / control_dt)),
+                cameras=dataset_cameras(cameras, recording_camera_sources),
+                streaming_encoding=args_cli.dataset_streaming_encoding,
+                vcodec=args_cli.dataset_vcodec,
+                encoder_queue_size=args_cli.dataset_encoder_queue_size,
+                encoder_threads=None if args_cli.dataset_encoder_threads == 0 else args_cli.dataset_encoder_threads,
+                image_writer_processes=args_cli.dataset_image_writer_processes,
+                image_writer_threads_per_camera=args_cli.dataset_image_writer_threads_per_camera,
+                video_files_size_mb=args_cli.dataset_video_files_size_mb,
+                timing_callback=profiler.record if profiler is not None else None,
+            )
     else:
         print("[INFO]: LeRobot dataset recording disabled. Pass --record_dataset to enable it.")
 
@@ -1118,23 +1244,34 @@ def main():
         overhead_init_camera=args_cli.overhead_init_camera,
         overhead_init_key=args_cli.overhead_init_key,
         image_size=image_size,
+        timing_callback=profiler.record if profiler is not None else None,
+        counter_callback=profiler.increment if profiler is not None else None,
     )
     if not args_cli.hold_init:
-        policy.connect()
+        with _profile("setup.policy_connect"):
+            policy.connect()
 
-    obs, _ = _reset_env(env)
+    if recorder is not None:
+        with _profile("setup.recording_initialize"):
+            recorder.init_dataset()
+
+    if profiler is not None:
+        profiler.start_episode(1)
+    with _profile("episode.explicit_reset"):
+        obs, _ = _reset_env(env)
     sim_speed_ui.reset()
     _print_episode_setup(env)
-    policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
-    policy.reset()
+    with _profile("episode.policy_reset"):
+        policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
+        policy.reset()
     print(f"[INFO]: Episode instruction: {policy.lang_instruction}")
 
     hold_action = _initial_robot_action(env)
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
     actions[:] = hold_action
     if recorder is not None:
-        recorder.init_dataset()
-        recorder.start_episode(task=_instruction(env, args_cli.task_name))
+        with _profile("recording.episode_start"):
+            recorder.start_episode(task=_instruction(env, args_cli.task_name))
 
     step = 0
     episodes = 0
@@ -1151,6 +1288,7 @@ def main():
         snapshot_stdin_enabled=args_cli.camera_snapshot_stdin,
         debug=args_cli.camera_snapshot_debug,
     )
+    encoder_drops_seen: dict[str, int] = {}
 
     def _save_snapshot_requests(request_count: int) -> None:
         nonlocal snapshot_index
@@ -1197,49 +1335,91 @@ def main():
 
     def _cancel_recording() -> None:
         if recorder is not None:
-            recorder.cancel_episode()
+            with _profile("recording.episode_cancel"):
+                recorder.cancel_episode()
 
     def _push_recording_frame() -> None:
         if recorder is None:
             return
         assert recorder_mapper is not None
         assert recording_camera_sources is not None
-        recorder.push_frame(
-            action=recorder_mapper.sim_radians_to_lerobot_positions(actions[0].clone()),
-            observation_state=recorder_mapper.sim_radians_to_lerobot_positions(
-                obs["policy"]["joint_pos_obs"][0].clone()
-            ),
-            images=recording_images(obs["visual"], recording_camera_sources),
-        )
+        with _profile("recording.frame.total"):
+            with _profile("recording.frame.action_state_mapping"):
+                recorded_action = recorder_mapper.sim_radians_to_lerobot_positions(actions[0].clone())
+                recorded_state = recorder_mapper.sim_radians_to_lerobot_positions(
+                    obs["policy"]["joint_pos_obs"][0].clone()
+                )
+            with _profile("recording.frame.image_conversion"):
+                images = recording_images(obs["visual"], recording_camera_sources)
+            with _profile("recording.frame.recorder_push"):
+                recorder.push_frame(
+                    action=recorded_action,
+                    observation_state=recorded_state,
+                    images=images,
+                )
+        if profiler is not None:
+            with _profile("profiler.encoder_telemetry"):
+                encoder_stats = recorder.streaming_encoder_stats()
+                for camera_name, depth in encoder_stats["queue_depths"].items():
+                    profiler.observe(f"recording.encoder.queue_depth.{camera_name}", depth)
+                for camera_name, dropped in encoder_stats["dropped_frames"].items():
+                    previous = encoder_drops_seen.get(camera_name, 0)
+                    if dropped > previous:
+                        profiler.increment(
+                            f"recording.encoder.dropped_frames_total.{camera_name}",
+                            dropped - previous,
+                        )
+                    encoder_drops_seen[camera_name] = dropped
 
     def _save_recording() -> None:
         if recorder is not None:
-            recorder.stop_episode(task=_instruction(env, args_cli.task_name))
+            with _profile("recording.episode_finalize"):
+                recorder.stop_episode(task=_instruction(env, args_cli.task_name))
+
+    def _finish_profile_episode(*, success: bool, termination_reason: str) -> None:
+        if profiler is None:
+            return
+        profiler.finish_episode(
+            episode=episodes,
+            success=success,
+            termination_reason=termination_reason,
+            control_steps=step,
+            simulated_seconds=step * control_dt,
+        )
 
     def _start_next_episode() -> None:
         nonlocal obs, actions, hold_action, step, robot_control_started
         next_episode_number = episodes + 1
+        encoder_drops_seen.clear()
+        if profiler is not None:
+            profiler.start_episode(next_episode_number)
         print(f"[INFO]: Resetting episode {next_episode_number}/{episode_count}...")
-        _configure_env_for_episode(
-            env,
-            episode_plan[episodes],
-            episode_layouts[episodes],
-            object_pool,
-            object_asset_names,
-        )
-        obs, _ = _reset_env(env)
+        with _profile("episode.apply_precomputed_configuration"):
+            _configure_env_for_episode(
+                env,
+                episode_plan[episodes],
+                episode_layouts[episodes],
+                object_pool,
+                object_asset_names,
+            )
+        with _profile("episode.explicit_reset"):
+            obs, _ = _reset_env(env)
         sim_speed_ui.reset()
         _print_episode_setup(env)
-        policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
-        policy.reset(reset_remote=args_cli.remote_reset_each_episode)
+        with _profile("episode.policy_reset"):
+            policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
+            policy.reset(reset_remote=args_cli.remote_reset_each_episode)
         print(f"[INFO]: Episode instruction: {policy.lang_instruction}")
         hold_action = _initial_robot_action(env)
         actions[:] = hold_action
         step = 0
         robot_control_started = False
         if recorder is not None:
-            recorder.start_episode(task=_instruction(env, args_cli.task_name))
+            with _profile("recording.episode_start"):
+                recorder.start_episode(task=_instruction(env, args_cli.task_name))
 
+    run_completed = False
+    run_status = "interrupted"
     try:
         while simulation_app.is_running():
             skip_requested = _poll_runtime_controls()
@@ -1248,16 +1428,19 @@ def main():
                 episodes += 1
                 skipped += 1
                 print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
+                _finish_profile_episode(success=False, termination_reason="skipped")
                 if episodes >= episode_count:
                     _print_final_score()
+                    run_completed = True
                     break
                 _start_next_episode()
                 continue
 
             if runtime_controls.paused:
-                env.unwrapped.sim.render()
-                sim_speed_ui.update()
-                time.sleep(0.02)
+                with _profile("runtime.paused_iteration"):
+                    env.unwrapped.sim.render()
+                    sim_speed_ui.update()
+                    time.sleep(0.02)
                 continue
 
             if step < initial_hold_steps:
@@ -1272,12 +1455,17 @@ def main():
                     if not robot_control_started:
                         _begin_robot_control(env, policy, obs, object_asset_names)
                         robot_control_started = True
-                    with torch.inference_mode():
-                        joint_positions = obs["policy"]["joint_pos_obs"][0].clone()
-                        actions[:] = policy.get_action(joint_positions, obs["visual"])
+                    with _profile("policy.control_step.total"):
+                        with torch.inference_mode():
+                            joint_positions = obs["policy"]["joint_pos_obs"][0].clone()
+                            actions[:] = policy.get_action(joint_positions, obs["visual"])
 
-            obs, _rewards, terminated, truncated, info = env.step(actions)
+            with _profile("simulation.env_step.total"):
+                obs, _rewards, terminated, truncated, info = env.step(actions)
             step += 1
+            if profiler is not None:
+                profiler.increment("simulation.control_steps")
+                profiler.increment("simulation.simulated_seconds", control_dt)
             sim_speed_ui.add_step()
             _push_recording_frame()
 
@@ -1287,8 +1475,10 @@ def main():
                 episodes += 1
                 skipped += 1
                 print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
+                _finish_profile_episode(success=False, termination_reason="skipped")
                 if episodes >= episode_count:
                     _print_final_score()
+                    run_completed = True
                     break
                 _start_next_episode()
                 continue
@@ -1296,6 +1486,8 @@ def main():
             is_done = bool(terminated.any().item() or truncated.any().item())
             if not is_done:
                 continue
+            if profiler is not None:
+                profiler.increment("simulation.terminal_control_steps")
 
             term_log = info.get("log", {})
             is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
@@ -1331,24 +1523,55 @@ def main():
                 elif postmortem is not None:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     message += f", live_failure_reason={live_failure_reason}"
+            else:
+                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
+                postmortem = diagnostics[0] if diagnostics else None
             # Emit the already-computed outcome before finalizing video. A
             # recorder/encoder shutdown must not erase the episode result from
             # the log after the environment has definitively ended the episode.
             print(message, flush=True)
+            if diagnostics_jsonl is not None:
+                with _profile("diagnostics.episode_jsonl_write"):
+                    spec = episode_plan[episodes - 1]
+                    payload = {
+                        "episode": episodes,
+                        "total": episode_count,
+                        "success": is_success,
+                        "termination_reason": end_reason,
+                        "episode_length_s": episode_duration_s,
+                        "live_failure_reason": live_failure_reason,
+                        "episode_spec": spec.reset_payload(),
+                        "postmortem": asdict(postmortem) if postmortem is not None else None,
+                    }
+                    with diagnostics_jsonl.open("a", encoding="utf-8") as diagnostics_file:
+                        diagnostics_file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                        diagnostics_file.flush()
             _save_recording()
+            _finish_profile_episode(success=is_success, termination_reason=end_reason)
 
             if episodes >= episode_count:
                 _print_final_score()
+                run_completed = True
                 break
 
             _start_next_episode()
+    except KeyboardInterrupt:
+        run_status = "interrupted"
+        raise
+    except BaseException:
+        run_status = "failed"
+        raise
     finally:
         _cancel_recording()
         if recorder is not None:
-            recorder.finalize()
+            with _profile("cleanup.recording_finalize"):
+                recorder.finalize()
         runtime_controls.close()
         sim_speed_ui.close()
-        env.close()
+        with _profile("cleanup.environment_close"):
+            env.close()
+        if profiler is not None:
+            profiler.finish(status="completed" if run_completed else run_status)
 
 
 if __name__ == "__main__":

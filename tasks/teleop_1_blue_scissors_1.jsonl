@@ -1,0 +1,9 @@
+{"objects": ["blue scissors"], "ood_key": "seen", "trial_id": 0, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors"], "ood_key": "seen", "trial_id": 1, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors"], "ood_key": "seen", "trial_id": 2, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors"], "ood_key": "seen", "trial_id": 3, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors"], "ood_key": "seen", "trial_id": 4, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["white pen", "black pen", "silver glasses", "blue scissors"], "ood_key": "seen", "trial_id": 5, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["blue scissors", "yellow wires", "pink eraser", "grey wires"], "ood_key": "seen", "trial_id": 6, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["altoids container", "blue scissors", "blue pliers", "green clip"], "ood_key": "seen", "trial_id": 7, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["red tape", "blue scissors", "yellow screwdriver", "black screwdriver"], "ood_key": "seen", "trial_id": 8, "n_objects": 4, "instruction": "Place each object in the plastic bin"}

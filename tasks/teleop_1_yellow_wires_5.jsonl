@@ -1,0 +1,4 @@
+{"objects": ["blue bowl", "grey toy car", "blue scissors", "yellow wires"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the yellow wires left", "target": "yellow wires", "direction": "left"}
+{"objects": ["yellow wires", "blue scissors", "silver glasses", "white pen"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the yellow wires right", "target": "yellow wires", "direction": "right"}
+{"objects": ["flower pot", "cooking spoon", "yellow wires", "cardboard box"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the wires forwards", "target": "yellow wires", "direction": "forward"}
+{"objects": ["yellow wires", "red tape", "black tape", "cardboard box"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the yellow wires backwards", "target": "yellow wires", "direction": "backward"}

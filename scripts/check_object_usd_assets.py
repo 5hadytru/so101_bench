@@ -184,6 +184,26 @@ def check_object_usd(usd_path: Path, textures_dir: Path) -> bool:
         print("  FAIL no Mesh prim found")
         passes = False
 
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim.IsValid():
+        print("  FAIL no default prim")
+        passes = False
+    else:
+        default_path = default_prim.GetPath()
+        for prim in stage.Traverse():
+            relationship = UsdShade.MaterialBindingAPI(prim).GetDirectBindingRel()
+            if not relationship:
+                continue
+            outside_targets = [
+                target for target in relationship.GetTargets() if not target.HasPrefix(default_path)
+            ]
+            if outside_targets:
+                print(
+                    f"  FAIL {prim.GetPath()} has material target(s) outside "
+                    f"default prim {default_path}: {outside_targets}"
+                )
+                passes = False
+
     physics_bound_meshes: list[tuple[Usd.Prim, UsdShade.Material]] = []
     for mesh_prim in all_meshes:
         material = bound_material(mesh_prim, ("physics",))

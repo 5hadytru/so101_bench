@@ -1,0 +1,4 @@
+{"objects": ["grey wires", "yellow toy car", "black screwdriver", "blue scissors"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the blue scissors left", "target": "blue scissors", "direction": "left"}
+{"objects": ["black pen", "silver glasses", "white pen", "blue scissors"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the scissors right", "target": "blue scissors", "direction": "right"}
+{"objects": ["blue scissors", "grey toy car", "silver glasses", "blue bowl"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the scissors forwards", "target": "blue scissors", "direction": "forward"}
+{"objects": ["blue scissors", "pink eraser", "black tape", "red tape"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the scissors backwards", "target": "blue scissors", "direction": "backward"}

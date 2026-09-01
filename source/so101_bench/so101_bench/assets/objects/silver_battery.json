@@ -1,0 +1,34 @@
+{
+  "boxes": [
+    [
+      -0.013,
+      -0.005,
+      0.014,
+      0.007
+    ],
+    [
+      -0.012,
+      -0.006,
+      0.014,
+      -0.005
+    ],
+    [
+      -0.011,
+      -0.007,
+      0.013,
+      -0.006
+    ],
+    [
+      -0.011,
+      0.007,
+      0.014,
+      0.008
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/physics/node_0_001"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "silver_battery.usdc"
+}

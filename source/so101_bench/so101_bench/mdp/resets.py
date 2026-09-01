@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from pathlib import Path
 
@@ -70,10 +71,41 @@ DEFAULT_FOOTPRINT_HALF_EXTENTS = (0.02, 0.02)
 DEFAULT_FOOTPRINT_CENTER_OFFSET = (0.0, 0.0)
 
 
+def slots_live_in_any_env(env, num_objects: int) -> list[bool] | None:
+    """Per-slot flag for "some env has this object on the table this episode".
+
+    Slots that no env is using were parked 20 m off the table by the reset and take
+    no part in the task, so their state is served from the reset's own buffers rather
+    than round-tripping through a PhysX view once per slot per step. That also keeps
+    them inert: an unused slot reads as sitting at its parked pose instead of
+    free-falling further from it every step.
+
+    Reading the mask back from the GPU is a device sync, so the result is cached for
+    the current step; the reset clears the cache when it re-picks the active slots.
+    """
+
+    active_mask = getattr(env, "_so101_active_object_mask", None)
+    if not isinstance(active_mask, torch.Tensor) or active_mask.shape[1] != num_objects:
+        return None
+    step_counter = getattr(env, "common_step_counter", None)
+    cache_key = (step_counter, num_objects) if isinstance(step_counter, int) else None
+    cached = getattr(env, "_so101_live_object_slots", None)
+    if cache_key is not None and cached is not None and cached[0] == cache_key:
+        return cached[1]
+    live = active_mask.any(dim=0).tolist()
+    env._so101_live_object_slots = (cache_key, live) if cache_key is not None else None
+    return live
+
+
 def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tensor:
     positions = []
     multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
-    for name in object_asset_names:
+    live = slots_live_in_any_env(env, len(object_asset_names))
+    parked_pos = getattr(env, "_so101_initial_object_pos_w", None)
+    for object_id, name in enumerate(object_asset_names):
+        if live is not None and not live[object_id] and parked_pos is not None:
+            positions.append(parked_pos[:, object_id, :])
+            continue
         asset = env.scene[name]
         if isinstance(asset, XformPrimView):
             views = multi_info.get(name)
@@ -108,7 +140,12 @@ def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tens
 def benchmark_object_yaws(env, object_asset_names: list[str]) -> torch.Tensor:
     yaws = []
     multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
+    live = slots_live_in_any_env(env, len(object_asset_names))
+    parked_yaws = getattr(env, "_so101_initial_object_yaws", None)
     for object_id, name in enumerate(object_asset_names):
+        if live is not None and not live[object_id] and parked_yaws is not None:
+            yaws.append(parked_yaws[:, object_id])
+            continue
         asset = env.scene[name]
         if isinstance(asset, XformPrimView):
             views = multi_info.get(name)
@@ -447,6 +484,74 @@ def _write_multi_rigid_body_pose(
         velocities = torch.zeros((view.count, 6), dtype=torch.float32, device=device)
         view.set_velocities(velocities, indices)
     return True
+
+
+# Scripts that walk a JSONL of episodes pre-spawn one scene slot per unique object
+# name in the file, so a 150-object task list puts 150 rigid bodies and 300 contact
+# sensors into a stage where at most four objects are ever on the table. The unused
+# slots are parked far off the table but are still clocked, read, and scanned every
+# step, which is what makes a 150-object task file much slower than a 1-object one.
+# The helpers below keep the per-step work proportional to the episode instead.
+
+POOL_GATING_ENV_VAR = "SO101_BENCH_DISABLE_POOL_GATING"
+
+
+def _pool_gating_enabled() -> bool:
+    """Escape hatch: set ``SO101_BENCH_DISABLE_POOL_GATING=1`` to keep every pool slot live."""
+
+    return os.environ.get(POOL_GATING_ENV_VAR, "").strip().lower() not in {"1", "true", "yes"}
+
+
+def _skip_sensor_update(dt: float, force_recompute: bool = False) -> None:
+    """Stand-in for ``SensorBase.update`` on a slot that is parked off the table."""
+
+
+def _object_contact_sensors(env, object_asset_names: list[str]) -> list[list]:
+    """Contact sensors belonging to each object slot, cached on ``env``."""
+
+    signature = tuple(object_asset_names)
+    cached = getattr(env, "_so101_object_contact_sensors", None)
+    if isinstance(cached, tuple) and cached[0] == signature:
+        return cached[1]
+
+    sensors = getattr(env.scene, "sensors", {})
+    sensors_by_slot = []
+    for asset_name in object_asset_names:
+        prefix = f"{asset_name}_"
+        sensors_by_slot.append(
+            [
+                sensor
+                for name, sensor in sensors.items()
+                if name.startswith(prefix) and (name.endswith("_contacts") or name.endswith("_robot_contact"))
+            ]
+        )
+    env._so101_object_contact_sensors = (signature, sensors_by_slot)
+    return sensors_by_slot
+
+
+def _apply_object_sensor_gating(env, object_asset_names: list[str], active_by_slot: list[bool]) -> None:
+    """Stop clocking the contact sensors of slots this episode does not use.
+
+    ``InteractiveScene.update`` walks every sensor on every physics substep, and each
+    visit costs a handful of one-element CUDA launches. With two contact sensors per
+    pool object, that walk - not the contacts themselves - is the single largest
+    per-step cost of a big task JSONL. Parked slots sit 20 m off the table with
+    nothing to touch, so their sensors get a no-op ``update`` until the slot is used
+    again. Shadowing the method on the sensor instance leaves ``scene.sensors``
+    itself untouched, so lookups, ``keys()``/``values()`` pairing, and
+    ``scene.reset`` all behave exactly as before.
+    """
+
+    gating_enabled = _pool_gating_enabled()
+    for object_id, sensors in enumerate(_object_contact_sensors(env, object_asset_names)):
+        enabled = not gating_enabled or (object_id < len(active_by_slot) and active_by_slot[object_id])
+        for sensor in sensors:
+            if enabled:
+                if sensor.__dict__.pop("update", None) is not None and sensor.is_initialized:
+                    # Its clock stopped while parked; force a recompute on next read.
+                    sensor.reset()
+            elif "update" not in sensor.__dict__:
+                sensor.__dict__["update"] = _skip_sensor_update
 
 
 def _ensure_robot_start_buffers(env) -> None:
@@ -1276,5 +1381,13 @@ def reset_benchmark_scene(
             "direction": direction if selected_task == TASK_MOVE else None,
             "metadata": dict(episode_spec.get("metadata", {})) if episode_spec is not None else {},
         }
+
+    # Sensors are shared across envs, so a slot's sensors stay live if any env uses it.
+    env._so101_live_object_slots = None
+    _apply_object_sensor_gating(
+        env,
+        object_asset_names,
+        slots_live_in_any_env(env, num_objects) or [True] * num_objects,
+    )
 
     env.so101_bench_instruction = env._so101_instruction_text[0]

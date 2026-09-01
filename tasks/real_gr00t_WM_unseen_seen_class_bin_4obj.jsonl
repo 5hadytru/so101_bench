@@ -1,4 +1,0 @@
-{"objects": ["blue tape", "blue pen", "blue screwdriver", "pink bowl"], "ood_key": "unseen_seen_class", "trial_id": 0, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["blue tape", "white bowl", "orange toy car", "red pen"], "ood_key": "unseen_seen_class", "trial_id": 1, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["orange toy car", "white glasses", "white bowl", "blue tape"], "ood_key": "unseen_seen_class", "trial_id": 2, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["blue pen", "pink bowl", "white glasses", "orange toy car"], "ood_key": "unseen_seen_class", "trial_id": 3, "n_objects": 4, "instruction": "Place each object in the plastic bin"}

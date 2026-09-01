@@ -1,1 +1,0 @@
-{"objects": ["blue tape", "blue clip", "yellow tape", "pink bowl"], "ood_key": "unseen_seen_class", "trial_id": 4, "n_objects": 4, "instruction": "Move the blue tape forwards", "target": "blue tape"}

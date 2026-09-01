@@ -1,9 +1,0 @@
-{"objects": ["yellow wires"], "ood_key": "seen", "trial_id": 0, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires"], "ood_key": "seen", "trial_id": 1, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires"], "ood_key": "seen", "trial_id": 2, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires"], "ood_key": "seen", "trial_id": 3, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires"], "ood_key": "seen", "trial_id": 4, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
-{"objects": ["grey toy car", "yellow wires", "blue bowl", "blue scissors"], "ood_key": "seen", "trial_id": 5, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["red tape", "yellow wires", "cardboard box", "black tape"], "ood_key": "seen", "trial_id": 6, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires", "yellow screwdriver", "black screwdriver", "grey wires"], "ood_key": "seen", "trial_id": 7, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
-{"objects": ["yellow wires", "flower pot", "cooking spoon", "yellow toy car"], "ood_key": "seen", "trial_id": 8, "n_objects": 4, "instruction": "Place each object in the plastic bin"}

@@ -1,2 +1,0 @@
-{"objects":["white pen","black pen","red tape","blue scissors"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the white pen next to the blue scissors","target":"white pen","referents":["blue scissors"]}
-{"objects":["white pen","black screwdriver","altoids container","black tape"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place the pen next to the black tape","target":"white pen","referents":["black tape"]}

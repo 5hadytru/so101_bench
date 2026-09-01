@@ -1,4 +1,0 @@
-{"objects": ["cooking spoon", "flower pot", "cardboard box", "yellow toy car"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the cardboard box left", "target": "cardboard box", "direction": "left"}
-{"objects": ["flower pot", "red tape", "cardboard box", "black tape"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the cardboard box right", "target": "cardboard box", "direction": "right"}
-{"objects": ["blue scissors", "grey toy car", "cardboard box", "blue bowl"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the cardboard box forwards", "target": "cardboard box", "direction": "forward"}
-{"objects": ["black screwdriver", "cardboard box", "grey wires", "yellow screwdriver"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the cardboard box backwards", "target": "cardboard box", "direction": "backward"}

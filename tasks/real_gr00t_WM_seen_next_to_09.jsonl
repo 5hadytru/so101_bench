@@ -1,5 +1,0 @@
-{"objects":["pink eraser","altoids container","black screwdriver","yellow toy car"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the eraser next to the toy car","target":"pink eraser","referents":["yellow toy car"]}
-{"objects":["black screwdriver","green clip","blue bowl","yellow toy car"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place the screwdriver next to the bowl","target":"black screwdriver","referents":["blue bowl"]}
-{"objects":["yellow screwdriver","silver glasses","blue bowl","altoids container"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place the screwdriver next to the glasses","target":"yellow screwdriver","referents":["silver glasses"]}
-{"objects":["black tape","white pen","cooking spoon","pink eraser"],"ood_key":"seen","trial_id":3,"n_objects":4,"instruction":"Place the tape next to the white pen","target":"black tape","referents":["white pen"]}
-{"objects":["flower pot","pink eraser","cooking spoon","yellow screwdriver"],"ood_key":"seen","trial_id":4,"n_objects":4,"instruction":"Place the flower pot next to the yellow screwdriver","target":"flower pot","referents":["yellow screwdriver"]}

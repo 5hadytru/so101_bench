@@ -1,1 +1,0 @@
-{"objects":["blue scissors","black screwdriver","pink eraser","blue pliers"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the scissors next to the pink eraser","target":"blue scissors","referents":["pink eraser"]}

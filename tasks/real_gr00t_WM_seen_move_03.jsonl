@@ -1,3 +1,0 @@
-{"objects":["black tape","cooking spoon","green clip","blue scissors"],"ood_key":"seen","trial_id":9,"n_objects":4,"instruction":"Move the tape backwards","target":"black tape"}
-{"objects":["flower pot","yellow toy car","black screwdriver","blue bowl"],"ood_key":"seen","trial_id":10,"n_objects":4,"instruction":"Move the flower pot forwards","target":"flower pot"}
-{"objects":["yellow toy car","yellow screwdriver","black pen","green clip"],"ood_key":"seen","trial_id":12,"n_objects":4,"instruction":"Move the yellow toy car right","target":"yellow toy car"}

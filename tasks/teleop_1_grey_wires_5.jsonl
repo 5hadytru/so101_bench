@@ -1,4 +1,0 @@
-{"objects": ["red tape", "yellow screwdriver", "grey wires", "black tape"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the wires left", "target": "grey wires", "direction": "left"}
-{"objects": ["grey toy car", "blue bowl", "blue scissors", "grey wires"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the wires right", "target": "grey wires", "direction": "right"}
-{"objects": ["yellow toy car", "grey toy car", "grey wires", "blue bowl"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the grey wires forwards", "target": "grey wires", "direction": "forward"}
-{"objects": ["grey wires", "blue pliers", "altoids container", "green clip"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the grey wires backwards", "target": "grey wires", "direction": "backward"}

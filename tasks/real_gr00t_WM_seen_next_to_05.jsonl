@@ -1,4 +1,0 @@
-{"objects":["black tape","yellow toy car","black screwdriver","silver glasses"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the tape next to the yellow toy car","target":"black tape","referents":["yellow toy car"]}
-{"objects":["yellow toy car","yellow screwdriver","grey toy car","blue scissors"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place the yellow toy car next to the grey toy car","target":"yellow toy car","referents":["grey toy car"]}
-{"objects":["yellow toy car","cooking spoon","black tape","red tape"],"ood_key":"seen","trial_id":3,"n_objects":4,"instruction":"Place the toy car next to the red tape","target":"yellow toy car","referents":["red tape"]}
-{"objects":["grey toy car","yellow toy car","pink eraser","white pen"],"ood_key":"seen","trial_id":4,"n_objects":4,"instruction":"Place the grey toy car next to the pink eraser","target":"grey toy car","referents":["pink eraser"]}

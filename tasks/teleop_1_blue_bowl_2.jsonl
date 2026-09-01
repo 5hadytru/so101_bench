@@ -1,3 +1,0 @@
-{"objects": ["grey toy car", "altoids container", "blue bowl", "yellow toy car"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Place the blue bowl next to the altoids container", "target": "blue bowl", "referents": ["altoids container"]}
-{"objects": ["pink eraser", "blue bowl", "green clip", "blue pliers"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Place the bowl next to the pliers", "target": "blue bowl", "referents": ["blue pliers"]}
-{"objects": ["blue bowl", "green clip", "pink eraser", "yellow wires"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Place the bowl next to the green clip", "target": "blue bowl", "referents": ["green clip"]}

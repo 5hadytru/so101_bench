@@ -1,4 +1,0 @@
-{"objects":["black pen","white pen","altoids container","blue scissors"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the black pen next to the white pen","target":"black pen","referents":["white pen"]}
-{"objects":["black pen","black tape","white pen","black screwdriver"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place the black pen next to the screwdriver","target":"black pen","referents":["black screwdriver"]}
-{"objects":["blue pliers","blue bowl","flower pot","yellow toy car"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place the blue pliers next to the toy car","target":"blue pliers","referents":["yellow toy car"]}
-{"objects":["blue pliers","black screwdriver","blue bowl","black pen"],"ood_key":"seen","trial_id":3,"n_objects":4,"instruction":"Place the pliers next to the black pen","target":"blue pliers","referents":["black pen"]}

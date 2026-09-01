@@ -1,3 +1,0 @@
-{"objects":["black pen","yellow screwdriver","green clip","silver glasses"],"ood_key":"seen","trial_id":0,"n_objects":4,"instruction":"Place the pen next to the glasses","target":"black pen","referents":["silver glasses"]}
-{"objects":["blue pliers","cooking spoon","black tape","silver glasses"],"ood_key":"seen","trial_id":1,"n_objects":4,"instruction":"Place the pliers next to the cooking spoon","target":"blue pliers","referents":["cooking spoon"]}
-{"objects":["blue pliers","black pen","yellow toy car","pink eraser"],"ood_key":"seen","trial_id":2,"n_objects":4,"instruction":"Place the pliers next to the black pen","target":"blue pliers","referents":["black pen"]}

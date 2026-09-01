@@ -1,4 +1,0 @@
-{"objects": ["blue bowl", "black pen", "blue pliers", "altoids container"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Move the bowl left", "target": "blue bowl", "direction": "left"}
-{"objects": ["blue pliers", "blue bowl", "altoids container", "green clip"], "ood_key": "seen", "trial_id": 1, "n_objects": 4, "instruction": "Move the blue bowl right", "target": "blue bowl", "direction": "right"}
-{"objects": ["black pen", "blue bowl", "white pen", "silver glasses"], "ood_key": "seen", "trial_id": 2, "n_objects": 4, "instruction": "Move the blue bowl forwards", "target": "blue bowl", "direction": "forward"}
-{"objects": ["blue bowl", "silver glasses", "blue scissors", "grey toy car"], "ood_key": "seen", "trial_id": 3, "n_objects": 4, "instruction": "Move the bowl backwards", "target": "blue bowl", "direction": "backward"}

@@ -1,0 +1,28 @@
+{
+  "boxes": [
+    [
+      -0.03,
+      -0.019,
+      0.031,
+      0.02
+    ],
+    [
+      -0.029,
+      -0.02,
+      0.03,
+      -0.019
+    ],
+    [
+      -0.029,
+      0.02,
+      0.03,
+      0.021
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/physics/Mesh_007"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "green_juice_box.usdc"
+}

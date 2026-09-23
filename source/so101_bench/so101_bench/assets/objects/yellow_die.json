@@ -1,0 +1,16 @@
+{
+  "boxes": [
+    [
+      -0.006,
+      -0.006,
+      0.007,
+      0.007
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/Sketchfab_model/_6_edges_fbx/RootNode/Layer_1/physics/Layer_1_6_edges_mtl0_0_001"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "yellow_die.usdc"
+}

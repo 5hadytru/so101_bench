@@ -1,0 +1,28 @@
+{
+  "boxes": [
+    [
+      -0.022,
+      -0.101,
+      0.023,
+      0.097
+    ],
+    [
+      -0.022,
+      0.097,
+      0.022,
+      0.098
+    ],
+    [
+      -0.019,
+      -0.102,
+      0.023,
+      -0.101
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/physics/node_0_010"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "black_remote.usdc"
+}

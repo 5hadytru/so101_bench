@@ -1,0 +1,22 @@
+{
+  "boxes": [
+    [
+      -0.05,
+      -0.014,
+      0.052,
+      0.016
+    ],
+    [
+      -0.022,
+      0.016,
+      0.026,
+      0.017
+    ]
+  ],
+  "physics_mesh_paths": [
+    "/root/physics/node_0_004"
+  ],
+  "raster_resolution_m": 0.001,
+  "schema_version": 1,
+  "source_usd": "blue_harmonica.usdc"
+}

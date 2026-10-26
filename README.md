@@ -1,5 +1,7 @@
 # SO-101 Bench: Accessible Spatial Manipulation
 
+![SO-101 Bench](media/so101_bench_summary.png)
+
 A simulated benchmark for language-conditioned spatial manipulation with the low-cost
 [SO-101](https://github.com/TheRobotStudio/SO-ARM100) arm, built on an Isaac Lab digital twin of a real
 SO-101 setup. Four tasks (bin, next to, between, directional move), 138 objects in three generalization

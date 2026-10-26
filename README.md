@@ -7,9 +7,9 @@ A simulated benchmark for language-conditioned spatial manipulation with the low
 SO-101 setup. Four tasks (bin, next to, between, directional move), 138 objects in three generalization
 splits, and policy rankings that hold on the real robot.
 
-[Project page](https://so101-bench.sharpgoby19.chatgpt.site) ·
-[Paper](https://so101-bench.sharpgoby19.chatgpt.site) ·
-[Live leaderboard](https://so101-bench.sharpgoby19.chatgpt.site/leaderboard/) ·
+[Project page](https://so101-bench.github.io) ·
+[Paper](https://so101-bench.github.io) ·
+[Live leaderboard](https://so101-bench.github.io/leaderboard/) ·
 [Sim demos](https://huggingface.co/datasets/5hadytru/so101_bench_sim) ·
 [Real demos](https://huggingface.co/datasets/5hadytru/so101_bench_real) ·
 [Assets](https://huggingface.co/datasets/5hadytru/so101_bench_assets) ·
@@ -78,7 +78,7 @@ python scripts/score_eval.py --tasks tasks/val_set.jsonl --log outputs/val_eval.
 Leaderboard scores come from the primary evaluation: 916 episodes over the same tasks and splits,
 including held-out unseen-class objects, backgrounds and robot colours that are not released, so the
 test set stays clean. To submit, send your checkpoint and policy server (or an endpoint) to
-hickoktruman@gmail.com; results appear on the [live leaderboard](https://so101-bench.sharpgoby19.chatgpt.site/leaderboard/).
+hickoktruman@gmail.com; results appear on the [live leaderboard](https://so101-bench.github.io/leaderboard/).
 
 ## Repository
 

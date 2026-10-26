@@ -46,12 +46,12 @@ parser.add_argument(
 )
 parser.add_argument("--policy_host", type=str, default="localhost", help="GR00T policy server host.")
 parser.add_argument("--policy_port", type=int, default=5555, help="GR00T policy server port.")
-parser.add_argument("--action_horizon", type=int, default=8, help="Action steps to execute per server query.")
+parser.add_argument("--action_horizon", type=int, default=16, help="Action steps to execute per server query.")
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
     default=1.5,
-    help="Seconds to hold the initial joint pose before recording overhead_init and querying GR00T.",
+    help="Seconds to hold the initial joint pose before recording overhead_init/wrist_init and querying GR00T.",
 )
 parser.add_argument(
     "--hold_init",
@@ -124,9 +124,9 @@ parser.add_argument(
     type=str,
     default=None,
     help=(
-        "JSON map from sim camera names to policy names. By default the sim wrist camera is sent as "
-        '\'front\' to match the SO100/SO101 real-robot GR00T scripts. Example: '
-        '\'{"wrist":"ego","overhead":"external"}\'.'
+        "JSON map from sim camera names to policy names. The default keeps the sim names wrist/overhead. "
+        "Legacy checkpoints that expect front can use: "
+        '\'{"wrist":"front"}\'.'
     ),
 )
 parser.add_argument(
@@ -152,6 +152,30 @@ parser.add_argument(
     type=str,
     default="overhead",
     help="Sim camera name to capture for the fixed overhead-init frame.",
+)
+parser.add_argument(
+    "--use_wrist_init",
+    nargs="?",
+    const=True,
+    default=True,
+    type=_str_to_bool,
+    help=(
+        "Send the settled wrist frame captured when robot control starts as video.wrist_init on every "
+        "GR00T request. "
+        "Accepts either '--use_wrist_init' or '--use_wrist_init true'."
+    ),
+)
+parser.add_argument(
+    "--wrist_init_key",
+    type=str,
+    default="wrist_init",
+    help="Policy video key for the fixed settled wrist frame used by WM-conditioned checkpoints.",
+)
+parser.add_argument(
+    "--wrist_init_camera",
+    type=str,
+    default="wrist",
+    help="Sim camera name to capture for the fixed wrist-init frame.",
 )
 parser.add_argument(
     "--policy_image_width",
@@ -704,6 +728,8 @@ def _save_camera_snapshot(
 
     if policy.use_overhead_init and policy.overhead_init_image is not None:
         saved_paths.append(_write_image(snapshot_dir / policy.overhead_init_key, policy.overhead_init_image))
+    if policy.use_wrist_init and policy.wrist_init_image is not None:
+        saved_paths.append(_write_image(snapshot_dir / policy.wrist_init_key, policy.wrist_init_image))
 
     if saved_paths:
         saved = ", ".join(str(path) for path in saved_paths)
@@ -720,7 +746,7 @@ def _instruction(env, override: str | None) -> str:
 
 
 def _rename_map(raw_map: str | None) -> dict[str, str]:
-    rename_map = {"wrist": "front", "overhead": "overhead"}
+    rename_map = {"wrist": "wrist", "overhead": "overhead"}
     if raw_map:
         rename_map.update(json.loads(raw_map))
     return rename_map
@@ -1056,6 +1082,9 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
 
 def main():
     episode_specs = load_episode_jsonl(args_cli.episodes_jsonl)
+    from so101_bench.benchmark import episode_is_executable
+    from primary_eval_exclusions import primary_episode_excluded
+    episode_specs = [episode for episode in episode_specs if episode_is_executable(episode) and not primary_episode_excluded(episode)]
     requested_count = len(episode_specs) if args_cli.num_episodes is None else args_cli.num_episodes
     planned_count = 1 if args_cli.inspect_initial_scene else requested_count
     if planned_count < 1:
@@ -1223,6 +1252,11 @@ def main():
             "[INFO]: WM overhead-init enabled: "
             f"rgb_{args_cli.overhead_init_camera} -> video.{args_cli.overhead_init_key}"
         )
+    if args_cli.use_wrist_init:
+        print(
+            "[INFO]: WM wrist-init enabled: "
+            f"rgb_{args_cli.wrist_init_camera} -> video.{args_cli.wrist_init_key}"
+        )
     image_size = (
         (args_cli.policy_image_width, args_cli.policy_image_height)
         if args_cli.policy_image_width > 0 and args_cli.policy_image_height > 0
@@ -1243,6 +1277,9 @@ def main():
         use_overhead_init=args_cli.use_overhead_init,
         overhead_init_camera=args_cli.overhead_init_camera,
         overhead_init_key=args_cli.overhead_init_key,
+        use_wrist_init=args_cli.use_wrist_init,
+        wrist_init_camera=args_cli.wrist_init_camera,
+        wrist_init_key=args_cli.wrist_init_key,
         image_size=image_size,
         timing_callback=profiler.record if profiler is not None else None,
         counter_callback=profiler.increment if profiler is not None else None,
@@ -1502,12 +1539,18 @@ def main():
                 f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
                 f"reason={end_reason}, length={episode_duration_s:.2f}s"
             )
+            # Use the terminal snapshot: env.step() has already auto-reset the scene.
+            diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
+            postmortem = diagnostics[0] if diagnostics else None
+            bin_progress = postmortem.bin_progress if postmortem is not None else None
+            if bin_progress is not None:
+                message += f", objects_in_bin={bin_progress[0]}/{bin_progress[1]}"
+            if postmortem is not None:
+                message += postmortem.task_distance_log
             if not is_success:
                 # Read the classification stored by benchmark_failure on the terminating
                 # step: the env auto-resets inside env.step() and zeros the lift buffer,
                 # so recomputing here would always see a cleared episode.
-                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
-                postmortem = diagnostics[0] if diagnostics else None
                 if postmortem is not None and postmortem.failure_type != POSTMORTEM_NOT_APPLICABLE:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     threshold_in = postmortem.lift_threshold_m / INCH
@@ -1523,9 +1566,6 @@ def main():
                 elif postmortem is not None:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     message += f", live_failure_reason={live_failure_reason}"
-            else:
-                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
-                postmortem = diagnostics[0] if diagnostics else None
             # Emit the already-computed outcome before finalizing video. A
             # recorder/encoder shutdown must not erase the episode result from
             # the log after the environment has definitively ended the episode.
@@ -1539,6 +1579,9 @@ def main():
                         "success": is_success,
                         "termination_reason": end_reason,
                         "episode_length_s": episode_duration_s,
+                        "objects_in_bin": bin_progress[0] if bin_progress is not None else None,
+                        "bin_object_count": bin_progress[1] if bin_progress is not None else None,
+                        "task_distances": postmortem.task_distances if postmortem is not None else None,
                         "live_failure_reason": live_failure_reason,
                         "episode_spec": spec.reset_payload(),
                         "postmortem": asdict(postmortem) if postmortem is not None else None,

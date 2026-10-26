@@ -59,48 +59,37 @@ SO101_CFG = ArticulationCfg(
         pos=(0.05209, 0.18061, -0.03102),
         rot=euler_angles_to_quat(np.array([0.0, 0.0, 6.195]), degrees=True),
     ),
+    # One actuator group with per-joint gains. PhysX receives exactly the same drive
+    # parameters as six single-joint groups would, but Isaac Lab's per-substep
+    # ``_apply_actuator_model`` loop runs once instead of six times.
     actuators={
-        "rotation": ImplicitActuatorCfg(
-            joint_names_expr=["Rotation"],
-            effort_limit_sim=30.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Rotation"],
-            stiffness=55.0,
-            damping=0.7,
-        ),
-        "pitch": ImplicitActuatorCfg(
-            joint_names_expr=["Pitch"],
-            effort_limit_sim=30.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Pitch"],
-            stiffness=30.0,
-            damping=0.8,
-        ),
-        "elbow": ImplicitActuatorCfg(
-            joint_names_expr=["Elbow"],
-            effort_limit_sim=30.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Elbow"],
-            stiffness=25.0,
-            damping=0.7,
-        ),
-        "wrist_pitch": ImplicitActuatorCfg(
-            joint_names_expr=["Wrist_Pitch"],
-            effort_limit_sim=30.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Wrist_Pitch"],
-            stiffness=12.0,
-            damping=0.5,
-        ),
-        "wrist_roll": ImplicitActuatorCfg(
-            joint_names_expr=["Wrist_Roll"],
-            effort_limit_sim=30.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Wrist_Roll"],
-            stiffness=7.0,
-            damping=0.5,
-        ),
-        "gripper": ImplicitActuatorCfg(
-            joint_names_expr=["Jaw"],
-            effort_limit_sim=15.0,
-            velocity_limit_sim=SO101_VELOCITY_LIMITS_SIM["Jaw"],
-            stiffness=2.0,
-            damping=0.3,
+        "arm": ImplicitActuatorCfg(
+            joint_names_expr=["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw"],
+            effort_limit_sim={
+                "Rotation": 30.0,
+                "Pitch": 30.0,
+                "Elbow": 30.0,
+                "Wrist_Pitch": 30.0,
+                "Wrist_Roll": 30.0,
+                "Jaw": 15.0,
+            },
+            velocity_limit_sim=dict(SO101_VELOCITY_LIMITS_SIM),
+            stiffness={
+                "Rotation": 55.0,
+                "Pitch": 30.0,
+                "Elbow": 25.0,
+                "Wrist_Pitch": 12.0,
+                "Wrist_Roll": 7.0,
+                "Jaw": 2.0,
+            },
+            damping={
+                "Rotation": 0.7,
+                "Pitch": 0.8,
+                "Elbow": 0.7,
+                "Wrist_Pitch": 0.5,
+                "Wrist_Roll": 0.5,
+                "Jaw": 0.3,
+            },
         ),
     },
 )

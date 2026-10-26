@@ -103,6 +103,7 @@ def test_remote_policy_profiles_query_and_cached_actions():
         cameras={},
         action_horizon=2,
         use_overhead_init=False,
+        use_wrist_init=False,
         timing_callback=lambda name, _value: timing_names.append(name),
         counter_callback=lambda name, value: counters.update({name: value}),
     )
@@ -122,3 +123,30 @@ def test_remote_policy_profiles_query_and_cached_actions():
     assert "policy.server.handler_reported" in timing_names
     assert "policy.action.decode_chunk" in timing_names
     assert timing_names.count("policy.get_action.total") == 2
+
+
+def test_remote_policy_sends_both_initial_camera_frames():
+    policy = GR00TRemotePolicy(
+        device="cpu",
+        cameras={"wrist": {}, "overhead": {}},
+        use_overhead_init=True,
+        use_wrist_init=True,
+        image_size=None,
+    )
+    visual_obs = {
+        "rgb_wrist": np.full((1, 4, 5, 3), 17, dtype=np.uint8),
+        "rgb_overhead": np.full((1, 4, 5, 3), 29, dtype=np.uint8),
+    }
+
+    policy.set_episode_initial_observation(visual_obs)
+    inputs = policy._sim_obs_to_groot_inputs(torch.zeros(6), visual_obs)
+
+    assert set(inputs["video"]) == {"wrist", "overhead", "wrist_init", "overhead_init"}
+    assert inputs["video"]["wrist_init"].shape == (1, 1, 4, 5, 3)
+    assert inputs["video"]["overhead_init"].shape == (1, 1, 4, 5, 3)
+    assert np.all(inputs["video"]["wrist_init"] == 17)
+    assert np.all(inputs["video"]["overhead_init"] == 29)
+
+    policy.reset(reset_remote=False)
+    assert policy.wrist_init_image is None
+    assert policy.overhead_init_image is None

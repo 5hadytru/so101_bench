@@ -1,0 +1,36 @@
+diff --git a/experiments/launch_scripts/data_mixtures.py b/experiments/launch_scripts/data_mixtures.py
+index bb1fd2f..8e7372f 100644
+--- a/experiments/launch_scripts/data_mixtures.py
++++ b/experiments/launch_scripts/data_mixtures.py
+@@ -397,3 +397,31 @@ MOLMOACT2_LEROBOT_MIXTURES: Dict[str, MixtureBuilder] = {
+     "yam": build_molmoact2_yam,
+     "so100_so101": build_molmoact2_so100_so101,
+ }
++
++
++# --- so101_bench: SO-101 Bench sim_WM fine-tune -------------------------------------------
++# Joint values are pre-converted into the released SO-100/101 frame
++# (so101_bench scripts/MolmoAct2_fine_tuning/pod/make_molmoframe_dataset.py), so the setup
++# and control text match the allenai/MolmoAct2-SO100_101 checkpoint this run starts from.
++def build_molmoact2_so101_bench_sim_wm() -> Tuple[List[RawMixtureEntry], Dict[str, Dict[str, object]]]:
++    return build_single_lerobot_mixture(
++        name="so101_bench_sim_wm",
++        tag="so101_bench_sim_wm",
++        repo_ids=["5hadytru/so101_bench_sim_WM_molmoframe"],
++        action_key="action",
++        state_keys=["observation.state"],
++        camera_keys=[
++            "observation.images.overhead",
++            "observation.images.wrist",
++            "observation.images.overhead_init",
++            "observation.images.wrist_init",
++        ],
++        normalize_gripper=True,
++        setup_type="single so100/so101 robotic arm in molmoact2",
++        control_mode="absolute joint pose",
++        action_horizon=30,
++        n_action_steps=30,
++    )
++
++
++MOLMOACT2_LEROBOT_MIXTURES["so101_bench_sim_wm"] = build_molmoact2_so101_bench_sim_wm

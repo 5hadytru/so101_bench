@@ -1,0 +1,5 @@
+51d4c89f72fda44cbf77285c6a8114b52676b8a1
+https://github.com/NVIDIA/Isaac-GR00T
+Python 3.12.3
+NVIDIA A100-SXM4-80GB, 580.126.20
+torch 2.9.0+cu128 cuda 12.8 transformers 4.57.3 deepspeed 0.17.6

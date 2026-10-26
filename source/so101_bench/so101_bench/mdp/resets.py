@@ -21,6 +21,7 @@ from isaaclab.sim import get_current_stage
 from isaaclab.sim.views import XformPrimView
 
 from so101_bench import assets
+from so101_bench.robust_visuals import ROBUST_ROBOT_COLORS
 from so101_bench.benchmark import (
     DIRECTIONS,
     MAX_GRASP_ATTEMPTS,
@@ -217,6 +218,42 @@ def benchmark_object_yaws(env, object_asset_names: list[str]) -> torch.Tensor:
         else:
             yaws.append(_quat_yaw(asset.data.root_quat_w))
     return torch.stack(yaws, dim=1)
+
+
+def benchmark_object_quats(env, object_asset_names: list[str]) -> torch.Tensor:
+    """World orientation (wxyz) of every object slot, like ``benchmark_object_yaws``; NaN for
+    deformable and parked slots, whose orientation is not a rigid pose."""
+
+    quats = []
+    multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
+    live = slots_live_in_any_env(env, len(object_asset_names))
+    nan = torch.full((env.num_envs, 4), float("nan"), device=env.device)
+    for object_id, name in enumerate(object_asset_names):
+        if live is not None and not live[object_id]:
+            quats.append(nan)
+            continue
+        asset = env.scene[name]
+        if isinstance(asset, XformPrimView):
+            views = multi_info.get(name)
+            if views:
+                view_info = views[0]
+                transforms = view_info["view"].get_transforms()
+                if not isinstance(transforms, torch.Tensor):
+                    transforms = torch.as_tensor(transforms)
+                transforms = transforms.to(env.device)
+                child_quat_wxyz = math_utils.convert_quat(transforms[..., 3:7], to="wxyz")
+                local_quat_inv = math_utils.quat_inv(view_info["local_quat"].to(env.device).expand_as(child_quat_wxyz))
+                quats.append(math_utils.quat_mul(child_quat_wxyz, local_quat_inv))
+            else:
+                quat = asset.get_world_poses()[1]
+                if not isinstance(quat, torch.Tensor):
+                    quat = torch.as_tensor(quat)
+                quats.append(quat.to(env.device, dtype=torch.float32))
+        elif isinstance(asset, DeformableObject):
+            quats.append(nan)
+        else:
+            quats.append(asset.data.root_quat_w.to(dtype=torch.float32))
+    return torch.stack(quats, dim=1)
 
 
 def _quat_yaw(quat_wxyz: torch.Tensor) -> torch.Tensor:
@@ -595,6 +632,47 @@ def _apply_object_sensor_gating(env, object_asset_names: list[str], active_by_sl
                 sensor.__dict__["update"] = _skip_sensor_update
 
 
+def _lean_rigid_object_write(asset: RigidObject):
+    """``RigidObject.write_data_to_sim`` minus the no-op wrench reset.
+
+    Isaac Lab zeroes the instantaneous wrench buffers of every rigid body on every
+    physics substep, even when no force was ever applied. With a pre-spawned pool
+    that is hundreds of GPU memset launches per control step. When neither composer
+    is active and the instantaneous one is already in its post-reset state, the
+    original method has no effect on the simulation, so it is skipped.
+    """
+
+    original = type(asset).write_data_to_sim.__get__(asset)
+
+    def write_data_to_sim() -> None:
+        instantaneous = asset._instantaneous_wrench_composer
+        if (
+            instantaneous.active
+            or asset._permanent_wrench_composer.active
+            or getattr(instantaneous, "_link_poses_updated", True)
+        ):
+            original()
+
+    return write_data_to_sim
+
+
+def _install_lean_rigid_object_writes(env) -> None:
+    """Shadow ``write_data_to_sim`` on each scene rigid object once (instance-level only)."""
+
+    if getattr(env, "_so101_lean_rigid_writes_installed", False):
+        return
+    if _pool_gating_enabled():
+        for asset in getattr(env.scene, "rigid_objects", {}).values():
+            if (
+                isinstance(asset, RigidObject)
+                and "write_data_to_sim" not in asset.__dict__
+                and hasattr(asset, "_instantaneous_wrench_composer")
+                and hasattr(asset, "_permanent_wrench_composer")
+            ):
+                asset.__dict__["write_data_to_sim"] = _lean_rigid_object_write(asset)
+    env._so101_lean_rigid_writes_installed = True
+
+
 def _ensure_robot_start_buffers(env) -> None:
     if not hasattr(env, "_so101_robot_started_moving"):
         env._so101_robot_started_moving = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -659,7 +737,8 @@ def randomize_robot_color(
 
     if color_names is None:
         color_names = list(ROBOT_COLORS.keys())
-    color = ROBOT_COLORS[random.choice(color_names)]
+    # Holdout colors are available only by explicit name; defaults remain training-only.
+    color = {**ROBOT_COLORS, **ROBUST_ROBOT_COLORS}[random.choice(color_names)]
 
     with Sdf.ChangeBlock():
         robot = env.scene["robot"]
@@ -1647,6 +1726,8 @@ def reset_benchmark_scene(
             "metadata": dict(episode_spec.get("metadata", {})) if episode_spec is not None else {},
             "domain_randomization": resolved_domain_randomization.to_json(),
         }
+
+    _install_lean_rigid_object_writes(env)
 
     # Sensors are shared across envs, so a slot's sensors stay live if any env uses it.
     env._so101_live_object_slots = None

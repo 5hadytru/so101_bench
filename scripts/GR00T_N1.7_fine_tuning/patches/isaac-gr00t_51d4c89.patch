@@ -1,0 +1,55 @@
+diff --git a/examples/finetune.sh b/examples/finetune.sh
+index 8c2dd03..1b7027b 100644
+--- a/examples/finetune.sh
++++ b/examples/finetune.sh
+@@ -148,7 +148,7 @@ LAUNCH_CMD=(
+     --num_gpus "$NUM_GPUS"
+     --output_dir "$OUTPUT_DIR"
+     --save_steps "$SAVE_STEPS"
+-    --save_total_limit 5
++    --save_total_limit "${SAVE_TOTAL_LIMIT:-3}"
+     --max_steps "$MAX_STEPS"
+     --warmup_ratio 0.05
+     --weight_decay 1e-5
+diff --git a/gr00t/experiment/experiment.py b/gr00t/experiment/experiment.py
+index a75ecb9..1f7ef43 100755
+--- a/gr00t/experiment/experiment.py
++++ b/gr00t/experiment/experiment.py
+@@ -24,7 +24,7 @@ import warnings
+ from omegaconf import OmegaConf
+ import torch
+ import torch.distributed as dist
+-from transformers import TrainingArguments, set_seed
++from transformers import TrainerCallback, TrainingArguments, set_seed
+ import wandb
+ 
+ from gr00t.configs.base_config import Config
+@@ -35,6 +35,19 @@ from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
+ from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
+ from gr00t.model import MODEL_REGISTRY
+ from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
++class ResumeStepIntervalsCallback(TrainerCallback):
++    """Apply this launch's logging/save/eval intervals when resuming.
++
++    transformers loads trainer_state.json from the resume checkpoint after it computes the
++    step intervals from TrainingArguments, so a resumed run silently keeps the checkpoint's
++    save_steps (e.g. 2000) instead of the requested one (e.g. 500). on_train_begin runs after
++    that load, so re-apply the intervals here.
++    """
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        state.compute_steps(args, state.max_steps)
++
++
+ from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, save_initial_actions
+ 
+ 
+@@ -312,6 +325,8 @@ def run(config: Config):
+         multiprocessing_context=config.data.multiprocessing_context,
+     )
+ 
++    trainer.add_callback(ResumeStepIntervalsCallback())
++
+     trainer.add_callback(
+         CheckpointFormatCallback(
+             run_name=experiment_name,

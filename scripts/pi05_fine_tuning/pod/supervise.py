@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Keep the pi0.5 so101_bench fine-tune running, prune checkpoints, and export for validation.
+
+Loop: preflight (GPUs free, disk, dataset spot-check, newest checkpoint complete + fully
+readable) -> launch run_train.sh (fresh, or RESUME=1 from checkpoints/last) -> watch the
+log -> on a crash or a stall, restart with backoff.
+
+LeRobot keeps every checkpoint, so this supervisor prunes: it keeps the newest KEEP
+checkpoints (never the one `last` points at). Every checkpoint whose step is a multiple
+of EXPORT_EVERY (and the final one) is exported in the background to
+export/<RUN_NAME>-stepN: the EMA weights (pretrained_model_ema, else pretrained_model),
+cast to bf16, plus the processor configs/stats, with EXPORT_OK written last. The local
+monitor pulls exports and marks them PULLED; pulled exports beyond EXPORT_KEEP are pruned.
+
+Settings come from supervisor_config.json (re-read before each launch). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+WORK = Path("/workspace/pi05-so101")
+CONFIG = WORK / "supervisor_config.json"
+STATUS = WORK / "status.json"
+LOG = WORK / "supervisor.log"
+EXPORTS = WORK / "export"
+DATASET = Path("/workspace/datasets/lerobot/5hadytru/so101_bench_sim_WM")
+VENV_PY = Path("/root/lerobot-venv/bin/python")
+
+STEP_LINE_RE = re.compile(r"\sstep:(\S+)\s.*loss:")
+SAVED_RE = re.compile(r"Checkpoint policy after step (\d+)")
+STALL_S = 20 * 60
+STARTUP_GRACE_S = 45 * 60
+RESTARTS_PER_6H = 6
+BACKOFF_S = 120
+MIN_FREE_GB = 120
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def record(message: str) -> None:
+    line = f"{now()} {message}"
+    print(line, flush=True)
+    with LOG.open("a") as out:
+        out.write(line + "\n")
+
+
+def load_config() -> dict:
+    cfg = json.loads(CONFIG.read_text())
+    for key in ("RUN_NAME", "STEPS", "SAVE_FREQ"):
+        if key not in cfg:
+            raise KeyError(f"{CONFIG} is missing {key}")
+    return cfg
+
+
+class Status:
+    def __init__(self) -> None:
+        self.data = json.loads(STATUS.read_text()) if STATUS.is_file() else {}
+        self.data.setdefault("restarts", [])
+
+    def update(self, **kwargs) -> None:
+        self.data.update(kwargs, updated_at=now(), supervisor_pid=os.getpid())
+        tmp = STATUS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2))
+        tmp.replace(STATUS)
+
+
+def run_dir(cfg: dict) -> Path:
+    return WORK / "runs" / cfg["RUN_NAME"]
+
+
+def checkpoints(cfg: dict) -> list[tuple[int, Path]]:
+    root = run_dir(cfg) / "checkpoints"
+    found = [(int(p.name), p) for p in root.glob("*") if p.is_dir() and not p.is_symlink() and p.name.isdigit()]
+    return sorted(found, reverse=True)
+
+
+def last_target(cfg: dict) -> Path | None:
+    link = run_dir(cfg) / "checkpoints" / "last"
+    return link.resolve() if link.is_symlink() else None
+
+
+def read_all(path: Path, timeout_s: int = 1800) -> bool:
+    proc = subprocess.run(
+        ["timeout", str(timeout_s), "bash", "-c",
+         f"find {str(path)!r} -type f -print0 | xargs -0 -P 16 -n 8 cat > /dev/null"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        record(f"read check failed for {path}: rc={proc.returncode} {proc.stderr.strip()[-400:]}")
+    return proc.returncode == 0
+
+
+def checkpoint_ok(path: Path) -> bool:
+    pretrained = path / "pretrained_model"
+    required = [pretrained / "config.json", pretrained / "train_config.json"]
+    missing = [str(p.relative_to(path)) for p in required if not p.is_file()]
+    weights = list(pretrained.glob("*.safetensors")) + list(pretrained.glob("*.distcp"))
+    if missing or not weights or not (path / "training_state").is_dir():
+        record(f"checkpoint {path.name} incomplete: missing={missing} weights={len(weights)}")
+        return False
+    return read_all(path)
+
+
+def newest_valid_checkpoint(cfg: dict) -> Path | None:
+    """Verify the checkpoint `last` points at; quarantine it and repoint `last` if unreadable."""
+    while True:
+        target = last_target(cfg)
+        if target is None:
+            return None
+        if checkpoint_ok(target):
+            record(f"checkpoint {target.name} verified readable")
+            return target
+        quarantine = run_dir(cfg) / "_unreadable"
+        quarantine.mkdir(exist_ok=True)
+        dest = quarantine / f"{target.name}_{int(time.time())}"
+        shutil.move(str(target), str(dest))
+        record(f"QUARANTINED unreadable checkpoint {target} -> {dest}")
+        link = run_dir(cfg) / "checkpoints" / "last"
+        link.unlink()
+        remaining = [p for _, p in checkpoints(cfg)]
+        if remaining:
+            link.symlink_to(remaining[0].name)
+            record(f"repointed last -> {remaining[0].name}")
+
+
+def prune_checkpoints(cfg: dict, exporting: Path | None) -> None:
+    keep = int(cfg.get("KEEP", 2))
+    protect = {last_target(cfg), exporting}
+    for _, path in checkpoints(cfg)[keep:]:
+        if path.resolve() in protect or path in protect:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        record(f"pruned checkpoint {path.name}")
+
+
+def gpus_free(wait_s: int = 600) -> bool:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode == 0 and not out.stdout.strip():
+            return True
+        time.sleep(10)
+    return False
+
+
+def free_gb() -> float:
+    return shutil.disk_usage(WORK).free / 1e9
+
+
+def _exports_oldest_first() -> list[Path]:
+    def step_of(path: Path) -> int:
+        m = re.search(r"step(\d+)$", path.name)
+        return int(m.group(1)) if m else -1
+
+    return sorted((p for p in EXPORTS.glob("*-step*") if p.is_dir() and not p.name.endswith(".tmp")), key=step_of)
+
+
+def prune_exports(keep: int, force: bool = False) -> None:
+    exports = _exports_oldest_first()
+    for path in exports[: max(0, len(exports) - keep)]:
+        pulled = (path / "PULLED").is_file()
+        if pulled or force:
+            shutil.rmtree(path, ignore_errors=True)
+            record(f"pruned export {path.name}{'' if pulled else ' (unpulled, forced)'}")
+    for path in _exports_oldest_first()[:-2]:
+        if free_gb() >= MIN_FREE_GB:
+            break
+        shutil.rmtree(path, ignore_errors=True)
+        record(f"pruned export {path.name} (low disk: {free_gb():.0f} GB free)")
+
+
+def dataset_spot_check() -> bool:
+    proc = subprocess.run(
+        [str(VENV_PY), str(WORK / "verify_dataset.py"), "--root", str(DATASET),
+         "--manifest", str(WORK / "dataset_manifest.json"), "--sample", "48", "--parquet"],
+        capture_output=True, text=True, timeout=1800,
+    )
+    ok = proc.returncode == 0 and "DATASET_OK" in proc.stdout
+    record(f"dataset spot-check {'PASS' if ok else 'FAIL'}: {proc.stdout.strip().splitlines()[-1:] or proc.stderr[-300:]}")
+    return ok
+
+
+def preflight(cfg: dict, status: Status) -> tuple[str | None, bool]:
+    """Returns (problem, resume)."""
+    if not VENV_PY.is_file():
+        return f"training venv missing ({VENV_PY}); run bootstrap_after_restart.sh", False
+    if not gpus_free():
+        return "GPU compute processes still running after 10 min", False
+    prune_exports(int(cfg.get("EXPORT_KEEP", 4)))
+    if free_gb() < MIN_FREE_GB:
+        prune_exports(2, force=True)
+    if free_gb() < MIN_FREE_GB:
+        return f"only {free_gb():.0f} GB free on /workspace", False
+    if not dataset_spot_check():
+        return "dataset spot-check failed (see supervisor.log); re-download the bad files from HF", False
+    ckpt = newest_valid_checkpoint(cfg)
+    status.update(resume_from=str(ckpt) if ckpt else None)
+    return None, ckpt is not None
+
+
+class Exporter:
+    def __init__(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.queue: list[Path] = []
+        self.proc: subprocess.Popen | None = None
+        self.current: Path | None = None
+
+    def out_dir(self, ckpt: Path) -> Path:
+        return EXPORTS / f"{self.cfg['RUN_NAME']}-step{int(ckpt.name)}"
+
+    def enqueue(self, ckpt: Path) -> None:
+        if (self.out_dir(ckpt) / "EXPORT_OK").is_file() or ckpt in self.queue:
+            return
+        self.queue.append(ckpt)
+
+    def poll(self) -> None:
+        if self.proc is not None and self.proc.poll() is not None:
+            ok = self.proc.returncode == 0
+            record(f"export {self.current.name}: {'OK' if ok else f'FAILED rc={self.proc.returncode}'}")
+            self.proc, self.current = None, None
+            prune_exports(int(self.cfg.get("EXPORT_KEEP", 4)))
+        if self.proc is None and self.queue:
+            self.current = self.queue.pop(0)
+            if not self.current.is_dir():
+                record(f"export skipped, {self.current} no longer exists")
+                self.current = None
+                return
+            log = (WORK / "logs" / f"export_{self.current.name}.log").open("w")
+            self.proc = subprocess.Popen(
+                [str(VENV_PY), str(WORK / "export_checkpoint.py"), str(self.current), str(self.out_dir(self.current))],
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            record(f"exporting {self.current.name}")
+
+    def busy_with(self) -> Path | None:
+        return self.current
+
+    def drain(self, timeout_s: int = 1800) -> None:
+        deadline = time.monotonic() + timeout_s
+        while (self.proc is not None or self.queue) and time.monotonic() < deadline:
+            self.poll()
+            time.sleep(5)
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=60)
+    subprocess.run(["pkill", "-9", "-s", str(proc.pid)], capture_output=True)
+
+
+def run_attempt(cfg: dict, status: Status, exporter: Exporter, resume: bool) -> tuple[int, str]:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_path = WORK / "logs" / f"train_{stamp}.log"
+    link = WORK / "train.log"
+    link.unlink(missing_ok=True)
+    link.symlink_to(log_path)
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in cfg.items() if k.isupper()})
+    env["OUTPUT_DIR"] = str(run_dir(cfg))
+    env["RESUME"] = "1" if resume else "0"
+    target = int(cfg["STEPS"])
+    export_every = int(cfg.get("EXPORT_EVERY", cfg["SAVE_FREQ"]))
+    if not resume and run_dir(cfg).exists():
+        # A fresh launch with an existing output dir (no valid checkpoint) would be refused.
+        shutil.move(str(run_dir(cfg)), str(run_dir(cfg)) + f"_abandoned_{stamp}")
+    with log_path.open("w") as out:
+        proc = subprocess.Popen([str(WORK / "run_train.sh")], stdout=out, stderr=subprocess.STDOUT,
+                                env=env, start_new_session=True)
+    record(f"LAUNCH pid={proc.pid} resume={resume} log={log_path.name} cfg={json.dumps(cfg, sort_keys=True)}")
+    status.update(state="RUNNING", train_pid=proc.pid, train_log=str(log_path), attempt_started_at=now())
+
+    launched, last_line, position, buffer = time.monotonic(), None, 0, ""
+    step = checkpoints(cfg)[0][0] if checkpoints(cfg) else 0
+    while proc.poll() is None:
+        with log_path.open("r", errors="replace") as source:
+            source.seek(position)
+            chunk = source.read()
+            position = source.tell()
+        lines = (buffer + chunk).split("\n")
+        buffer = lines.pop()
+        for line in lines:
+            if (m := STEP_LINE_RE.search(line)) is not None:
+                last_line = time.monotonic()
+                status.update(step_display=m.group(1), last_step_at=now())
+            if (m := SAVED_RE.search(line)) is not None:
+                step = int(m.group(1))
+                status.update(step=step, target=target, last_checkpoint_step=step, last_checkpoint_at=now())
+        # A save is complete once `last` points at it.
+        target_dir = last_target(cfg)
+        if target_dir is not None and target_dir.name.isdigit():
+            saved = int(target_dir.name)
+            if saved % export_every == 0 or saved >= target:
+                exporter.enqueue(target_dir)
+        exporter.poll()
+        prune_checkpoints(cfg, exporter.busy_with())
+        age = time.monotonic() - (last_line or launched)
+        limit = STALL_S if last_line else STARTUP_GRACE_S
+        if age > limit:
+            reason = f"watchdog: no training log line for {int(age)}s (last saved step {step})"
+            record(reason)
+            kill_tree(proc)
+            return step, reason
+        time.sleep(15)
+    rc = proc.returncode
+    tail = log_path.read_text(errors="replace")[-20000:]
+    saved = [int(m) for m in SAVED_RE.findall(tail)]
+    step = max([step, *saved])
+    if rc != 0:
+        kill_tree(proc)
+        errors = [l for l in tail.splitlines() if "Error" in l or "CRITICAL" in l][-3:]
+        reason = f"exit={rc} at step {step}: {' | '.join(e.strip()[:300] for e in errors)}"
+    else:
+        reason = f"exit=0 at step {step}"
+    record(reason)
+    return step, reason
+
+
+def main() -> int:
+    (WORK / "logs").mkdir(exist_ok=True)
+    EXPORTS.mkdir(exist_ok=True)
+    status = Status()
+    record(f"supervisor start pid={os.getpid()}")
+    last_failure_step = None
+    while True:
+        cfg = load_config()
+        exporter = Exporter(cfg)
+        target = int(cfg["STEPS"])
+        export_every = int(cfg.get("EXPORT_EVERY", cfg["SAVE_FREQ"]))
+        for step_no, path in checkpoints(cfg):
+            if step_no % export_every == 0 or step_no >= target:
+                exporter.enqueue(path)
+        problem, resume = preflight(cfg, status)
+        if problem:
+            record(f"STOP: preflight failed: {problem}")
+            status.update(state="STOPPED", stop_reason=f"preflight: {problem}")
+            return 1
+        step, reason = run_attempt(cfg, status, exporter, resume)
+        status.update(last_exit=reason, last_exit_at=now())
+        if reason.startswith("exit=0") and step >= target:
+            record(f"COMPLETE at step {step}; finishing exports")
+            final = last_target(cfg)
+            if final is not None:
+                exporter.enqueue(final)
+            exporter.drain()
+            status.update(state="COMPLETE", step=step)
+            return 0
+        exporter.drain(timeout_s=900)
+        if last_failure_step is not None and step <= last_failure_step:
+            record(f"STOP: failed again without progress past step {last_failure_step}: {reason}")
+            status.update(state="STOPPED", stop_reason=f"repeat failure without progress: {reason}")
+            return 1
+        last_failure_step = step
+        window = [t for t in status.data["restarts"] if time.time() - t < 6 * 3600]
+        if len(window) >= RESTARTS_PER_6H:
+            record("STOP: restart budget exhausted")
+            status.update(state="STOPPED", stop_reason=f"restart budget exhausted; last: {reason}")
+            return 1
+        window.append(time.time())
+        status.update(state="RESTARTING", restarts=window)
+        record(f"RESTART {len(window)}/{RESTARTS_PER_6H} in 6h after: {reason}; backoff {BACKOFF_S}s")
+        time.sleep(BACKOFF_S)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -62,6 +62,19 @@ class MsgSerializer:
             return obj
         if "__ndarray_class__" in obj:
             return np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
+        # GR00T N1.7 servers encode replies with msgpack_numpy, whose envelope uses
+        # bytes keys: {b"nd": True, b"type", b"kind", b"shape", b"data"} for arrays and
+        # b"nd": False for NumPy scalars. msgpack_numpy is not installed in the Isaac Lab
+        # env, so decode the plain-dtype form here and refuse anything else (object and
+        # structured dtypes would need pickle or a descr).
+        if b"nd" in obj and b"data" in obj and b"type" in obj:
+            kind = obj.get(b"kind", b"")
+            if kind not in (b"", ""):
+                raise ValueError(f"Unsupported msgpack_numpy dtype kind {kind!r} in GR00T reply.")
+            dtype = np.dtype(obj[b"type"])
+            if obj[b"nd"]:
+                return np.frombuffer(obj[b"data"], dtype=dtype).reshape(obj[b"shape"]).copy()
+            return np.frombuffer(obj[b"data"], dtype=dtype)[0]
         return obj
 
     @staticmethod
@@ -152,6 +165,9 @@ class PolicyClient:
 
     def reset(self, options: dict[str, Any] | None = None):
         return self.call_endpoint("reset", {"options": options})
+
+    def get_modality_config(self) -> dict[str, Any]:
+        return self.call_endpoint("get_modality_config", requires_input=False)
 
     def get_action(self, observation: dict) -> tuple[dict, dict]:
         result = self.call_endpoint("get_action", {"observation": observation, "options": None}, requires_input=True)
@@ -259,6 +275,9 @@ class GR00TRemotePolicy:
         use_overhead_init: bool = False,
         overhead_init_camera: str = "overhead",
         overhead_init_key: str = "overhead_init",
+        use_wrist_init: bool = False,
+        wrist_init_camera: str = "wrist",
+        wrist_init_key: str = "wrist_init",
         image_size: tuple[int, int] | None = (640, 480),
         timing_callback: Callable[[str, float], None] | None = None,
         counter_callback: Callable[[str, float], None] | None = None,
@@ -273,10 +292,14 @@ class GR00TRemotePolicy:
         self.use_overhead_init = use_overhead_init
         self.overhead_init_camera = overhead_init_camera
         self.overhead_init_key = overhead_init_key
+        self.use_wrist_init = use_wrist_init
+        self.wrist_init_camera = wrist_init_camera
+        self.wrist_init_key = wrist_init_key
         self.image_size = image_size
         self.timing_callback = timing_callback
         self.counter_callback = counter_callback
         self.overhead_init_image: np.ndarray | None = None
+        self.wrist_init_image: np.ndarray | None = None
         self.action_queue: deque[dict[str, float]] = deque()
         self.client: PolicyClient | None = None
 
@@ -308,12 +331,62 @@ class GR00TRemotePolicy:
         if not self.client.ping():
             raise RuntimeError("Cannot connect to GR00T policy server.")
         print("[INFO]: Policy server connected.")
+        self._check_server_modality_config()
+
+    def _sent_video_keys(self) -> set[str]:
+        keys = {self.rename_map.get(camera, camera) for camera in self.cameras}
+        if self.use_overhead_init:
+            keys.add(self.overhead_init_key)
+        if self.use_wrist_init:
+            keys.add(self.wrist_init_key)
+        return keys
+
+    def _check_server_modality_config(self) -> None:
+        """Fail fast when the checkpoint's modality config disagrees with the observations we send."""
+
+        try:
+            configs = self.client.get_modality_config()
+        except Exception as exc:  # noqa: BLE001 - older servers may not expose the endpoint
+            print(f"[WARN]: Could not read the GR00T server modality config ({exc}); skipping key check.")
+            return
+
+        def keys(modality: str) -> list[str]:
+            config = configs.get(modality, {}) if isinstance(configs, dict) else {}
+            config = config.get("as_json", config) if isinstance(config, dict) else {}
+            return list(config.get("modality_keys") or [])
+
+        expected = {
+            "video": self._sent_video_keys(),
+            "state": {"single_arm", "gripper"},
+            "language": {"annotation.human.task_description"},
+        }
+        problems = []
+        for modality, sent in expected.items():
+            missing = sorted(set(keys(modality)) - sent)
+            if missing:
+                problems.append(f"{modality}: checkpoint expects {missing}, client sends {sorted(sent)}")
+        action_keys = set(keys("action"))
+        if action_keys and not {"single_arm", "gripper"} <= action_keys:
+            problems.append(f"action: checkpoint returns {sorted(action_keys)}, client needs single_arm and gripper")
+        if problems:
+            raise RuntimeError("GR00T checkpoint modality config mismatch:\n  " + "\n  ".join(problems))
+
+        action_config = configs.get("action", {}) if isinstance(configs, dict) else {}
+        action_config = action_config.get("as_json", action_config) if isinstance(action_config, dict) else {}
+        model_horizon = len(action_config.get("delta_indices") or [])
+        if model_horizon and model_horizon < self.action_horizon:
+            print(
+                f"[WARN]: action_horizon={self.action_horizon} exceeds the checkpoint's {model_horizon}-step "
+                f"action chunk; only {model_horizon} actions will be executed per query."
+            )
+        print(f"[INFO]: GR00T modality config matches (video={sorted(set(keys('video')))}).")
 
     def reset(self, initial_visual_obs: dict | None = None, *, reset_remote: bool = True):
         if reset_remote and self.client is not None:
             self.client.reset()
         self.action_queue.clear()
         self.overhead_init_image = None
+        self.wrist_init_image = None
         if initial_visual_obs is not None:
             self.set_episode_initial_observation(initial_visual_obs)
 
@@ -322,14 +395,18 @@ class GR00TRemotePolicy:
         self.action_queue.clear()
 
     def set_episode_initial_observation(self, visual_obs: dict):
-        """Capture the fixed settled overhead-init frame used by WM-conditioned policies."""
+        """Capture the fixed settled camera frames used by WM-conditioned policies."""
 
-        if not self.use_overhead_init:
-            return
-        self.overhead_init_image = self._timed_call(
-            "policy.input.overhead_init_capture",
-            lambda: self._camera_frame(visual_obs, self.overhead_init_camera).copy(),
-        )
+        if self.use_overhead_init:
+            self.overhead_init_image = self._timed_call(
+                "policy.input.overhead_init_capture",
+                lambda: self._camera_frame(visual_obs, self.overhead_init_camera).copy(),
+            )
+        if self.use_wrist_init:
+            self.wrist_init_image = self._timed_call(
+                "policy.input.wrist_init_capture",
+                lambda: self._camera_frame(visual_obs, self.wrist_init_camera).copy(),
+            )
         self.action_queue.clear()
 
     @staticmethod
@@ -464,6 +541,18 @@ class GR00TRemotePolicy:
             model_obs["video"][self.overhead_init_key] = self._timed_call(
                 "policy.input.overhead_init_copy",
                 self.overhead_init_image.copy,
+            )
+
+        if self.use_wrist_init:
+            if self.wrist_init_image is None:
+                raise RuntimeError(
+                    "use_wrist_init=True, but no initial wrist frame has been captured. "
+                    "Call set_episode_initial_observation(obs['visual']) after the episode settle hold "
+                    "and before the first policy query."
+                )
+            model_obs["video"][self.wrist_init_key] = self._timed_call(
+                "policy.input.wrist_init_copy",
+                self.wrist_init_image.copy,
             )
 
         model_obs = self._timed_call("policy.input.batch_dimensions", self._add_batch_time_dims, model_obs)

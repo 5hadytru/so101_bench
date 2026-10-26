@@ -1582,6 +1582,47 @@ def task_success(
     return confirmed_success
 
 
+def log_episode_task_metrics(
+    env: ManagerBasedRLEnv, env_ids: torch.Tensor | list[int] | None = None
+) -> None:
+    """Reset event: print cached terminal measurements without rescoring geometry.
+
+    This runs only at reset, before other reset events alter the scene. Repeated
+    resets of the same terminal snapshot are silent; manual nonterminal resets
+    and initial setup are also silent.
+    """
+    manager = getattr(env, "termination_manager", None)
+    diagnostics = getattr(env, "_so101_postmortem_failure_diagnostics", None)
+    if manager is None or not diagnostics:
+        return
+    logged = getattr(env, "_so101_logged_terminal_diagnostics", [None] * env.num_envs)
+    if env_ids is None:
+        indices = range(env.num_envs)
+    else:
+        indices = env_ids.tolist() if isinstance(env_ids, torch.Tensor) else env_ids
+    for env_id in indices:
+        diagnostic = diagnostics[env_id]
+        if logged[env_id] is diagnostic or int(env.episode_length_buf[env_id].item()) == 0:
+            continue
+        terminal = {
+            name: bool(manager.get_term(name)[env_id].item())
+            for name in ("success", "time_out", "failure") if name in manager.active_terms
+        }
+        if not any(terminal.values()):
+            continue
+        measurements = diagnostic.task_distance_log
+        if diagnostic.bin_progress is not None:
+            inside, total = diagnostic.bin_progress
+            measurements += f", objects_in_bin={inside}/{total}"
+        print(
+            f"[INFO]: Episode task metrics: env={env_id}, task={diagnostic.task_family}, "
+            f"success={terminal.get('success', False)}{measurements}",
+            flush=True,
+        )
+        logged[env_id] = diagnostic
+    env._so101_logged_terminal_diagnostics = logged
+
+
 def _debug_object_name(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
@@ -2137,6 +2178,45 @@ class PostmortemFailureDiagnostic:
     final_goal_met: bool = False
     attempts: tuple[ManipulationAttemptDiagnostic, ...] = ()
     evidence: dict[str, object] | None = None
+
+    @property
+    def bin_progress(self) -> tuple[int, int] | None:
+        """Final inside/active counts cached before auto-reset, when available."""
+        metric = (self.evidence or {}).get("current_goal_metric", {})
+        if self.task_family != TASK_BIN or metric.get("name") != "objects_inside_bin":
+            return None
+        return int(metric["value"]), int(metric["threshold"])
+
+    @property
+    def task_distances(self) -> dict[str, float | None]:
+        """Recorded terminal task distances in meters; absent geometry is null."""
+        metric = (self.evidence or {}).get("current_goal_metric", {})
+        if self.task_family == TASK_NEXT_TO and metric.get("name") != "target_referent_surface_distance_m":
+            return {"target_referent_distance_m": None}
+        fields = {
+            TASK_NEXT_TO: {"target_referent_distance_m": "value"},
+            TASK_BETWEEN: {
+                "target_line_distance_m": "perpendicular_distance_m",
+            },
+            TASK_MOVE: {
+                "path_lateral_distance_m": "lateral_error_m",
+                "boundary_gap_m": "boundary_gap_m",
+            },
+        }.get(self.task_family, {})
+        result = {}
+        for output_name, metric_name in fields.items():
+            value = metric.get(metric_name)
+            result[output_name] = (
+                float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+            )
+        return result
+
+    @property
+    def task_distance_log(self) -> str:
+        return "".join(
+            f", {name}={value:.6f}" if value is not None else f", {name}=unavailable"
+            for name, value in self.task_distances.items()
+        )
 
 
 @dataclass(frozen=True)
@@ -2972,6 +3052,34 @@ def _attempt_diagnostics(
     return tuple(result)
 
 
+class _CpuEnvView:
+    """Read-only view of an env whose tensor attributes are copied to the CPU once.
+
+    The postmortem classifier reads a few dozen per-env scalars and small per-object
+    rows every step. Doing that with ``.item()`` on CUDA tensors costs one device sync
+    per read; copying each tensor once and reading on the CPU gives identical values.
+    """
+
+    device = "cpu"
+
+    def __init__(self, env: ManagerBasedRLEnv):
+        object.__setattr__(self, "_env", env)
+        object.__setattr__(self, "_cache", {})
+
+    def __getattr__(self, name: str):
+        cache = object.__getattribute__(self, "_cache")
+        if name in cache:
+            return cache[name]
+        value = getattr(object.__getattribute__(self, "_env"), name)
+        if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+            value = value.cpu()
+        cache[name] = value
+        return value
+
+    def __setattr__(self, name: str, value) -> None:
+        raise AttributeError(f"_CpuEnvView is read-only (attempted to set {name!r}).")
+
+
 def benchmark_postmortem_failure_diagnostics(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
@@ -2986,6 +3094,8 @@ def benchmark_postmortem_failure_diagnostics(
     functional and can identify the fallback from ``classification_version``.
     """
 
+    if str(getattr(env, "device", "cpu")) != "cpu":
+        env = _CpuEnvView(env)
     diagnostics: list[PostmortemFailureDiagnostic] = []
     task_families = getattr(env, "_so101_task_family", None)
     max_lift = getattr(env, "_so101_max_object_lift", None)

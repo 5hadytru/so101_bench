@@ -1,0 +1,4 @@
+lerobot eb7a54c6ff4983fc86075442bf4fa61503e7b5d1 https://github.com/huggingface/lerobot
+torch 2.10.0+cu128 transformers 5.5.4 torchcodec 0.10.0+cu128 diffusers 0.39.0
+NVIDIA A100-SXM4-80GB, 570.172.08
+b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba

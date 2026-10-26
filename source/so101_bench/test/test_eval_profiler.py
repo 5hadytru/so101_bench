@@ -95,7 +95,7 @@ def test_profile_snapshot_episode_and_instrumentation(tmp_path):
     with profiler.measure("episode.explicit_reset"):
         env._reset_idx([0])
     profiler.increment("simulation.control_steps")
-    profiler.observe("recording.encoder.queue_depth.front", 3)
+    profiler.observe("recording.encoder.queue_depth.wrist", 3)
     profiler.finish_episode(
         episode=1,
         success=False,
@@ -109,7 +109,7 @@ def test_profile_snapshot_episode_and_instrumentation(tmp_path):
     assert summary["status"] == "completed"
     assert summary["completed_episodes"] == 1
     assert summary["counters"]["simulation.control_steps"] == 1
-    assert summary["gauges"]["recording.encoder.queue_depth.front"]["max"] == 3
+    assert summary["gauges"]["recording.encoder.queue_depth.wrist"]["max"] == 3
     assert summary["timings"]["simulation.physics.step"]["count"] == 1
     assert summary["timings"]["simulation.render.control_step"]["count"] == 1
     assert summary["timings"]["simulation.render.automatic_reset"]["count"] == 1

@@ -64,6 +64,8 @@
     // note: the default interpreter is overridden when user selects a workspace interpreter
     //     in the status bar. For example, the virtual environment python interpreter
     "python.defaultInterpreterPath": "",
+    "latex-workshop.latex.autoBuild.run": "onSave",
+    "latex-workshop.view.pdf.viewer": "tab",
     // ROS distribution
     "ros.distro": "noetic",
     // Language specific settings

@@ -1,0 +1,74 @@
+# @package _global_
+# SO-101 Bench full fine-tune of g05-base: the repo's so100 task recipe (LR 8e-5, betas 0.9/0.95, wd 0.01,
+# warmup 1000, AR action tokens + flow-matching head, q01/q99 norm, stepwise action norm), with the step
+# budget, batch and memory set per run on the command line (scripts/G05_fine_tuning/pod/run_train.sh).
+defaults:
+- override /model: g05
+- override /tokenizer: actioncodec
+- override /data: so101_bench
+- _self_
+datastatics_path: ${oc.env:SO101_STATS,/root/g05/stats/so101_bench_stats.json}
+model:
+  pretrained_ckpt: checkpoints/g05-base/checkpoints/model_state_dict.pt
+  use_torch_compile: false
+  use_8bit_optimizer: false
+  backbone_lr_multiplier: 1.0
+  batch_size: 16
+  max_epochs: 4
+  max_steps: null
+  learning_rate: 8.0e-05
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  warmup_steps: 1000
+  num_workers: 8
+  find_unused_parameters: true
+  model_arch:
+    position_ids_type: pi0fast
+    action_position_offset: null
+    ae_vlm_condition_mode: cross_attn_only
+    checkpoint_joint: false
+    checkpoint_vision: false
+    checkpoint_action_decoder: false
+    action_dim: 20
+    proprio_dim: 20
+    # As in g05-base: history frames enter as extra vision inputs, so the model sees one condition step.
+    cond_steps: 1
+    num_obs_steps: 1
+    discrete_action: true
+    continuous_action: true
+    vision:
+      temporal_freq: 4
+    mem_frame_drop_prob: 0.3
+    fm:
+      joint_training: false
+      fm_weight: 1.0
+      num_flow_samples: 8
+    ar:
+      ce_weight: 1.0
+  processor:
+    # Every history frame of every camera is one vision input (g05-base: 3 cameras x 6 frames = 18).
+    # Two real cameras; the absent wrist_left slot is left out rather than zero-padded.
+    num_obs_steps: ${data.obs_size}
+    num_output_cameras: ${eval:'2 * ${data.obs_size}'}
+    num_input_cameras: 2
+    camera_size_config:
+      exterior: [256, 256]
+      wrist_right: [256, 256]
+    norm_default_mode: q01/q99
+    vlm_input_action_norm_default_mode: null
+    vlm_input_action_norm_exception_mode: null
+    tokenizer_params:
+      local_files_only: true
+tokenizer:
+  vq_config:
+    block_wise_autoregressive: false
+    dropout_noop_parts: true
+    model_arch:
+      codebook_size: 4096
+    num_residuals: 2
+    rule_based_key_patterns:
+    - gripper
+    rule_based_binarize_threshold: 0.0
+    use_group_markers: true
+    group_order_shuffle: false
+    absent_key_fill_value: -100.0

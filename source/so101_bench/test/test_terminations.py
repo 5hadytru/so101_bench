@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -1590,6 +1593,68 @@ class PostmortemFailureTypeTests(unittest.TestCase):
         env._so101_pm_tracker_available = True
         return env
 
+    def test_recorded_task_distances_survive_reset_and_format_missing_geometry(self) -> None:
+        cases = (
+            (BENCHMARK.TASK_NEXT_TO,
+             {"name": "target_referent_surface_distance_m", "value": 0.025},
+             {"target_referent_distance_m": 0.025}),
+            (BENCHMARK.TASK_BETWEEN,
+             {"name": "between_geometry", "perpendicular_distance_m": 0.03},
+             {"target_line_distance_m": 0.03}),
+            (BENCHMARK.TASK_MOVE,
+             {"name": "move_boundary_gap_m", "lateral_error_m": 0.04, "boundary_gap_m": -0.02},
+             {"path_lateral_distance_m": 0.04, "boundary_gap_m": -0.02}),
+            (BENCHMARK.TASK_MOVE,
+             {"name": "move_directional_progress_m", "lateral_error_m": 0.01, "boundary_gap_m": None},
+             {"path_lateral_distance_m": 0.01, "boundary_gap_m": None}),
+        )
+        for family, metric, expected in cases:
+            with self.subTest(family=family, metric=metric):
+                env = self._tracked_env(family, [0.0, 0.0])
+                env._so101_postmortem_goal_metrics[0] = metric
+                diagnostic = TERMINATIONS.benchmark_postmortem_failure_diagnostics(
+                    env, ["object_1", "object_2"]
+                )[0]
+                TERMINATIONS._reset_postmortem_rows(env, torch.tensor([True]))
+                self.assertEqual(diagnostic.task_distances, expected)
+                for name, value in expected.items():
+                    formatted = f"{value:.6f}" if value is not None else "unavailable"
+                    self.assertIn(f", {name}={formatted}", diagnostic.task_distance_log)
+
+    def test_environment_logs_distances_on_success_failure_and_timeout_without_policy_runner(self) -> None:
+        for outcome in ("success", "failure", "time_out"):
+            with self.subTest(outcome=outcome):
+                env = self._tracked_env(BENCHMARK.TASK_NEXT_TO, [0.0, 0.0])
+                env.episode_length_buf = torch.tensor([50])
+                env._so101_postmortem_goal_metrics[0] = {
+                    "name": "target_referent_surface_distance_m", "value": 0.123,
+                }
+                terms = {name: torch.tensor([outcome == name]) for name in ("success", "failure", "time_out")}
+                env.termination_manager = types.SimpleNamespace(
+                    active_terms=list(terms), get_term=terms.__getitem__,
+                )
+                output = io.StringIO()
+                with (
+                    redirect_stdout(output),
+                    patch.object(TERMINATIONS, "_termination_step_state", return_value=object()),
+                    patch.object(TERMINATIONS, "next_to_success", return_value=torch.tensor([outcome == "success"])),
+                    patch.object(TERMINATIONS, "_postmortem_goal_step", side_effect=AssertionError("logging must reuse cached geometry")),
+                    patch.object(TERMINATIONS, "_move_boundary_distance", side_effect=AssertionError("logging must reuse cached geometry")),
+                ):
+                    TERMINATIONS.task_success(env, ["object_1", "object_2"], "bin", min_episode_time_s=0.0)
+                    self.assertEqual(output.getvalue(), "")
+                    TERMINATIONS.log_episode_task_metrics(env, torch.tensor([0]))
+                    # Duplicate scoring must not duplicate the terminal log.
+                    TERMINATIONS.log_episode_task_metrics(env, torch.tensor([0]))
+                    self.assertEqual(output.getvalue().count("Episode task metrics:"), 1)
+                    self.assertIn("target_referent_distance_m=0.123000", output.getvalue())
+                    self.assertIn(f"success={outcome == 'success'}", output.getvalue())
+                    # The next episode may terminate with the same eventual length.
+                    env.episode_length_buf[0] = 1
+                    TERMINATIONS.task_success(env, ["object_1", "object_2"], "bin", min_episode_time_s=0.0)
+                    TERMINATIONS.log_episode_task_metrics(env, torch.tensor([0]))
+                    self.assertEqual(output.getvalue().count("Episode task metrics:"), 2)
+
     def test_target_lifted_is_placement(self) -> None:
         threshold = TERMINATIONS.LIFT_OFF_GROUND_LIMIT_M
         diagnostic = self._classify(BENCHMARK.TASK_NEXT_TO, [threshold + 0.01, 0.0, 0.0, 0.0])
@@ -1817,6 +1882,55 @@ class PostmortemFailureTypeTests(unittest.TestCase):
         )
         self.assertFalse(diagnostic.wrong_object_acquired)
         self.assertFalse(diagnostic.evidence["target_vs_wrong_semantics_applicable"])
+
+    def test_bin_progress_counts_final_active_objects_and_survives_reset(self) -> None:
+        env = self._tracked_env(BENCHMARK.TASK_BIN, [0.0] * 5)
+        names = [f"object_{index + 1}" for index in range(5)]
+        env._so101_active_object_mask[0, 4] = False
+        env._so101_pm_ever_inside_bin[:] = True
+        env._so101_bin_footprint_half_extents = torch.tensor([[0.1, 0.1]])
+        env._so101_bin_footprint_center_offsets = torch.zeros(1, 2)
+        env.scene = {
+            "bin": types.SimpleNamespace(data=types.SimpleNamespace(
+                root_pos_w=torch.zeros(1, 3),
+                root_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            ))
+        }
+        original_math_utils = TERMINATIONS.math_utils
+        try:
+            TERMINATIONS.math_utils = types.SimpleNamespace(
+                quat_inv=lambda quat: quat,
+                quat_apply=lambda _quat, vector: vector,
+            )
+            for count in range(5):
+                with self.subTest(count=count):
+                    positions = torch.zeros(1, 5, 3)
+                    positions[0, count:4, 0] = 0.2
+                    goal = TERMINATIONS._postmortem_goal_step(
+                        env, names, "bin", {},
+                        TERMINATIONS._TerminationStepState(
+                            positions=positions,
+                            robot_contact_by_object=torch.zeros(1, 5, dtype=torch.bool),
+                        ),
+                    )
+                    env._so101_postmortem_goal_metrics[0] = goal.metrics[0]
+                    diagnostic = TERMINATIONS.benchmark_postmortem_failure_diagnostics(env, names)[0]
+                    self.assertEqual(diagnostic.bin_progress, (count, 4))
+                    # Auto-reset clears live evidence; the result must retain the final
+                    # count even if all four objects entered the bin earlier.
+                    TERMINATIONS._reset_postmortem_rows(env, torch.tensor([True]))
+                    self.assertEqual(diagnostic.bin_progress, (count, 4))
+        finally:
+            TERMINATIONS.math_utils = original_math_utils
+
+    def test_bin_progress_is_unavailable_for_legacy_and_spatial_diagnostics(self) -> None:
+        self.assertIsNone(self._classify(BENCHMARK.TASK_BIN, [0.0] * 4).bin_progress)
+        env = self._tracked_env(BENCHMARK.TASK_MOVE, [0.0] * 4)
+        env._so101_postmortem_goal_metrics[0] = {"name": "move_goal", "value": 0.1}
+        diagnostic = TERMINATIONS.benchmark_postmortem_failure_diagnostics(
+            env, [f"object_{index + 1}" for index in range(4)]
+        )[0]
+        self.assertIsNone(diagnostic.bin_progress)
 
     def test_bin_attempt_on_non_metadata_target_counts_as_acquisition_attempt(self) -> None:
         env = self._tracked_env(BENCHMARK.TASK_BIN, [0.0, 0.0])

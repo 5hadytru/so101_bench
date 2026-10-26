@@ -27,7 +27,7 @@ from so101_bench.utils.lerobot_calibration import (
 
 OVERHEAD_CAMERA_NAME = "overhead"
 REAL_COMPAT_CAMERA_SOURCES = {
-    "front": ("wrist", "front"),
+    "wrist": ("wrist", "front"),
     "overhead": (OVERHEAD_CAMERA_NAME,),
 }
 

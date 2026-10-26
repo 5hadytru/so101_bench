@@ -94,7 +94,11 @@ def _projected_triangles(stage: Usd.Stage, usd_path: Path) -> tuple[list[np.ndar
         raise ValueError(f"{usd_path}: no Mesh prim exists below a prim named 'physics'.")
 
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    world_to_root = xform_cache.GetLocalToWorldTransform(root).GetInverse()
+    root_to_world = xform_cache.GetLocalToWorldTransform(root)
+    world_to_root = root_to_world.GetInverse()
+    # Footprints use the object's local axes, but distances must include the
+    # scale embedded in the USD root (the inverse above removes it).
+    root_scale = np.asarray(Gf.Transform(root_to_world).GetScale(), dtype=np.float64)
     triangles: list[np.ndarray] = []
     mesh_paths: list[str] = []
     for prim in meshes:
@@ -114,6 +118,7 @@ def _projected_triangles(stage: Usd.Stage, usd_path: Path) -> tuple[list[np.ndar
             ],
             dtype=np.float64,
         )
+        projected_points *= root_scale[:2]
         index_offset = 0
         for face_count in face_counts:
             count = int(face_count)

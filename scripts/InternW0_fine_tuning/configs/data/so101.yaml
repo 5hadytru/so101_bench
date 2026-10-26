@@ -1,0 +1,104 @@
+# SO-101 Bench (5hadytru/so101_bench_sim, converted to LeRobot v2.1 by pod/convert_v30_to_v21.py).
+# Cameras: overhead (scene) above wrist on one 384x256 canvas, each 192x256 (4:3 like the 480x640
+# sources), the LIBERO two-camera layout. Actions: absolute joint targets (5 arm joints + gripper, in the
+# dataset's LeRobot units), z-score normalized, no delta dims: the RoboDojo joint-space convention.
+# In the shared 80-D layout the arm occupies the left-arm joint slots [0, 5) and the gripper slot 16.
+# Memory: the episode's first frame (anchor) and the frame 32 steps back (recent), the frame conditioning
+# set by model.memory.video in configs/task/so101.yaml (the persistent KV memory stays off).
+train:
+  _target_: wam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+  - ${oc.env:SO101_DATA_ROOT,${paths.data}/so101_bench_sim_v21}
+  shape_meta:
+    images:
+    - key: overhead
+      raw_shape: [3, 480, 640]
+      shape: [3, 192, 256]
+    - key: wrist
+      raw_shape: [3, 480, 640]
+      shape: [3, 192, 256]
+    action:
+    - key: default
+      lerobot_key: action
+      raw_shape: 6
+      shape: 6
+    state:
+    - key: default
+      lerobot_key: observation.state
+      raw_shape: 6
+      shape: 6
+  num_frames: 33
+  global_sample_stride: 1
+  memory_video_anchor_size: 1
+  memory_recent_frame_offset: 32
+  action_video_freq_ratio: 4
+  video_size: [384, 256]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  skip_padding_as_possible: false
+  concat_multi_camera: vertical
+  single_canvas: true
+  return_vlm_current_images: true
+  load_episode_stats: true
+  check_local_files: true
+  pretrained_norm_stats: ${oc.env:SO101_NORM_STATS,${paths.cache}/stats/so101.json}
+  processor:
+    _target_: wam.datasets.lerobot.processors.wam_processor.WAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 2
+    action_output_dim: 80
+    proprio_output_dim: 80
+    action_state_transforms: null
+    use_stepwise_action_norm: false
+    norm_default_mode: z-score
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: wam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      action_target_dim: 80
+      state_target_dim: 80
+      action_target_slices:
+      - {source_slice: [0, 5], target_slice: [0, 5]}
+      - {source_slice: [5, 6], target_slice: [16, 17]}
+      state_target_slices:
+      - {source_slice: [0, 5], target_slice: [0, 5]}
+      - {source_slice: [5, 6], target_slice: [16, 17]}
+    train_transforms:
+    - _target_: wam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [192, 256]
+    val_transforms:
+    - _target_: wam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [192, 256]
+  text_embedding_cache_dir: ${oc.env:SO101_TEXT_CACHE,${paths.cache}/text_embed/so101}
+  context_len: 128
+  image_color_jitter:
+    enabled: true
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    gamma: 0.15
+    apply_to_vlm: true
+val:
+  _target_: wam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs: ${data.train.dataset_dirs}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: ${data.train.global_sample_stride}
+  memory_video_anchor_size: ${data.train.memory_video_anchor_size}
+  memory_recent_frame_offset: ${data.train.memory_recent_frame_offset}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  video_size: ${data.train.video_size}
+  camera_key: ${data.train.camera_key}
+  val_set_proportion: ${data.train.val_set_proportion}
+  is_training_set: false
+  pretrained_norm_stats: ${data.train.pretrained_norm_stats}
+  skip_padding_as_possible: ${data.train.skip_padding_as_possible}
+  concat_multi_camera: ${data.train.concat_multi_camera}
+  single_canvas: ${data.train.single_canvas}
+  return_vlm_current_images: ${data.train.return_vlm_current_images}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}

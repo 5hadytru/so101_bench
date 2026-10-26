@@ -30,7 +30,6 @@ from so101_bench.benchmark import (
     DomainRandomizationSpec,
     FOUR_OBJECT_BIN_EPISODE_LENGTH_S,
     MOVE_STRAIGHTNESS_TOLERANCE_M,
-    OBJECT_SCALES,
     OVERHEAD_CAMERA_HORIZONTAL_APERTURE,
     SPATIAL_SUCCESS_DISTANCE_M,
     TASK_BETWEEN,
@@ -614,8 +613,6 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
         "collision_props": _contact_collision_props(),
         "func": _spawn_ccd_usd,
     }
-    if object_name in OBJECT_SCALES:
-        spawn_kwargs["scale"] = OBJECT_SCALES[object_name]
     if metadata["multiple_rigid_bodies"]:
         spawn_kwargs["func"] = _spawn_split_rigid_body_usd
     return cfg_type(
@@ -1060,6 +1057,8 @@ def configure_env_cfg_for_episode(
 @configclass
 class EventCfg:
     """Reset events for robot appearance, robot pose, and benchmark layout."""
+
+    log_episode_task_metrics = EventTerm(func=mdp.log_episode_task_metrics, mode="reset")
 
     reset_robot_position = EventTerm(
         func=mdp.reset_joints_by_offset,

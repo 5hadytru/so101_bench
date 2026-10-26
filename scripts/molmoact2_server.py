@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Serve the released MolmoAct2 SO-100/101 checkpoint over a small HTTP API.
+"""Serve a MolmoAct2 SO-100/101 checkpoint over a small HTTP API.
+
+Serves the released allenai/MolmoAct2-SO100_101 checkpoint (two images) or a local
+fine-tuned export (for example the four-camera so101_bench_sim_WM fine-tune, whose
+norm_stats.json names its norm tag and camera order).
 
 Wire protocol:
 
-    GET  /act -> health check
+    GET  /act -> health check (includes norm_tag, num_images, camera_keys)
     POST /act -> {
-        "images_png_base64": [str, str],
+        "images_png_base64": [str, ...],
         "instruction": str,
         "state": [float, float, float, float, float, float],
         "num_steps": int,
@@ -20,7 +24,9 @@ import argparse
 import base64
 from contextlib import nullcontext
 import io
+import json
 import logging
+from pathlib import Path
 import time
 from typing import Any
 
@@ -34,6 +40,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 REPO_ID = "allenai/MolmoAct2-SO100_101"
 NORM_TAG = "so100_so101_molmoact2"
+DEFAULT_NUM_IMAGES = 2
 DEFAULT_NUM_STEPS = 10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -61,6 +68,24 @@ def _load_processor(local_dir: str):
         )
 
 
+def _checkpoint_camera_contract(local_dir: str, norm_tag: str | None) -> tuple[str, list[str]]:
+    """Resolve the norm tag and training camera order from the checkpoint's norm_stats.json."""
+
+    stats_path = Path(local_dir) / "norm_stats.json"
+    tags = {}
+    if stats_path.is_file():
+        tags = json.loads(stats_path.read_text()).get("metadata_by_tag", {})
+    if norm_tag is None:
+        if len(tags) != 1:
+            norm_tag = NORM_TAG
+        else:
+            norm_tag = next(iter(tags))
+    if tags and norm_tag not in tags:
+        raise ValueError(f"norm_tag {norm_tag!r} is not in {stats_path}; available: {sorted(tags)}")
+    camera_keys = list(tags.get(norm_tag, {}).get("camera_keys") or [])
+    return norm_tag, camera_keys
+
+
 class Policy:
     """Own the loaded checkpoint and serialize inference calls through FastAPI."""
 
@@ -72,9 +97,13 @@ class Policy:
         dtype: torch.dtype,
         enable_cuda_graph: bool,
         default_num_steps: int,
+        norm_tag: str | None = None,
     ):
-        local_dir = snapshot_download(repo_id=repo_id)
+        local_dir = repo_id if Path(repo_id).is_dir() else snapshot_download(repo_id=repo_id)
         log.info("Resolved checkpoint snapshot: %s", local_dir)
+        self.norm_tag, self.camera_keys = _checkpoint_camera_contract(local_dir, norm_tag)
+        self.num_images = len(self.camera_keys) or DEFAULT_NUM_IMAGES
+        log.info("Norm tag %s, %d images %s", self.norm_tag, self.num_images, self.camera_keys or "")
         log.info("Loading processor")
         self.processor = _load_processor(local_dir)
         log.info("Loading model (dtype=%s, device=%s)", dtype, device)
@@ -107,8 +136,8 @@ class Policy:
         state: Any,
         num_steps: int | None,
     ) -> np.ndarray:
-        if len(images) != 2:
-            raise ValueError(f"MolmoAct2-SO100_101 expects two RGB images, got {len(images)}.")
+        if len(images) != self.num_images:
+            raise ValueError(f"This checkpoint expects {self.num_images} RGB images, got {len(images)}.")
         state_array = np.asarray(state, dtype=np.float32).reshape(-1)
         if state_array.shape != (6,):
             raise ValueError(f"MolmoAct2-SO100_101 state must have shape (6,), got {state_array.shape}.")
@@ -119,7 +148,7 @@ class Policy:
                 images=images,
                 task=instruction,
                 state=state_array,
-                norm_tag=NORM_TAG,
+                norm_tag=self.norm_tag,
                 inference_action_mode="continuous",
                 enable_depth_reasoning=False,
                 num_steps=num_steps or self.default_num_steps,
@@ -146,7 +175,9 @@ def build_app(policy: Policy) -> FastAPI:
             {
                 "status": "ok",
                 "repo_id": policy.repo_id,
-                "norm_tag": NORM_TAG,
+                "norm_tag": policy.norm_tag,
+                "num_images": policy.num_images,
+                "camera_keys": policy.camera_keys,
                 "device": policy.device,
                 "dtype": str(policy.dtype),
             }
@@ -189,7 +220,7 @@ def warmup(policy: Policy) -> None:
     image = Image.new("RGB", (640, 480))
     state = np.asarray([0.0, 180.0, 180.0, 60.0, 0.0, 0.0], dtype=np.float32)
     start = time.perf_counter()
-    policy.predict(images=[image, image], instruction="warmup", state=state, num_steps=None)
+    policy.predict(images=[image] * policy.num_images, instruction="warmup", state=state, num_steps=None)
     log.info("Warmup completed in %.1f ms", (time.perf_counter() - start) * 1000.0)
 
 
@@ -198,6 +229,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="Bind address.")
     parser.add_argument("--port", type=int, default=8000, help="Bind port.")
     parser.add_argument("--repo_id", default=REPO_ID, help="Hugging Face checkpoint repository or local directory.")
+    parser.add_argument(
+        "--norm_tag",
+        default=None,
+        help="Normalization tag. Defaults to the checkpoint's only tag in norm_stats.json, else so100_so101_molmoact2.",
+    )
     parser.add_argument("--device", default="cuda:0", help="Torch device.")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--num_steps", type=int, default=DEFAULT_NUM_STEPS, help="Continuous-flow solver iterations.")
@@ -221,6 +257,7 @@ def main() -> None:
         dtype=dtype,
         enable_cuda_graph=args.cuda_graph,
         default_num_steps=args.num_steps,
+        norm_tag=args.norm_tag,
     )
     if not args.no_warmup:
         warmup(policy)

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Create SO-101 Bench WM datasets with a static overhead_init stream.
+"""Create SO-101 Bench WM datasets with static overhead_init and wrist_init streams.
 
-The output dataset gets a new LeRobot video feature named
-``observation.images.overhead_init``. For each episode, every frame in that
-stream is the first frame from ``observation.images.overhead`` for the episode.
+The output dataset gets two new LeRobot video features named
+``observation.images.overhead_init`` and ``observation.images.wrist_init``.
+For each episode, every frame in each stream is the first frame from its
+corresponding source camera for that episode.
 
 Both LeRobot v2.1 per-episode videos and v3.0 consolidated videos are supported.
 Existing source data/videos are hardlinked into the destination when possible.
@@ -31,6 +32,9 @@ import pyarrow.parquet as pq
 
 OVERHEAD_KEY = "observation.images.overhead"
 OVERHEAD_INIT_KEY = "observation.images.overhead_init"
+WRIST_KEY = "observation.images.wrist"
+WRIST_INIT_KEY = "observation.images.wrist_init"
+INIT_STREAMS = ((OVERHEAD_KEY, OVERHEAD_INIT_KEY), (WRIST_KEY, WRIST_INIT_KEY))
 QUANTILES = {
     "q01": 0.01,
     "q10": 0.10,
@@ -46,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dest", type=Path, required=True, help="Destination LeRobot dataset root.")
     parser.add_argument("--workers", type=int, default=4, help="Parallel encoder workers.")
     parser.add_argument("--overwrite", action="store_true", help="Delete destination before recreating it.")
-    parser.add_argument("--codec", type=str, default="libaom-av1", help="PyAV encoder for new MP4s.")
+    parser.add_argument("--codec", type=str, default="libsvtav1", help="PyAV encoder for new MP4s.")
     parser.add_argument("--crf", type=int, default=40, help="Encoder CRF for new MP4s.")
     return parser.parse_args()
 
@@ -107,21 +111,23 @@ def validate_source(source: Path) -> dict[str, Any]:
     if version not in {"v2.1", "v3.0"}:
         raise ValueError(f"Unsupported codebase_version {version!r}; expected v2.1 or v3.0.")
     features = info.get("features", {})
-    if features.get(OVERHEAD_KEY, {}).get("dtype") != "video":
-        raise ValueError(f"Source dataset does not have video feature {OVERHEAD_KEY!r}.")
-    if OVERHEAD_INIT_KEY in features:
-        raise ValueError(f"Source dataset already has {OVERHEAD_INIT_KEY!r}.")
+    for source_key, init_key in INIT_STREAMS:
+        if features.get(source_key, {}).get("dtype") != "video":
+            raise ValueError(f"Source dataset does not have video feature {source_key!r}.")
+        if init_key in features:
+            raise ValueError(f"Source dataset already has {init_key!r}.")
     return info
 
 
-def add_overhead_init_feature(info: dict[str, Any]) -> dict[str, Any]:
+def add_init_features(info: dict[str, Any]) -> dict[str, Any]:
     new_info = copy.deepcopy(info)
     features = new_info["features"]
     ordered_features: dict[str, Any] = {}
     for key, value in features.items():
         ordered_features[key] = value
-        if key == OVERHEAD_KEY:
-            ordered_features[OVERHEAD_INIT_KEY] = copy.deepcopy(value)
+        for source_key, init_key in INIT_STREAMS:
+            if key == source_key:
+                ordered_features[init_key] = copy.deepcopy(value)
     new_info["features"] = ordered_features
 
     if new_info.get("codebase_version") == "v2.1":
@@ -250,11 +256,12 @@ def encode_static_video(
     first_frame = frame_segments[0][0]
     height, width = first_frame.shape[:2]
     container = av.open(str(tmp_video), "w")
-    stream = container.add_stream(
-        codec,
-        rate=fps,
-        options={"cpu-used": "8", "crf": str(crf), "threads": "1"},
-    )
+    options = {"crf": str(crf), "threads": "1"}
+    if codec == "libaom-av1":
+        options["cpu-used"] = "8"
+    elif codec == "libsvtav1":
+        options["preset"] = "10"
+    stream = container.add_stream(codec, rate=fps, options=options)
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
@@ -285,16 +292,18 @@ def process_v2_episode(
     dest: Path,
     info: dict[str, Any],
     episode: dict[str, Any],
+    source_key: str,
+    init_key: str,
     codec: str,
     crf: int,
 ) -> tuple[int, dict[str, Any], bool]:
     episode_index = int(episode["episode_index"])
     length = int(episode["length"])
     fps = int(info["fps"])
-    src_video = v2_video_path(source, info, OVERHEAD_KEY, episode_index)
-    dst_video = v2_video_path(dest, info, OVERHEAD_INIT_KEY, episode_index)
+    src_video = v2_video_path(source, info, source_key, episode_index)
+    dst_video = v2_video_path(dest, info, init_key, episode_index)
     if not src_video.exists():
-        raise FileNotFoundError(f"Missing source overhead video: {src_video}")
+        raise FileNotFoundError(f"Missing source video: {src_video}")
 
     frame = first_frame_rgb(src_video)
     stats = frame_stats(frame, length)
@@ -308,16 +317,16 @@ def process_v2_episode(
     return episode_index, stats, True
 
 
-def add_global_stats(dest: Path, wm_stats: dict[int, dict[str, Any]]) -> None:
+def add_global_stats(dest: Path, wm_stats: dict[str, dict[int, dict[str, Any]]]) -> None:
     stats = read_json(dest / "meta" / "stats.json")
     ordered_stats: dict[str, Any] = {}
-    global_overhead_init_stats = aggregate_video_stats([wm_stats[index] for index in sorted(wm_stats)])
     for key, value in stats.items():
         ordered_stats[key] = value
-        if key == OVERHEAD_KEY:
-            ordered_stats[OVERHEAD_INIT_KEY] = global_overhead_init_stats
-    if OVERHEAD_INIT_KEY not in ordered_stats:
-        ordered_stats[OVERHEAD_INIT_KEY] = global_overhead_init_stats
+        for source_key, init_key in INIT_STREAMS:
+            if key == source_key:
+                ordered_stats[init_key] = aggregate_video_stats(
+                    [wm_stats[init_key][index] for index in sorted(wm_stats[init_key])]
+                )
     write_json(dest / "meta" / "stats.json", ordered_stats)
 
 
@@ -326,29 +335,33 @@ def create_v2_wm(source: Path, dest: Path, info: dict[str, Any], workers: int, c
     if len(episodes) != int(info["total_episodes"]):
         raise ValueError("episodes.jsonl row count does not match info.json total_episodes.")
 
-    print(f"[INFO] v2.1: encoding {len(episodes)} per-episode overhead_init videos", flush=True)
-    wm_stats: dict[int, dict[str, Any]] = {}
+    print(f"[INFO] v2.1: encoding {len(episodes)} episodes for two init streams", flush=True)
+    wm_stats: dict[str, dict[int, dict[str, Any]]] = {init_key: {} for _, init_key in INIT_STREAMS}
     encoded = 0
     reused = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [
-            executor.submit(process_v2_episode, source, dest, info, episode, codec, crf)
-            for episode in episodes
+            (init_key, executor.submit(
+                process_v2_episode, source, dest, info, episode, source_key, init_key, codec, crf
+            ))
+            for source_key, init_key in INIT_STREAMS for episode in episodes
         ]
-        for done, future in enumerate(as_completed(futures), start=1):
+        future_to_key = {future: init_key for init_key, future in futures}
+        for done, future in enumerate(as_completed(future_to_key), start=1):
             episode_index, stats, did_encode = future.result()
-            wm_stats[episode_index] = stats
+            wm_stats[future_to_key[future]][episode_index] = stats
             encoded += int(did_encode)
             reused += int(not did_encode)
-            if done == 1 or done % 25 == 0 or done == len(futures):
+            if done == 1 or done % 25 == 0 or done == len(future_to_key):
                 print(f"[INFO] v2.1: {done}/{len(futures)} episodes (encoded={encoded}, reused={reused})", flush=True)
 
-    write_json(dest / "meta" / "info.json", add_overhead_init_feature(info))
+    write_json(dest / "meta" / "info.json", add_init_features(info))
     add_global_stats(dest, wm_stats)
 
     rows = read_jsonl(dest / "meta" / "episodes_stats.jsonl")
     for row in rows:
-        row["stats"][OVERHEAD_INIT_KEY] = wm_stats[int(row["episode_index"])]
+        for _, init_key in INIT_STREAMS:
+            row["stats"][init_key] = wm_stats[init_key][int(row["episode_index"])]
     write_jsonl(dest / "meta" / "episodes_stats.jsonl", rows)
 
 
@@ -363,9 +376,14 @@ def load_v3_episode_files(source: Path) -> list[tuple[Path, list[dict[str, Any]]
     return episode_files
 
 
-def capture_v3_first_frames(src_video: Path, records: list[dict[str, Any]], fps: int) -> dict[int, np.ndarray]:
+def capture_v3_first_frames(
+    src_video: Path,
+    records: list[dict[str, Any]],
+    fps: int,
+    source_key: str,
+) -> dict[int, np.ndarray]:
     target_frames = {
-        round(float(record[f"videos/{OVERHEAD_KEY}/from_timestamp"]) * fps): int(record["episode_index"])
+        round(float(record[f"videos/{source_key}/from_timestamp"]) * fps): int(record["episode_index"])
         for record in records
     }
     captured: dict[int, np.ndarray] = {}
@@ -390,17 +408,19 @@ def process_v3_video_file(
     chunk_index: int,
     file_index: int,
     records: list[dict[str, Any]],
+    source_key: str,
+    init_key: str,
     codec: str,
     crf: int,
 ) -> tuple[tuple[int, int], dict[int, dict[str, Any]], bool]:
     fps = int(info["fps"])
-    src_video = v3_video_path(source, info, OVERHEAD_KEY, chunk_index, file_index)
-    dst_video = v3_video_path(dest, info, OVERHEAD_INIT_KEY, chunk_index, file_index)
+    src_video = v3_video_path(source, info, source_key, chunk_index, file_index)
+    dst_video = v3_video_path(dest, info, init_key, chunk_index, file_index)
     if not src_video.exists():
-        raise FileNotFoundError(f"Missing source overhead video: {src_video}")
+        raise FileNotFoundError(f"Missing source video: {src_video}")
 
-    sorted_records = sorted(records, key=lambda rec: float(rec[f"videos/{OVERHEAD_KEY}/from_timestamp"]))
-    frames = capture_v3_first_frames(src_video, sorted_records, fps)
+    sorted_records = sorted(records, key=lambda rec: float(rec[f"videos/{source_key}/from_timestamp"]))
+    frames = capture_v3_first_frames(src_video, sorted_records, fps, source_key)
     wm_stats = {
         int(record["episode_index"]): frame_stats(frames[int(record["episode_index"])], int(record["length"]))
         for record in sorted_records
@@ -421,35 +441,33 @@ def process_v3_video_file(
 def update_v3_episode_metadata(
     dest: Path,
     episode_files: list[tuple[Path, list[dict[str, Any]]]],
-    wm_stats: dict[int, dict[str, Any]],
+    wm_stats: dict[str, dict[int, dict[str, Any]]],
     fps: int,
 ) -> None:
-    # The new overhead_init stream contains only frames from retained episodes.
-    # It may therefore be shorter than the source overhead shard when the source
-    # dataset has pruned episodes whose video spans remain in that shard. Build
-    # fresh contiguous spans for overhead_init instead of copying overhead spans.
+    # Each init stream contains only frames from retained episodes. It may be
+    # shorter than its source-camera shard when the source dataset has pruned
+    # episodes, so build fresh contiguous spans instead of copying source spans.
     all_records = [record for _, records in episode_files for record in records]
-    by_source_video: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
-    for record in all_records:
-        key = (
-            int(record[f"videos/{OVERHEAD_KEY}/chunk_index"]),
-            int(record[f"videos/{OVERHEAD_KEY}/file_index"]),
-        )
-        by_source_video[key].append(record)
-
-    init_spans: dict[int, tuple[int, int, float, float]] = {}
-    for (chunk_index, file_index), records in by_source_video.items():
-        offset_frames = 0
-        for record in sorted(records, key=lambda rec: float(rec[f"videos/{OVERHEAD_KEY}/from_timestamp"])):
-            episode_index = int(record["episode_index"])
-            length = int(record["length"])
-            init_spans[episode_index] = (
-                chunk_index,
-                file_index,
-                offset_frames / fps,
-                (offset_frames + length) / fps,
+    spans_by_init: dict[str, dict[int, tuple[int, int, float, float]]] = {}
+    for source_key, init_key in INIT_STREAMS:
+        by_source_video: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for record in all_records:
+            key = (
+                int(record[f"videos/{source_key}/chunk_index"]),
+                int(record[f"videos/{source_key}/file_index"]),
             )
-            offset_frames += length
+            by_source_video[key].append(record)
+        init_spans: dict[int, tuple[int, int, float, float]] = {}
+        for (chunk_index, file_index), records in by_source_video.items():
+            offset_frames = 0
+            for record in sorted(records, key=lambda rec: float(rec[f"videos/{source_key}/from_timestamp"])):
+                episode_index = int(record["episode_index"])
+                length = int(record["length"])
+                init_spans[episode_index] = (
+                    chunk_index, file_index, offset_frames / fps, (offset_frames + length) / fps
+                )
+                offset_frames += length
+        spans_by_init[init_key] = init_spans
 
     for source_meta_path, records in episode_files:
         dest_meta_path = dest / source_meta_path.relative_to(source_meta_path.parents[3])
@@ -457,13 +475,14 @@ def update_v3_episode_metadata(
         for record in records:
             episode_index = int(record["episode_index"])
             record = dict(record)
-            chunk_index, file_index, from_timestamp, to_timestamp = init_spans[episode_index]
-            record[f"videos/{OVERHEAD_INIT_KEY}/chunk_index"] = chunk_index
-            record[f"videos/{OVERHEAD_INIT_KEY}/file_index"] = file_index
-            record[f"videos/{OVERHEAD_INIT_KEY}/from_timestamp"] = from_timestamp
-            record[f"videos/{OVERHEAD_INIT_KEY}/to_timestamp"] = to_timestamp
-            for stat_key, value in wm_stats[episode_index].items():
-                record[f"stats/{OVERHEAD_INIT_KEY}/{stat_key}"] = value
+            for _, init_key in INIT_STREAMS:
+                chunk_index, file_index, from_timestamp, to_timestamp = spans_by_init[init_key][episode_index]
+                record[f"videos/{init_key}/chunk_index"] = chunk_index
+                record[f"videos/{init_key}/file_index"] = file_index
+                record[f"videos/{init_key}/from_timestamp"] = from_timestamp
+                record[f"videos/{init_key}/to_timestamp"] = to_timestamp
+                for stat_key, value in wm_stats[init_key][episode_index].items():
+                    record[f"stats/{init_key}/{stat_key}"] = value
             updated_records.append(record)
         table = pa.Table.from_pylist(updated_records)
         dest_meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -480,20 +499,23 @@ def create_v3_wm(source: Path, dest: Path, info: dict[str, Any], workers: int, c
     if len(all_records) != int(info["total_episodes"]):
         raise ValueError("v3.0 episode metadata row count does not match info.json total_episodes.")
 
-    by_video_file: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
-    for record in all_records:
-        key = (
-            int(record[f"videos/{OVERHEAD_KEY}/chunk_index"]),
-            int(record[f"videos/{OVERHEAD_KEY}/file_index"]),
-        )
-        by_video_file[key].append(record)
+    jobs = []
+    for source_key, init_key in INIT_STREAMS:
+        by_video_file: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for record in all_records:
+            key = (
+                int(record[f"videos/{source_key}/chunk_index"]),
+                int(record[f"videos/{source_key}/file_index"]),
+            )
+            by_video_file[key].append(record)
+        jobs.extend((source_key, init_key, key, records) for key, records in sorted(by_video_file.items()))
 
-    print(f"[INFO] v3.0: encoding {len(by_video_file)} consolidated overhead_init videos", flush=True)
-    wm_stats: dict[int, dict[str, Any]] = {}
+    print(f"[INFO] v3.0: encoding {len(jobs)} consolidated init videos", flush=True)
+    wm_stats: dict[str, dict[int, dict[str, Any]]] = {init_key: {} for _, init_key in INIT_STREAMS}
     encoded = 0
     reused = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 process_v3_video_file,
                 source,
@@ -502,19 +524,21 @@ def create_v3_wm(source: Path, dest: Path, info: dict[str, Any], workers: int, c
                 chunk_index,
                 file_index,
                 records,
+                source_key,
+                init_key,
                 codec,
                 crf,
-            )
-            for (chunk_index, file_index), records in sorted(by_video_file.items())
-        ]
+            ): init_key
+            for source_key, init_key, (chunk_index, file_index), records in jobs
+        }
         for done, future in enumerate(as_completed(futures), start=1):
             _, stats_for_file, did_encode = future.result()
-            wm_stats.update(stats_for_file)
+            wm_stats[futures[future]].update(stats_for_file)
             encoded += int(did_encode)
             reused += int(not did_encode)
             print(f"[INFO] v3.0: {done}/{len(futures)} video files (encoded={encoded}, reused={reused})", flush=True)
 
-    write_json(dest / "meta" / "info.json", add_overhead_init_feature(info))
+    write_json(dest / "meta" / "info.json", add_init_features(info))
     add_global_stats(dest, wm_stats)
     update_v3_episode_metadata(dest, episode_files, wm_stats, int(info["fps"]))
 

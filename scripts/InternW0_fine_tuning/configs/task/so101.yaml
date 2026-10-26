@@ -1,0 +1,50 @@
+# @package _global_
+# SO-101 Bench post-training from InternW0-Delta-Base. Repo recipe defaults (full fine-tune, cosine LR
+# 5e-5, weight decay 0.01, bf16, grad clip 1.0) with the anchor + recent frame memory. Batch, accumulation and the step
+# budget are set per run on the command line (scripts/InternW0_fine_tuning/pod/run_train.sh).
+defaults:
+- override /data: so101
+- override /model: wam
+- _self_
+batch_size: 16
+num_workers: 8
+prefetch_factor: 2
+pin_memory: false
+lr_scheduler_type: cosine
+learning_rate: 5.0e-05
+num_epochs: 1
+max_steps: null
+log_every: 10
+save_every: 500
+max_weight_checkpoints: 2
+eval_every: 1000000
+eval_max_videos: 0
+gradient_accumulation_steps: 1
+weight_decay: 0.01
+max_grad_norm: 1.0
+mixed_precision: bf16
+model:
+  mot_checkpoint_mixed_attn: true
+  mot_checkpoint_layer_stride: 1
+  action_dit_pretrained_path: null
+  skip_dit_load_from_pretrain: true
+  understanding:
+    enabled: true
+  future_delta:
+    num_views: 1
+  # Visual memory = "frame conditioning": every sample conditions on the episode's first frame (anchor)
+  # and the frame 32 steps back (recent); the model requires exactly one of each, always on.
+  # memory.enabled is a separate persistent KV memory that this release keeps off and its training
+  # validator rejects ("Frame-window training requires model.memory.enabled=false").
+  memory:
+    enabled: false
+    video:
+      enabled: true
+      num_anchor_frames: 1
+      num_recent_frames: 1
+resume: ${oc.env:WAM_PRETRAIN_CHECKPOINT,${paths.checkpoints}/pretrain.pt}
+video_latent_cache: 'off'
+length_bucketed_sampling: true
+save_training_state: true
+paths:
+  so101: ${oc.env:SO101_DATA_ROOT,${paths.data}/so101_bench_sim_v21}

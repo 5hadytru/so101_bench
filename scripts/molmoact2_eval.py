@@ -44,14 +44,45 @@ parser.add_argument(
 )
 parser.add_argument("--policy_host", type=str, default="localhost", help="MolmoAct2 policy server host.")
 parser.add_argument("--policy_port", type=int, default=8000, help="MolmoAct2 policy server port.")
-parser.add_argument("--action_horizon", type=int, default=30, help="Action steps to execute per server query.")
+parser.add_argument("--action_horizon", type=int, default=30, help="Action steps to execute per server query (30 = the full MolmoAct2 SO-100/101 chunk, its deployment default).")
 parser.add_argument(
     "--policy_cameras",
     type=str,
     default="overhead,wrist",
     help=(
-        "Comma-separated pair of sim cameras sent to MolmoAct2. The checkpoint was trained on two third-person "
-        "views, so '--policy_cameras overhead,overhead' is also useful for testing without the wrist camera."
+        "Comma-separated live sim cameras sent to MolmoAct2, in checkpoint order. The released checkpoint was "
+        "trained on two third-person views, so '--policy_cameras overhead,overhead' is also useful for testing "
+        "without the wrist camera. so101_bench_sim_WM fine-tunes use overhead,wrist plus both init frames."
+    ),
+)
+parser.add_argument(
+    "--use_overhead_init",
+    nargs="?",
+    const=True,
+    default=False,
+    type=_str_to_bool,
+    help=(
+        "Append the settled overhead frame captured when robot control starts to every request, after the live "
+        "cameras. Required by so101_bench_sim_WM fine-tunes; the released checkpoint does not use it."
+    ),
+)
+parser.add_argument("--overhead_init_camera", type=str, default="overhead", help="Sim camera for overhead_init.")
+parser.add_argument(
+    "--use_wrist_init",
+    nargs="?",
+    const=True,
+    default=False,
+    type=_str_to_bool,
+    help="Append the settled wrist frame captured when robot control starts, after overhead_init.",
+)
+parser.add_argument("--wrist_init_camera", type=str, default="wrist", help="Sim camera for wrist_init.")
+parser.add_argument(
+    "--joint_frame",
+    choices=["molmoact2", "lerobot"],
+    default="molmoact2",
+    help=(
+        "Joint convention of the served checkpoint's state/actions: 'molmoact2' (MolmoAct2 SO-100/101 frame) or "
+        "'lerobot' (the dataset's native LeRobot units, e.g. pi0.5 served by scripts/pi05_server.py)."
     ),
 )
 parser.add_argument(
@@ -59,6 +90,24 @@ parser.add_argument(
     type=float,
     default=120.0,
     help="HTTP timeout for MolmoAct2 health checks and inference requests.",
+)
+parser.add_argument(
+    "--history_ticks",
+    type=int,
+    default=1,
+    help=(
+        "Control ticks of observation history sent with each request (1 = current observation only). "
+        "FLUX 3 Action SO-101 checkpoints served by scripts/flux3_server.py use 8."
+    ),
+)
+parser.add_argument(
+    "--prediction_trace_dir",
+    type=str,
+    default=None,
+    help=(
+        "Ask the policy server to save its predicted video per request under this directory "
+        "(scripts/flux3_server.py --save_predictions). Frames line up with --record_dataset's episodes."
+    ),
 )
 parser.add_argument(
     "--num_steps",
@@ -652,6 +701,8 @@ def _save_camera_snapshot(
 
     if policy.use_overhead_init and policy.overhead_init_image is not None:
         saved_paths.append(_write_image(snapshot_dir / policy.overhead_init_key, policy.overhead_init_image))
+    if policy.use_wrist_init and policy.wrist_init_image is not None:
+        saved_paths.append(_write_image(snapshot_dir / policy.wrist_init_key, policy.wrist_init_image))
 
     if saved_paths:
         saved = ", ".join(str(path) for path in saved_paths)
@@ -997,6 +1048,9 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
 
 def main():
     episode_specs = load_episode_jsonl(args_cli.episodes_jsonl)
+    from so101_bench.benchmark import episode_is_executable
+    from primary_eval_exclusions import primary_episode_excluded
+    episode_specs = [episode for episode in episode_specs if episode_is_executable(episode) and not primary_episode_excluded(episode)]
     requested_count = len(episode_specs) if args_cli.num_episodes is None else args_cli.num_episodes
     planned_count = 1 if args_cli.inspect_initial_scene else requested_count
     if planned_count < 1:
@@ -1078,6 +1132,10 @@ def main():
 
     policy_cameras = [name.strip() for name in args_cli.policy_cameras.split(",") if name.strip()]
     print(f"[INFO]: MolmoAct2 policy cameras: {policy_cameras}")
+    if args_cli.use_overhead_init:
+        print(f"[INFO]: MolmoAct2 init frame: rgb_{args_cli.overhead_init_camera} at robot start -> overhead_init")
+    if args_cli.use_wrist_init:
+        print(f"[INFO]: MolmoAct2 init frame: rgb_{args_cli.wrist_init_camera} at robot start -> wrist_init")
     image_size = (
         (args_cli.policy_image_width, args_cli.policy_image_height)
         if args_cli.policy_image_width > 0 and args_cli.policy_image_height > 0
@@ -1099,6 +1157,13 @@ def main():
         timeout_s=args_cli.policy_timeout_s,
         num_steps=args_cli.num_steps,
         max_joint_step_deg=args_cli.max_joint_step_deg,
+        use_overhead_init=args_cli.use_overhead_init,
+        overhead_init_camera=args_cli.overhead_init_camera,
+        use_wrist_init=args_cli.use_wrist_init,
+        wrist_init_camera=args_cli.wrist_init_camera,
+        joint_frame=args_cli.joint_frame,
+        history_ticks=args_cli.history_ticks,
+        prediction_trace_dir=args_cli.prediction_trace_dir,
     )
     if not args_cli.hold_init:
         policy.connect()
@@ -1253,6 +1318,10 @@ def main():
                     if not robot_control_started:
                         _begin_robot_control(env, policy, obs, object_asset_names)
                         robot_control_started = True
+                    # Recorded frame k holds the observation after env step k, so a request at env step
+                    # `step` predicts recorded frames step, step + 1, ... of this episode.
+                    policy.trace_episode = episodes
+                    policy.trace_frame = step
                     with torch.inference_mode():
                         joint_positions = obs["policy"]["joint_pos_obs"][0].clone()
                         actions[:] = policy.get_action(joint_positions, obs["visual"])
@@ -1291,12 +1360,18 @@ def main():
                 f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
                 f"reason={end_reason}, length={episode_duration_s:.2f}s"
             )
+            # Use the terminal snapshot: env.step() has already auto-reset the scene.
+            diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
+            postmortem = diagnostics[0] if diagnostics else None
+            bin_progress = postmortem.bin_progress if postmortem is not None else None
+            if bin_progress is not None:
+                message += f", objects_in_bin={bin_progress[0]}/{bin_progress[1]}"
+            if postmortem is not None:
+                message += postmortem.task_distance_log
             if not is_success:
                 # Read the classification stored by benchmark_failure on the terminating
                 # step: the env auto-resets inside env.step() and zeros the lift buffer,
                 # so recomputing here would always see a cleared episode.
-                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
-                postmortem = diagnostics[0] if diagnostics else None
                 if postmortem is not None and postmortem.failure_type != POSTMORTEM_NOT_APPLICABLE:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     threshold_in = postmortem.lift_threshold_m / INCH
@@ -1312,7 +1387,7 @@ def main():
                 elif postmortem is not None:
                     postmortem_failure_counts[postmortem.failure_type] += 1
                     message += f", live_failure_reason={live_failure_reason}"
-            print(message)
+            print(message, flush=True)
 
             # Finalize the recording only after the per-episode result is logged: with
             # --record_dataset the video encode can take minutes, and printing first keeps

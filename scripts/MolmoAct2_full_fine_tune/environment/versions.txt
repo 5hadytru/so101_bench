@@ -1,0 +1,4 @@
+molmoact2 66b87e64efd99dfd103241418113955cf64dfa9c https://github.com/allenai/molmoact2
+Python 3.12.3
+NVIDIA A100-SXM4-80GB, 570.172.08
+torch 2.10.0+cu128 cuda 12.8 transformers 5.17.0 torchcodec 0.10.0+cu128

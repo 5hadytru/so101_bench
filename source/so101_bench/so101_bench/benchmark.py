@@ -16,30 +16,6 @@ from typing import Any
 INCH = 0.0254
 MULTI_RIGID_BODY_CHILD_NAMES = ("left", "right")
 
-# Per-axis scale applied when benchmark object USDs are spawned.  Footprint
-# metadata stores the source-USD dimensions, so its XY coordinates are scaled
-# by the same factors when loaded below.
-OBJECT_SCALES = {
-    "black skateboard tool": (0.13, 0.13, 0.13),
-    "blue kazoo": (0.9, 0.9, 0.9),
-    "blue sponge": (1.0, 1.0, 1.0),
-    "green air pump": (1.15, 1.15, 1.15),
-    "white pill planner": (1.1, 1.1, 1.1),
-    "white corkscrew": (1.4, 1.4, 1.4),
-    "yellow die": (17.0 / 13.0, 17.0 / 13.0, 17.0 / 13.0),
-    "green sponge": (0.75, 0.75, 0.75),
-    "grey scissors": (1.0, 1.0, 1.3),
-    "green spool": (1.0, 1.0, 0.9),
-    "purple spool": (0.9, 0.9, 1.0),
-    "brown trimmer": (1.2, 1.2, 1.2),
-    "yellow juice box": (0.9, 0.9, 0.9),
-    "green juice box": (0.9, 0.9, 0.9),
-    "name plate": (1.1, 1.1, 1.1),
-    "white toy boat": (1.2, 1.2, 1.2),
-    "red pepper": (1.3, 1.3, 1.3),
-    "red pliers": (1.25, 1.25, 1.25),
-}
-
 TASK_BIN = "bin"
 TASK_NAMED_BIN = "named_bin"
 TASK_NEXT_TO = "next_to"
@@ -136,7 +112,7 @@ MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.25 * INCH
 # glancing clip), so the move is scored on forward progress instead of "reaching" it.
 MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
 DEFAULT_EPISODE_LENGTH_S = 30.0
-FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 90.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 75.0
 
 
 def episode_length_s(task_family: str, object_count: int) -> float:
@@ -151,13 +127,8 @@ def episode_length_s(task_family: str, object_count: int) -> float:
 # RigidObjectCfg and must use AssetBaseCfg instead.
 OBJECT_SPLITS: dict[str, dict[str, dict[str, bool | list[str]]]] = {
     "seen": {
-        # LEGACY: reactivated for sim_6 compatibility; the marker distinguishes these from current objects.
-        "black glasses": {
-            "multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True
-        },
-        "silver glasses": {
-            "multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True
-        },
+        # "black glasses": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True},
+        # "silver glasses": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True},
         "white pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "black pen": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "altoids container": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
@@ -167,12 +138,8 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool | list[str]]]] = {
         "green clip": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "pink eraser": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "yellow wires": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
-        "grey wires": {
-            "multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True
-        },
-        "black screwdriver": {
-            "multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True
-        },
+        # "grey wires": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True},
+        # "black screwdriver": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"], "legacy": True},
         "yellow screwdriver": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "red tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "black tape": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
@@ -182,9 +149,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool | list[str]]]] = {
         "yellow toy car": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "grey toy car": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "green shoes": {"multiple_rigid_bodies": True, "deformable": False, "tasks": ["BIN"]},
-        "black shoes": {
-            "multiple_rigid_bodies": True, "deformable": False, "tasks": ["ALL"], "legacy": True
-        },
+        # "black shoes": {"multiple_rigid_bodies": True, "deformable": False, "tasks": ["ALL"], "legacy": True},
         "blue bowl": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "blue scissors": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "silver battery": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
@@ -271,7 +236,40 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool | list[str]]]] = {
         "white corkscrew": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
         "white eraser": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
     },
+    "unseen_unseen_class": {
+        "blue highlighter": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "purple toothbrush": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "blue controller": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "action figure": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "razor": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "silver tongs": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "playing cards": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "toy fire truck": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "toy monster truck": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+        "toy dinosaur": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+    },
 }
+
+# The held-out unseen-object/unseen-class objects are not published: the public split above holds only
+# the ones in tasks/real_gr00t_WM_all_filtered.jsonl. A local private_objects.py (never committed)
+# supplies the full split, in its original order. It is loaded by path so this works however
+# benchmark.py itself is imported.
+PUBLIC_UNSEEN_UNSEEN_CLASS: tuple[str, ...] = tuple(OBJECT_SPLITS["unseen_unseen_class"])
+_PRIVATE_OBJECTS = Path(__file__).resolve().with_name("private_objects.py")
+if _PRIVATE_OBJECTS.is_file():
+    import importlib.util as _importlib_util
+
+    _spec = _importlib_util.spec_from_file_location("so101_bench_private_objects", _PRIVATE_OBJECTS)
+    _private = _importlib_util.module_from_spec(_spec)
+    _spec.loader.exec_module(_private)
+    OBJECT_SPLITS["unseen_unseen_class"] = dict(_private.UNSEEN_UNSEEN_CLASS)
+
+# Retire from active generation even when the private split overrides the public
+# catalog. Legacy scene metadata below permits unchanged distractor/referent rows.
+RETIRED_GRASP_OBJECTS = frozenset({"candy bar"})
+for _split_objects in OBJECT_SPLITS.values():
+    for _retired_name in RETIRED_GRASP_OBJECTS:
+        _split_objects.pop(_retired_name, None)
 
 BENCHMARK_OBJECT_NAMES: tuple[str, ...] = tuple(
     object_name for split in OBJECT_SPLITS.values() for object_name in split
@@ -281,6 +279,7 @@ BENCHMARK_OBJECT_NAMES: tuple[str, ...] = tuple(
 # so that the recorded task prefix can still be parsed and replayed.
 LEGACY_OBJECT_METADATA: dict[str, dict[str, bool | list[str]]] = {
     "black bike lock": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
+    "candy bar": {"multiple_rigid_bodies": False, "deformable": False, "tasks": ["ALL"]},
 }
 OBJECT_METADATA: dict[str, dict[str, bool | list[str]]] = {
     **{
@@ -464,8 +463,9 @@ class DomainRandomizationSpec:
 
     def _validate(self, *, source: str) -> None:
         background_index = self.background_mesh_index
-        if not background_index.is_integer() or not 1 <= int(background_index) <= 18:
-            raise ValueError(f"{source}.background_mesh_index must be an integer-valued float from 1 to 18.")
+        # Parsing accepts explicit ROBUST holdouts; training samplers stay at 1–18.
+        if not background_index.is_integer() or not 1 <= int(background_index) <= 22:
+            raise ValueError(f"{source}.background_mesh_index must be an integer-valued float from 1 to 22 (19–22 are ROBUST-only holdouts).")
 
         for name in ("overhead_camera_horizontal_fov_deg", "wrist_camera_horizontal_fov_deg"):
             value = getattr(self, name)
@@ -537,6 +537,8 @@ class BenchmarkEpisodeSpec:
     def reset_payload(self) -> dict[str, Any]:
         """Return the JSON-compatible subset needed by the reset event."""
 
+        if not episode_is_executable(self):
+            raise ValueError("Episode requires grasping a retired object: candy bar")
         return {
             "objects": list(self.objects),
             "instruction": self.instruction,
@@ -548,6 +550,12 @@ class BenchmarkEpisodeSpec:
             "metadata": dict(self.metadata or {}),
             "domain_randomization": self.domain_randomization.to_json(),
         }
+
+
+def episode_is_executable(episode: BenchmarkEpisodeSpec) -> bool:
+    """Old tasks may retain retired props, but may not require grasping them."""
+    grasped = episode.objects if episode.task_family == TASK_BIN else (episode.objects[episode.target_object_id],)
+    return not RETIRED_GRASP_OBJECTS.intersection(grasped)
 
 
 def object_metadata(object_name: str) -> dict[str, bool | list[str]]:
@@ -586,7 +594,7 @@ def load_object_move_footprint_boxes(
     *,
     required: bool = True,
 ) -> tuple[tuple[float, float, float, float], ...]:
-    """Load raster-derived local XY rectangles for move-task geometry."""
+    """Load raster-derived local XY rectangles in meters, including the USD scale."""
 
     path = object_move_footprint_path(object_name)
     if not path.is_file():
@@ -634,11 +642,7 @@ def load_object_move_footprint_boxes(
                 f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
             )
         boxes.append(box)
-    scale_x, scale_y, _ = OBJECT_SCALES.get(object_name, (1.0, 1.0, 1.0))
-    return tuple(
-        (min_x * scale_x, min_y * scale_y, max_x * scale_x, max_y * scale_y)
-        for min_x, min_y, max_x, max_y in boxes
-    )
+    return tuple(boxes)
 
 
 def validate_move_episode_footprints(episodes: list[BenchmarkEpisodeSpec]) -> None:

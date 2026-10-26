@@ -1,0 +1,16 @@
+diff --git a/src/g05/models/g05/qwen35/vision.py b/src/g05/models/g05/qwen35/vision.py
+index 3606d5c..600cebd 100644
+--- a/src/g05/models/g05/qwen35/vision.py
++++ b/src/g05/models/g05/qwen35/vision.py
+@@ -23,6 +23,11 @@ _flash_attn_varlen = None
+ _flash_attn_backend = None
+ 
+ try:
++    # FA4 (flash_attn.cute) has no backward below compute capability 9.0 (e.g. A100): use FA2 there.
++    import torch as _torch
++
++    if _torch.cuda.is_available() and _torch.cuda.get_device_capability()[0] < 9:
++        raise ImportError("FA4 needs sm90+")
+     from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
+ 
+     _flash_attn_varlen = _fa4_varlen

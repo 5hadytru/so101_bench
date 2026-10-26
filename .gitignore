@@ -101,6 +101,23 @@ checkpoints/
 /tasks/test*.jsonl*
 !/tasks/test_domain_rand.jsonl
 
-# Public repository boundary: task data is private unless explicitly released.
-/tasks/*
-!/tasks/real_gr00t_WM_all_filtered.jsonl
+# Local archives
+/outputs_archive/
+/tasks_archive/
+
+# Held-out objects stay local: the unseen-object/unseen-class objects outside
+# tasks/real_gr00t_WM_all_filtered.jsonl, and every file that names them or describes their split.
+source/so101_bench/so101_bench/private_objects.py
+/tasks/primary_eval.jsonl
+/tasks/real_gr00t_val_v2.jsonl
+/docs/primary_eval.md
+/scripts/create_primary_eval.py
+
+# Private primary evaluation v2 (including editor task-file backups).
+/tasks/primary_eval_v2.jsonl
+/docs/primary_eval_v2.md
+/scripts/create_primary_eval_v2.py
+/scripts/add_primary_eval_robust.py
+
+# Paper and release staging (local only)
+release/

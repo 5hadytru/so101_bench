@@ -1,0 +1,20 @@
+{
+  "RUN_NAME": "molmoact2-so101-sim-wm-b128",
+  "MAX_DURATION": 10000,
+  "DEVICE_BS": 16,
+  "GLOBAL_BS": 128,
+  "NUM_WORKERS": 8,
+  "PREFETCH": 4,
+  "SAVE_INTERVAL": 500,
+  "SAVE_EPHEMERAL": 200,
+  "KEEP": 3,
+  "EXPORT_EVERY": 1000,
+  "EXPORT_KEEP": 6,
+  "VIDEO_BACKEND": "pyav",
+  "LLM_LR": "1.4e-5",
+  "VIT_LR": "7e-6",
+  "CONNECTOR_LR": "7e-6",
+  "AE_LR": "7e-5",
+  "LOG_INTERVAL": 10,
+  "WANDB_MODE": "online"
+}

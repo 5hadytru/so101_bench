@@ -1,0 +1,95 @@
+# SO-101 Bench (5hadytru/so101_bench_sim @ 3423375, converted to LeRobot v2.1 by pod/convert_v30_to_v21.py),
+# in the 16D action/state layout of the InternData-A1-EE pretrain weight (SO101ToCanonicalEE16: arm joints in
+# slots [0, 5), gripper in slot 7, the rest masked). Absolute joint targets in the dataset's LeRobot units,
+# z-score normalized from this dataset (no pretrain stats), the RoboTwin-ee16 fine-tune convention.
+#
+# Cameras: by default the pretrain canvas, compact_288x256 ("robotwin" concat): overhead in the 192x256 top
+# slot, wrist in the 96x128 bottom-left slot, the bottom-right slot black (the processor zero-pads a third
+# camera, as for the pretrain's one-wrist Franka). pod/run_train.sh CANVAS=tall switches to a 384x256
+# vertical stack of two 192x256 tiles (InternW0's canvas).
+#
+# Time: native 30 fps (global_sample_stride 1). num_frames 33 = a 32-action chunk; the editing target is the
+# chunk's last frame (endpoint_frames_only), conditioned on the current frame. CHUNK=16 -> num_frames 17.
+# No history and no init frames.
+train:
+  _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+  - ${oc.env:SO101_DATA_ROOT}
+  shape_meta:
+    images:
+    - key: overhead
+      raw_shape: [3, 480, 640]
+      shape: [3, 240, 320]
+    - key: wrist
+      raw_shape: [3, 480, 640]
+      shape: [3, 240, 320]
+    action:
+    - key: default
+      raw_shape: 6
+      shape: 16
+    state:
+    - key: default
+      raw_shape: 6
+      shape: 16
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 1
+  video_size: [288, 256]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: ${oc.env:SO101_NORM_STATS,null}
+  skip_padding_as_possible: false
+  concat_multi_camera: robotwin
+  robotwin_camera_layout: compact_288x256
+  video_augmentation:
+    _target_: imagewam.datasets.lerobot.transforms.image.VideoAugmentation
+    p: 0.5
+    augment_types: [corrupt_only, color_only, both]
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.03
+    gamma:
+      range: [0.9, 1.1]
+    gaussian_noise:
+      std: 0.01
+    random_resized_crop:
+      scale: [0.95, 1.0]
+      ratio: preserve
+    rotate:
+      degrees: 5.0
+      fill: mean
+  require_text_cache: false
+  endpoint_frames_only: true
+  nonidle_filter_path: null
+  qwen_text_cache_dir: ${oc.env:SO101_QWEN_CACHE}
+  qwen_context_len: 128
+  qwen_text_cache_format: qwen3_flux2
+  processor:
+    _target_: imagewam.datasets.lerobot.processors.imagewam_processor.ImageWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    image_obs_steps: 2
+    num_output_cameras: 3
+    action_output_dim: 16
+    proprio_output_dim: 16
+    action_state_transforms:
+    - _target_: imagewam.datasets.lerobot.transforms.so101.SO101ToCanonicalEE16
+      key: default
+    use_stepwise_action_norm: false
+    norm_default_mode: z-score
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: imagewam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+    - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [240, 320]
+    val_transforms:
+    - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
+    - _target_: torchvision.transforms.Resize
+      size: [240, 320]
+  text_embedding_cache_dir: null
+  context_len: 128

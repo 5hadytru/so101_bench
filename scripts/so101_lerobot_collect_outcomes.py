@@ -993,6 +993,93 @@ def _raw_joint_positions_to_tensor(
     return torch.tensor(ordered, dtype=torch.float32, device=device)
 
 
+_PARQUET_INDEX_CACHE: dict[str, tuple[dict[str, Any], dict[int, Path]]] = {}
+
+
+def _parquet_episode_index(root: Path) -> tuple[dict[str, Any], dict[int, Path]]:
+    """Return (info.json, episode_index -> data parquet path) for a LeRobot v3 dataset root."""
+    key = str(root.resolve())
+    cached = _PARQUET_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import pyarrow.parquet as pq
+
+    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+    data_path_template = info["data_path"]
+    paths: dict[int, Path] = {}
+    for meta_path in sorted((root / "meta" / "episodes").glob("chunk-*/*.parquet")):
+        table = pq.read_table(meta_path, columns=["episode_index", "data/chunk_index", "data/file_index"])
+        columns = table.to_pydict()
+        for episode, chunk, file in zip(
+            columns["episode_index"], columns["data/chunk_index"], columns["data/file_index"], strict=True
+        ):
+            paths[int(episode)] = root / data_path_template.format(chunk_index=int(chunk), file_index=int(file))
+    _PARQUET_INDEX_CACHE[key] = (info, paths)
+    return info, paths
+
+
+def _load_lerobot_action_episode_from_parquet(
+    *,
+    root: Path,
+    episode_index: int,
+    device: str,
+    load_observed_states: bool,
+) -> LeRobotActionEpisode | None:
+    """Read one episode's joint columns directly from its data parquet file.
+
+    Equivalent to the LeRobotDataset path below (same float32 values, same frame
+    order and joint reordering) without constructing a dataset object per episode.
+    Returns None whenever the layout is not the one this reader understands.
+    """
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        info, paths = _parquet_episode_index(root)
+        data_path = paths.get(int(episode_index))
+        features = info.get("features", {})
+        if data_path is None or not data_path.exists() or ACTION not in features:
+            return None
+        if load_observed_states and OBSERVATION_STATE not in features:
+            return None
+        columns = [ACTION, "frame_index", "episode_index"]
+        if load_observed_states:
+            columns.append(OBSERVATION_STATE)
+        table = pq.read_table(data_path, columns=columns)
+        table = table.filter(pc.equal(table["episode_index"], int(episode_index)))
+        if table.num_rows == 0:
+            return None
+        frame_index = np.asarray(table["frame_index"].to_pylist(), dtype=np.int64)
+        order = np.argsort(frame_index, kind="stable")
+        if not np.array_equal(frame_index[order], np.arange(len(frame_index))):
+            return None
+
+        def ordered_joints(column: str) -> torch.Tensor:
+            values = np.asarray(table[column].to_pylist(), dtype=np.float32)[order]
+            names = _coerce_action_feature_names(features[column].get("names"))
+            if len(names) != values.shape[1]:
+                if values.shape[1] != len(LEROBOT_JOINT_FEATURE_ORDER):
+                    raise ValueError(f"{column} width {values.shape[1]} does not match names {names!r}.")
+                names = list(LEROBOT_JOINT_FEATURE_ORDER)
+            index_by_name = {_canonical_action_name(name): index for index, name in enumerate(names)}
+            missing = [name for name in LEROBOT_JOINT_FEATURE_ORDER if name not in index_by_name]
+            if missing:
+                raise ValueError(f"{column} names are missing {missing}. Found {names!r}.")
+            permutation = [index_by_name[name] for name in LEROBOT_JOINT_FEATURE_ORDER]
+            return torch.as_tensor(np.ascontiguousarray(values[:, permutation]), device=device)
+
+        return LeRobotActionEpisode(
+            episode_index=episode_index,
+            fps=float(info.get("fps", 30.0)),
+            action_names=tuple(LEROBOT_JOINT_FEATURE_ORDER),
+            actions=ordered_joints(ACTION),
+            observed_states=ordered_joints(OBSERVATION_STATE) if load_observed_states else None,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        print(f"[WARN]: Fast parquet episode load failed ({exc}); falling back to LeRobotDataset.")
+        return None
+
+
 def _load_lerobot_action_episode(
     *,
     repo_id: str,
@@ -1001,6 +1088,15 @@ def _load_lerobot_action_episode(
     device: str,
     load_observed_states: bool = False,
 ) -> LeRobotActionEpisode:
+    if root is not None:
+        fast = _load_lerobot_action_episode_from_parquet(
+            root=root,
+            episode_index=episode_index,
+            device=device,
+            load_observed_states=load_observed_states,
+        )
+        if fast is not None:
+            return fast
     dataset = _open_lerobot_dataset(repo_id, root, episode_index)
     features = getattr(dataset, "features", {})
     if ACTION not in features:
@@ -1962,15 +2058,27 @@ def _object_contact_evidence(
     """Aggregate contact force evidence per object across split contact sensors."""
     max_force = np.zeros(len(object_asset_names), dtype=np.float32)
     available = np.zeros(len(object_asset_names), dtype=np.bool_)
-    sensors = getattr(env.unwrapped.scene, "sensors", {})
-    for object_id, asset_name in enumerate(object_asset_names):
-        exact_name = f"{asset_name}_contacts"
-        split_prefix = f"{asset_name}_"
-        for sensor_name, sensor in sensors.items():
-            if sensor_name != exact_name and not (
-                sensor_name.startswith(split_prefix) and sensor_name.endswith("_contacts")
-            ):
-                continue
+    unwrapped = env.unwrapped
+    cache_key = tuple(object_asset_names)
+    cached = getattr(unwrapped, "_so101_collector_object_contact_sensors", None)
+    if isinstance(cached, tuple) and cached[0] == cache_key:
+        sensors_by_object = cached[1]
+    else:
+        # Same name match as before, resolved once instead of scanning every
+        # scene sensor for every object on every sampled step.
+        sensors = getattr(unwrapped.scene, "sensors", {})
+        sensors_by_object = [
+            [
+                sensor
+                for sensor_name, sensor in sensors.items()
+                if sensor_name == f"{asset_name}_contacts"
+                or (sensor_name.startswith(f"{asset_name}_") and sensor_name.endswith("_contacts"))
+            ]
+            for asset_name in object_asset_names
+        ]
+        unwrapped._so101_collector_object_contact_sensors = (cache_key, sensors_by_object)
+    for object_id, object_sensors in enumerate(sensors_by_object):
+        for sensor in object_sensors:
             force_matrix = getattr(getattr(sensor, "data", None), "force_matrix_w", None)
             if force_matrix is None:
                 continue
@@ -2255,6 +2363,9 @@ def _diagnostic_call_kwargs(
     }
 
 
+_SIGNATURE_PARAMETERS: dict[Any, frozenset[str]] = {}
+
+
 def _optional_task_condition_metrics(
     env,
     *,
@@ -2266,8 +2377,11 @@ def _optional_task_condition_metrics(
     if not callable(metrics_fn):
         return None
     try:
-        signature = inspect.signature(metrics_fn)
-        supported = {key: value for key, value in kwargs.items() if key in signature.parameters}
+        parameters = _SIGNATURE_PARAMETERS.get(metrics_fn)
+        if parameters is None:
+            parameters = frozenset(inspect.signature(metrics_fn).parameters)
+            _SIGNATURE_PARAMETERS[metrics_fn] = parameters
+        supported = {key: value for key, value in kwargs.items() if key in parameters}
         metrics = metrics_fn(env.unwrapped, **supported)
         if isinstance(metrics, (list, tuple)):
             return metrics[env_id] if env_id < len(metrics) else None

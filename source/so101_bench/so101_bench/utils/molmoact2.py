@@ -90,6 +90,31 @@ class SO101MolmoAct2Mapper:
         return sim_deg * torch.pi / 180.0
 
 
+class SO101LeRobotUnitsMapper:
+    """Sim radians <-> the dataset's native LeRobot `.pos` units (for pi0.5 and other LeRobot policies).
+
+    Same interface as SO101MolmoAct2Mapper; wraps the GR00T client's calibrated mapper, which
+    the so101_bench_sim_WM dataset was recorded with.
+    """
+
+    joint_order = LEROBOT_JOINT_ORDER
+
+    def __init__(self, device: str):
+        from so101_bench.utils.groot import SO101JointMapper
+
+        self.device = device
+        self._mapper = SO101JointMapper(device=device)
+
+    def sim_radians_to_model_positions(self, sim_values: torch.Tensor) -> torch.Tensor:
+        return self._mapper.sim_radians_to_lerobot_positions(sim_values)
+
+    def model_positions_to_sim_radians(self, model_values: torch.Tensor) -> torch.Tensor:
+        return self._mapper.lerobot_positions_to_sim_radians(model_values)
+
+
+JOINT_FRAMES = {"molmoact2": SO101MolmoAct2Mapper, "lerobot": SO101LeRobotUnitsMapper}
+
+
 class MolmoAct2RemotePolicy:
     """Chunked-action HTTP client for ``scripts/molmoact2_server.py``."""
 
@@ -106,8 +131,21 @@ class MolmoAct2RemotePolicy:
         timeout_s: float = 120.0,
         num_steps: int = 10,
         max_joint_step_deg: float = 15.0,
+        use_overhead_init: bool = False,
+        overhead_init_camera: str = "overhead",
+        overhead_init_key: str = "overhead_init",
+        use_wrist_init: bool = False,
+        wrist_init_camera: str = "wrist",
+        wrist_init_key: str = "wrist_init",
+        joint_frame: str = "molmoact2",
+        history_ticks: int = 1,
+        prediction_trace_dir: str | None = None,
     ):
-        self.mapper = SO101MolmoAct2Mapper(device=device)
+        # "molmoact2": the released MolmoAct2 SO-100/101 frame (MolmoAct2 fine-tunes too);
+        # "lerobot": the dataset's native LeRobot units (pi0.5 and other LeRobot policies).
+        if joint_frame not in JOINT_FRAMES:
+            raise ValueError(f"joint_frame must be one of {sorted(JOINT_FRAMES)}, got {joint_frame!r}")
+        self.mapper = JOINT_FRAMES[joint_frame](device=device)
         self.cameras = cameras
         self.host = host
         self.port = port
@@ -119,7 +157,21 @@ class MolmoAct2RemotePolicy:
         self.num_steps = num_steps
         self.max_joint_step_rad = max_joint_step_deg * torch.pi / 180.0
         self.action_queue: deque[torch.Tensor] = deque()
+        # History-conditioned servers (flux3_server.py) receive the last ``history_ticks`` control ticks
+        # with every request: measured state, the command issued before each tick, and the camera frames
+        # of the oldest and newest tick. The first tick of an episode fills the window with itself, and
+        # its "previous command" is the measured state, as in flux-action's ObservationHistory.
+        self.history_ticks = history_ticks
+        self._history: deque[dict] = deque(maxlen=max(1, history_ticks))
+        self._last_command: np.ndarray | None = None
+        # With prediction_trace_dir set, each request names where the server should save the video it
+        # predicts (flux3_server.py --save_predictions); the eval loop sets the episode/frame per tick.
+        self.prediction_trace_dir = prediction_trace_dir
+        self.trace_episode = 0
+        self.trace_frame = 0
 
+        if self.history_ticks < 1:
+            raise ValueError(f"history_ticks must be at least 1, got {self.history_ticks}.")
         if self.action_horizon < 1:
             raise ValueError(f"action_horizon must be at least 1, got {self.action_horizon}.")
         if self.timeout_s <= 0.0:
@@ -129,16 +181,33 @@ class MolmoAct2RemotePolicy:
         if max_joint_step_deg < 0.0:
             raise ValueError(f"max_joint_step_deg must be non-negative, got {max_joint_step_deg}.")
 
-        # Match the small interface used by the evaluator's snapshot helper.
-        self.use_overhead_init = False
-        self.overhead_init_image = None
-        self.overhead_init_key = ""
+        # WM-conditioned fine-tunes (so101_bench_sim_WM) also see the settled frames captured when
+        # robot control starts, appended after the live cameras: overhead_init, then wrist_init.
+        self.use_overhead_init = use_overhead_init
+        self.overhead_init_camera = overhead_init_camera
+        self.overhead_init_key = overhead_init_key
+        self.use_wrist_init = use_wrist_init
+        self.wrist_init_camera = wrist_init_camera
+        self.wrist_init_key = wrist_init_key
+        self.overhead_init_image: np.ndarray | None = None
+        self.wrist_init_image: np.ndarray | None = None
 
-        if len(self.camera_names) != 2:
-            raise ValueError(f"MolmoAct2 expects exactly two policy cameras, got: {self.camera_names}")
-        missing_cameras = [name for name in self.camera_names if name not in self.cameras]
+        if not self.camera_names:
+            raise ValueError("MolmoAct2 needs at least one policy camera.")
+        init_cameras = [overhead_init_camera] * use_overhead_init + [wrist_init_camera] * use_wrist_init
+        missing_cameras = [name for name in [*self.camera_names, *init_cameras] if name not in self.cameras]
         if missing_cameras:
             raise ValueError(f"Unknown MolmoAct2 policy camera(s) {missing_cameras}; found: {list(self.cameras)}")
+
+    @property
+    def image_keys(self) -> list[str]:
+        """Image order sent to the server; it must match the checkpoint's training camera order."""
+        keys = list(self.camera_names)
+        if self.use_overhead_init:
+            keys.append(self.overhead_init_key)
+        if self.use_wrist_init:
+            keys.append(self.wrist_init_key)
+        return keys
 
     @property
     def url(self) -> str:
@@ -153,18 +222,53 @@ class MolmoAct2RemotePolicy:
             raise RuntimeError(f"Cannot connect to MolmoAct2 policy server at {self.url}: {exc}") from exc
         if payload.get("status") != "ok":
             raise RuntimeError(f"MolmoAct2 policy server health check failed: {payload}")
-        print(f"[INFO]: MolmoAct2 policy server connected ({payload.get('repo_id', 'unknown checkpoint')}).")
+        server_history = int(payload.get("history_ticks", 1))
+        if server_history != self.history_ticks:
+            raise RuntimeError(
+                f"Policy server conditions on {server_history} history ticks, but this client sends {self.history_ticks}."
+            )
+        expected_images = payload.get("num_images")
+        if expected_images is not None and int(expected_images) != len(self.image_keys):
+            raise RuntimeError(
+                f"MolmoAct2 server checkpoint expects {expected_images} images "
+                f"({payload.get('camera_keys')}), but this client sends {self.image_keys}."
+            )
+        print(
+            f"[INFO]: MolmoAct2 policy server connected ({payload.get('repo_id', 'unknown checkpoint')}, "
+            f"norm_tag={payload.get('norm_tag')}, images={self.image_keys})."
+        )
 
     def reset(self, initial_visual_obs: dict | None = None, *, reset_remote: bool = True) -> None:
         del initial_visual_obs, reset_remote
-        self.action_queue.clear()
+        self._clear_episode_state()
 
     def set_language_instruction(self, instruction: str) -> None:
         self.lang_instruction = instruction
-        self.action_queue.clear()
+        self._clear_episode_state()
 
     def set_episode_initial_observation(self, visual_obs: dict) -> None:
-        del visual_obs
+        """Capture the fixed settled camera frames used by WM-conditioned checkpoints."""
+
+        if self.use_overhead_init:
+            self.overhead_init_image = self._camera_frame(visual_obs, self.overhead_init_camera).copy()
+        if self.use_wrist_init:
+            self.wrist_init_image = self._camera_frame(visual_obs, self.wrist_init_camera).copy()
+        self._clear_episode_state()
+
+    def _clear_episode_state(self) -> None:
+        self.action_queue.clear()
+        self._history.clear()
+        self._last_command = None
+
+    def _record_tick(self, joint_positions: torch.Tensor, visual_obs: dict) -> None:
+        state = self.mapper.sim_radians_to_model_positions(joint_positions).detach().cpu().numpy().astype(np.float32)
+        tick = {
+            "state": state,
+            "command": state if self._last_command is None else self._last_command,
+            "frames": [self._camera_frame(visual_obs, name) for name in self.camera_names],
+        }
+        for _ in range(self.history_ticks if not self._history else 1):
+            self._history.append(tick)
 
     @staticmethod
     def _to_uint8_rgb(image: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -228,15 +332,35 @@ class MolmoAct2RemotePolicy:
         Image.fromarray(image).save(output, format="PNG")
         return base64.b64encode(output.getvalue()).decode("ascii")
 
+    def _policy_images(self, visual_obs: dict) -> list[np.ndarray]:
+        images = [self._camera_frame(visual_obs, name) for name in self.camera_names]
+        if self.use_overhead_init:
+            if self.overhead_init_image is None:
+                raise RuntimeError("overhead_init frame requested before set_episode_initial_observation().")
+            images.append(self.overhead_init_image)
+        if self.use_wrist_init:
+            if self.wrist_init_image is None:
+                raise RuntimeError("wrist_init frame requested before set_episode_initial_observation().")
+            images.append(self.wrist_init_image)
+        return images
+
     def _query_server(self, joint_positions: torch.Tensor, visual_obs: dict) -> np.ndarray:
         model_state = self.mapper.sim_radians_to_model_positions(joint_positions).detach().cpu().numpy()
         payload = {
-            "images_png_base64": [self._encode_png(self._camera_frame(visual_obs, name)) for name in self.camera_names],
-            "camera_names": self.camera_names,
+            "images_png_base64": [self._encode_png(image) for image in self._policy_images(visual_obs)],
+            "camera_names": self.image_keys,
             "instruction": self.lang_instruction,
             "state": model_state.astype(np.float32).tolist(),
             "num_steps": self.num_steps,
+            # Stateful servers (internw0_server.py) reset their per-episode memory when this changes.
+            "episode": self.trace_episode,
         }
+        if self.history_ticks > 1:
+            payload["snapshot_images_png_base64"] = [self._encode_png(image) for image in self._history[0]["frames"]]
+            payload["state_history"] = [tick["state"].tolist() for tick in self._history]
+            payload["command_history"] = [np.asarray(tick["command"], dtype=np.float32).tolist() for tick in self._history]
+        if self.prediction_trace_dir:
+            payload["trace"] = {"dir": self.prediction_trace_dir, "episode": self.trace_episode, "frame": self.trace_frame}
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         http_request = request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
         try:
@@ -268,6 +392,8 @@ class MolmoAct2RemotePolicy:
         return current + delta * (self.max_joint_step_rad / biggest)
 
     def get_action(self, joint_positions: torch.Tensor, visual_obs: dict) -> torch.Tensor:
+        if self.history_ticks > 1:
+            self._record_tick(joint_positions, visual_obs)
         if not self.action_queue:
             action_chunk = self._query_server(joint_positions, visual_obs)
             horizon = min(action_chunk.shape[0], self.action_horizon)
@@ -277,5 +403,7 @@ class MolmoAct2RemotePolicy:
             )
 
         model_action = self.action_queue.popleft()
+        if self.history_ticks > 1:
+            self._last_command = model_action.detach().cpu().numpy().astype(np.float32)
         sim_action = self.mapper.model_positions_to_sim_radians(model_action)
         return self._limit_joint_step(joint_positions, sim_action)

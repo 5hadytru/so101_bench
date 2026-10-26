@@ -1,0 +1,42 @@
+# @package _global_
+
+# so101_bench_sim fine-tune of the released InternData-A1-EE FLUX.2 klein-base-4B ImageWAM weight
+# (pod/run_train.sh passes resume=<model.pt>: weights only, fresh optimizer and schedule). Mirrors the
+# official RoboTwin ee16 fine-tune (configs/task/robotwin_flux2_klein_4b_base_clean_imagewam_ee16.yaml):
+# AdamW (0.9, 0.95), wd 1e-2, cosine with 5% warmup, bf16, ZeRO-1. pod/run_train.sh sets batch size,
+# accumulation, LR and max_steps per run.
+defaults:
+  - override /data: so101_ee16
+  - override /model: imagewam_flux2_klein_4b_base
+  - _self_
+
+batch_size: 8
+gradient_accumulation_steps: 4
+num_workers: 16
+prefetch_factor: 2
+persistent_workers: true
+keep_latest_state_only: true
+
+lr_scheduler_type: cosine
+learning_rate: 2.5e-5
+num_epochs: 1000
+max_steps: 100000
+log_every: 10
+save_every: 1000
+eval_every: 0
+
+weight_decay: 1e-2
+mixed_precision: bf16
+resume: null
+
+model:
+  qwen_context_len: 128
+  load_text_encoder: false
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+  action_dit_pretrained_path: null
+
+wandb:
+  enabled: false
+  workspace: 5hadytru
+  project: finetune-imagewam-so101
+  name: so101_flux2_klein_4b_ee16

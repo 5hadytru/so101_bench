@@ -104,6 +104,14 @@ hickoktruman@gmail.com; results appear on the [live leaderboard](https://so101-b
   dataset tools, real-robot runners, and the fine-tuning recipe for each baseline (`*_fine_tuning/`).
 - `tasks/`: the validation set, the sim2real (MMRV) set and the training task file, with layouts.
 
+## License
+
+The code is released under the [Apache License 2.0](LICENSE): use, modify and redistribute it however
+you like, commercially or not. Files derived from the Isaac Lab extension template keep their BSD-3-Clause
+headers, patches under `scripts/*/patches/` apply to third-party repositories under those
+repositories' licenses, and the datasets, assets and checkpoints on Hugging Face carry the terms on their cards
+(fine-tuned checkpoints inherit their base model's license).
+
 ## Citation
 
 ```bibtex

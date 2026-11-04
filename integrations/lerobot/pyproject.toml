@@ -7,6 +7,7 @@ name = "lerobot_env_so101_bench"
 version = "0.1.0"
 description = "SO-101 Bench (Isaac Sim) as a LeRobot evaluation environment: --env.type=so101_bench"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.12"
 dependencies = [
     "lerobot>=0.6.1",

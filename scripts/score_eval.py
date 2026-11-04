@@ -12,8 +12,12 @@ task file the run used, and reports:
 
     python scripts/score_eval.py --tasks tasks/val_set.jsonl --log outputs/val/eval.log
     python scripts/score_eval.py --tasks tasks/val_set.jsonl --log a.log --log b.log --json score.json
+    python scripts/score_eval.py --tasks chunk_00/tasks.jsonl --log chunk_00.log \
+        --tasks chunk_01/tasks.jsonl --log chunk_01.log          # chunks with their own task files
 
-Episode i of a log is row i of the task file (the order the evaluator ran them in).
+Episode i of a log is row i of its task file (the order the evaluator ran them in). With one --tasks,
+every log indexes it; with one --tasks per --log, each log indexes its own. Episodes are keyed by
+trial_id, so a trial scored by several logs counts once (the last log wins).
 """
 
 from __future__ import annotations
@@ -44,22 +48,28 @@ def bootstrap(cells: dict[tuple[str, str], list[bool]], reps: int = 5000, seed: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--tasks", required=True, type=Path, help="Task JSONL the run evaluated (in run order).")
+    parser.add_argument("--tasks", required=True, type=Path, action="append",
+                        help="Task JSONL the run evaluated (in run order); give one, or one per --log.")
     parser.add_argument("--log", required=True, type=Path, action="append",
-                        help="Evaluator log; repeat for chunked runs (each log indexes the same task file).")
+                        help="Evaluator log; repeat for chunked runs.")
     parser.add_argument("--json", type=Path, help="Optional path for a JSON copy of the scores.")
     args = parser.parse_args()
 
     benchmark, _ = load_modules()
-    rows = [json.loads(line) for line in args.tasks.read_text().splitlines() if line.strip()]
-    episodes: dict[int, dict] = {}
-    for log in args.log:
+    if len(args.tasks) not in (1, len(args.log)):
+        raise SystemExit("Give one --tasks for all logs, or one --tasks per --log.")
+    task_files = args.tasks * len(args.log) if len(args.tasks) == 1 else args.tasks
+    read = lambda path: [json.loads(line) for line in path.read_text().splitlines() if line.strip()]  # noqa: E731
+    all_rows = {r.get("trial_id", i): r for path in dict.fromkeys(task_files) for i, r in enumerate(read(path))}
+    episodes: dict[object, dict] = {}
+    for tasks, log in zip(task_files, args.log):
+        rows = read(tasks)
         for m in LINE.finditer(log.read_text(errors="replace")):
             k = int(m.group(1)) - 1
             if k >= len(rows):
                 continue
             split, family = cell_key(benchmark, rows[k])
-            episodes[k] = dict(split=split, task=family, success=m.group(3) == "True",
+            episodes[rows[k].get("trial_id", k)] = dict(split=split, task=family, success=m.group(3) == "True",
                                progress=int(m.group(6)) / int(m.group(7)) if m.group(6) else None)
     if not episodes:
         raise SystemExit("No 'Episode i/n: success=...' lines found in the log(s).")
@@ -71,6 +81,7 @@ def main() -> None:
     low, high = bootstrap(cells)
     progress = [e["progress"] for e in episodes.values() if e["task"] == "bin_4" and e["progress"] is not None]
 
+    rows = all_rows
     print(f"Episodes scored: {len(episodes)}/{len(rows)}   cells covered: {len(cells)}/15")
     print(f"Score (mean of cell success): {100 * score:.1f}  [95% CI {100 * low:.1f}, {100 * high:.1f}]")
     if progress:

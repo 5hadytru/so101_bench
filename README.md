@@ -27,8 +27,11 @@ git clone https://github.com/5hadytru/so101_bench && cd so101_bench
 
 ## Evaluate a policy on the validation set
 
-`tasks/val_set.jsonl` is a small, balanced, public validation set: 45 episodes, 3 in each of the
-15 task-family × object-split cells. Use it for development and checkpoint selection.
+`tasks/val_set.jsonl` is the public validation set: 135 episodes over the 15 task-family × object-split
+cells (10 per cell, 5 per four-object-bin cell), half in the canonical scene and half with a training
+background and robot colour. It uses only public objects; the public unseen-class split has 10, and
+each is the target once per task family. Use it for development, checkpoint selection and
+public comparisons.
 
 **1. Serve your policy.** The evaluator talks to a policy server over HTTP: `POST /act` with the
 camera images (PNG, base64), the instruction and the 6-D joint state, returning a chunk of joint-position
@@ -71,6 +74,20 @@ Leaderboard settings per baseline (all use `--policy_cameras overhead,wrist`; GR
 
 ```bash
 python scripts/score_eval.py --tasks tasks/val_set.jsonl --log outputs/val_eval.log
+```
+
+### With LeRobot
+
+`lerobot-eval --env.type=so101_bench` runs the same episodes, with the same leaderboard settings, on
+any LeRobot policy. LeRobot needs Python >= 3.12 and Isaac Sim 5.1 runs on 3.11, so the plugin in
+[`integrations/lerobot`](integrations/lerobot) starts this repo's simulator as a separate process:
+
+```bash
+pip install -e integrations/lerobot            # in your LeRobot environment
+export SO101_BENCH_ROOT=$PWD ISAACLAB_SH=~/IsaacLab/isaaclab.sh
+lerobot-eval --env.type=so101_bench --policy.path=5hadytru/so101_bench_pi05 \
+    --env.cameras=overhead,wrist,overhead_init,wrist_init --eval.n_episodes=1
+python integrations/lerobot/lerobot_env_so101_bench/score.py outputs/eval/<run>/eval_info.json
 ```
 
 ## Leaderboard

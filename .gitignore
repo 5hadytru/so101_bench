@@ -66,6 +66,7 @@ _build
 
 # Tests
 tests/
+!integrations/lerobot/tests/
 
 # Docker history
 .isaac-lab-docker-history

@@ -5,12 +5,19 @@ Use it to select checkpoints and tune settings; the leaderboard is computed on t
 primary evaluation, which shares the tasks, splits and scoring but uses held-out objects,
 backgrounds and robot colours.
 
-* 3 episodes in each of the 15 task-family x object-split cells (45 total), canonical appearance.
+* 135 episodes over the 15 task-family x object-split cells: 10 per one-object bin, next_to,
+  between and move cell, 5 per four-object bin cell (those run 75 s). The public unseen-class split
+  has 10 objects, so each of them is the target once per family; more episodes would only repeat
+  targets.
 * Only public objects: the public part of each split (no held-out unseen-class objects).
-* Spatial targets (next_to/between/move) are distinct within a split; one-object bins prefer
-  objects that are not spatial targets; four-object-bin scenes never repeat an object pair;
-  move directions are balanced.
-* Layouts come from the benchmark's footprint-aware sampler.
+* Half the episodes of every cell use the canonical scene, half a varied one: a training
+  background (2-18) and a non-orange training robot colour, with no background repeated in a cell
+  and no background/colour pair repeated anywhere. The held-out ROBUST visuals are not used.
+* Targets are distinct within a cell and, where a split has enough objects, across its spatial
+  families; one-object bins prefer objects that are not spatial targets; four-object-bin scenes
+  never repeat an object pair; move directions are balanced in every cell.
+* Layouts come from the benchmark's footprint-aware sampler; the released ones were then hand-tuned
+  with scripts/edit_layouts.py, so regenerating replaces them (use --check to validate edits).
 
     python scripts/create_val_set.py           # write tasks/val_set.jsonl + tasks/layouts/val_set_layouts.jsonl
     python scripts/create_val_set.py --check   # validate the saved files
@@ -30,9 +37,18 @@ SEED = 20261026
 TASKS = ROOT / "tasks/val_set.jsonl"
 LAYOUTS = ROOT / "tasks/layouts/val_set_layouts.jsonl"
 GENERATED_AT = "2026-10-26T00:00:00+00:00"
-EPISODES_PER_CELL = 3
-FAMILIES = ("bin_1", "bin_4", "next_to", "between", "move")
+CELL_SIZES = {"bin_1": 10, "bin_4": 5, "next_to": 10, "between": 10, "move": 10}
+FAMILIES = tuple(CELL_SIZES)
 SPATIAL = ("next_to", "between", "move")
+VARIED_BACKGROUNDS = tuple(float(i) for i in range(2, 19))
+# The training palette (mdp.resets.ROBOT_COLORS) without the canonical orange.
+VARIED_ROBOT_COLORS = {
+    "red": (0.64, 0.012, 0.03),
+    "turquoise": (0.15, 0.60, 0.69),
+    "yellow": (0.84, 0.69, 0.07),
+    "white": (0.95, 0.95, 0.95),
+    "black": (0.08, 0.08, 0.08),
+}
 
 
 def public_objects(benchmark):
@@ -45,11 +61,11 @@ def public_objects(benchmark):
 
 
 def bin4_scenes(names, uses, rng):
-    """EPISODES_PER_CELL four-object scenes with no repeated object pair, least-used objects first."""
+    """Four-object scenes with no repeated object pair, least-used objects first."""
 
     for _ in range(10000):
         local_uses, used_pairs, scenes = Counter(uses), set(), []
-        for _scene in range(EPISODES_PER_CELL):
+        for _scene in range(CELL_SIZES["bin_4"]):
             scene = []
             for name in sorted(names, key=lambda n: (local_uses[n], rng.random())):
                 if len(scene) == 4:
@@ -74,24 +90,26 @@ def make_rows(benchmark, objects, attempt=0):
         names = objects[split]
         eligible = [n for n in names if "ALL" in benchmark.OBJECT_METADATA[n]["tasks"]]
         rng = random.Random(f"{SEED}:{split}:{attempt}")
-        in_scene = Counter()
-        spatial_targets = rng.sample(eligible, len(SPATIAL) * EPISODES_PER_CELL)
-        for index, target in enumerate(spatial_targets):
-            family = SPATIAL[index // EPISODES_PER_CELL]
-            companions = sorted((n for n in eligible if n != target), key=lambda n: (in_scene[n], rng.random()))[:3]
-            row = dict(ood_key=split, appearance_profile="canonical", repeat_index=0,
-                       objects=[target, *companions], n_objects=4, target=target)
-            rng.shuffle(row["objects"])
-            if family == "move":
-                row["direction"] = DIRECTIONS[direction_index % len(DIRECTIONS)]
-                direction_index += 1
-            else:
-                row["referents"] = companions[: 1 if family == "next_to" else 2]
-            row["instruction"] = instruction_for_row(row, family, set(benchmark.COLORS))
-            rows.append(row)
-            in_scene.update(row["objects"])
+        in_scene, as_target = Counter(), Counter()
+        for family in SPATIAL:
+            targets = sorted(eligible, key=lambda n: (as_target[n], rng.random()))[:CELL_SIZES[family]]
+            as_target.update(targets)
+            for target in targets:
+                companions = sorted((n for n in eligible if n != target),
+                                    key=lambda n: (in_scene[n], rng.random()))[:3]
+                row = dict(ood_key=split, appearance_profile="canonical", repeat_index=0,
+                           objects=[target, *companions], n_objects=4, target=target)
+                rng.shuffle(row["objects"])
+                if family == "move":
+                    row["direction"] = DIRECTIONS[direction_index % len(DIRECTIONS)]
+                    direction_index += 1
+                else:
+                    row["referents"] = companions[: 1 if family == "next_to" else 2]
+                row["instruction"] = instruction_for_row(row, family, set(benchmark.COLORS))
+                rows.append(row)
+                in_scene.update(row["objects"])
         # Prefer objects that were not spatial targets (the public unseen-class split is small).
-        for name in sorted(names, key=lambda n: (n in spatial_targets, rng.random()))[:EPISODES_PER_CELL]:
+        for name in sorted(names, key=lambda n: (as_target[n], rng.random()))[:CELL_SIZES["bin_1"]]:
             rows.append(dict(ood_key=split, appearance_profile="canonical", repeat_index=0, objects=[name],
                              n_objects=1, instruction="Place each object in the plastic bin"))
             in_scene[name] += 1
@@ -99,11 +117,43 @@ def make_rows(benchmark, objects, attempt=0):
             rows.append(dict(ood_key=split, appearance_profile="canonical", repeat_index=0, objects=scene,
                              n_objects=4, anchor=scene[0], instruction="Place each object in the plastic bin"))
             in_scene.update(scene)
-    return order_rows(rows, benchmark)
+    rows = order_rows(rows, benchmark)
+    assign_appearances(rows, benchmark, attempt)
+    return rows
+
+
+def assign_appearances(rows, benchmark, attempt):
+    """Make half of every cell varied; odd cells alternate which profile gets the extra episode.
+
+    Varied rows walk the background and colour cycles together; 17 backgrounds and 5 colours are
+    coprime, so the first 85 varied rows all get distinct pairs and a cell's backgrounds differ.
+    """
+
+    rng = random.Random(f"{SEED}:appearance:{attempt}")
+    backgrounds, colors = list(VARIED_BACKGROUNDS), list(VARIED_ROBOT_COLORS.values())
+    rng.shuffle(backgrounds)
+    rng.shuffle(colors)
+    cells = defaultdict(list)
+    for row in rows:
+        cells[cell_key(benchmark, row)].append(row)
+    varied_index = 0
+    for index, (cell, cell_rows) in enumerate(sorted(cells.items())):
+        picks = sorted(range(len(cell_rows)), key=lambda _: rng.random())
+        n_varied = (len(cell_rows) + index % 2) // 2
+        for position in sorted(picks[:n_varied]):
+            row = cell_rows[position]
+            color = colors[varied_index % len(colors)]
+            row["appearance_profile"] = "varied"
+            row["domain_randomization"] = dict(
+                background_mesh_index=backgrounds[varied_index % len(backgrounds)],
+                robot_color_r=color[0], robot_color_g=color[1], robot_color_b=color[2])
+            varied_index += 1
 
 
 def validate(rows, layout_rows, benchmark, objects):
     counts, directions, specs = Counter(), Counter(), []
+    cell_directions, profiles, cell_backgrounds = defaultdict(Counter), defaultdict(Counter), defaultdict(list)
+    visual_pairs = []
     for index, row in enumerate(rows):
         assert row["trial_id"] == index
         specs.append(benchmark.episode_spec_from_json(row))
@@ -114,13 +164,36 @@ def validate(rows, layout_rows, benchmark, objects):
         for field in ("target", "referents", "direction"):
             assert normalized.get(field) == row.get(field), (index, field)
         counts[split, family] += 1
+        profiles[split, family][row["appearance_profile"]] += 1
+        if row["appearance_profile"] == "varied":
+            dr = row["domain_randomization"]
+            color = (dr["robot_color_r"], dr["robot_color_g"], dr["robot_color_b"])
+            assert dr["background_mesh_index"] in VARIED_BACKGROUNDS, index
+            assert color in VARIED_ROBOT_COLORS.values(), index
+            cell_backgrounds[split, family].append(dr["background_mesh_index"])
+            visual_pairs.append((dr["background_mesh_index"], color))
+        else:
+            assert row["appearance_profile"] == "canonical" and "domain_randomization" not in row, index
         if family == "move":
             directions[row["direction"]] += 1
+            cell_directions[split][row["direction"]] += 1
     assert set(counts) == {(s, f) for s in SPLITS for f in FAMILIES}
-    assert set(counts.values()) == {EPISODES_PER_CELL}
+    assert all(n == CELL_SIZES[f] for (_, f), n in counts.items())
+    for cell, profile in profiles.items():
+        assert abs(profile["canonical"] - profile["varied"]) <= 1, cell
+    for cell, backgrounds in cell_backgrounds.items():
+        assert len(backgrounds) == len(set(backgrounds)), f"{cell}: repeated background"
+    assert len(visual_pairs) == len(set(visual_pairs)), "repeated background/colour pair"
     for split in SPLITS:
+        eligible = [n for n in objects[split] if "ALL" in benchmark.OBJECT_METADATA[n]["tasks"]]
+        for family in SPATIAL:
+            targets = [r["target"] for r in rows if cell_key(benchmark, r) == (split, family)]
+            assert len(targets) == len(set(targets)), f"{split}/{family}: repeated target"
         spatial = [r["target"] for r in rows if r["ood_key"] == split and "target" in r]
-        assert len(spatial) == len(set(spatial)), f"{split}: repeated spatial target"
+        if len(eligible) >= len(spatial):
+            assert len(spatial) == len(set(spatial)), f"{split}: repeated spatial target"
+        moves = cell_directions[split]
+        assert max(moves.values()) - min(moves.values()) <= 1, f"{split}: unbalanced move directions"
         bin4 = [r["objects"] for r in rows if cell_key(benchmark, r) == (split, "bin_4")]
         pairs = [tuple(sorted(p)) for scene in bin4 for p in combinations(scene, 2)]
         assert len(pairs) == len(set(pairs)), f"{split}: repeated bin companion pair"
@@ -133,8 +206,12 @@ def validate(rows, layout_rows, benchmark, objects):
             assert layout["instruction"] == row["instruction"]
             assert [obj["name"] for obj in layout["objects"]] == row["objects"]
     seconds = sum(benchmark.episode_length_s(s.task_family, len(s.objects)) for s in specs)
+    scenes = Counter(name for row in rows for name in row["objects"])
     return dict(episodes=len(rows), sim_seconds_at_timeout=seconds,
-                cells={f"{s}/{f}": n for (s, f), n in sorted(counts.items())}, move_directions=dict(directions))
+                profiles=dict(Counter(row["appearance_profile"] for row in rows)),
+                cells={f"{s}/{f}": n for (s, f), n in sorted(counts.items())}, move_directions=dict(directions),
+                scenes_per_object={split: [min(scenes[n] for n in objects[split]), max(scenes[n] for n in objects[split])]
+                                   for split in SPLITS})
 
 
 def make_layouts(rows, benchmark, layouts):
@@ -143,18 +220,25 @@ def make_layouts(rows, benchmark, layouts):
     layout_rows, history, pose_use = [], [], Counter()
     for index, row in enumerate(rows):
         _, family = cell_key(benchmark, row)
-        kwargs = dict(bin_random_poses=bin_poses, valid_spawn_regions=regions)
-        pose_index = None
+        candidates = [(None, dict(bin_random_poses=bin_poses, valid_spawn_regions=regions))]
         if family == "bin_4":
+            # Least-used bin pose first; fall back to the next when the scene does not fit its region.
             rng = random.Random(f"{SEED}:binpose:{index}")
-            pose_index = min(range(len(bin_poses)), key=lambda p: (pose_use[p], rng.random()))
-            kwargs = dict(bin_random_poses=(bin_poses[pose_index],), valid_spawn_regions=[regions[pose_index]])
-        layout = layouts.generate_episode_layout(
-            benchmark.episode_spec_from_json(row), episode_index=index,
-            rng=random.Random(f"{SEED}:layout:{index}"),
-            table_object_z=constants["TABLE_OBJECT_Z"], seed=SEED, generated_at=GENERATED_AT,
-            robot_bounding_box=constants["SO101_BOUNDING_BOX"], placement_history=history, **kwargs,
-        )
+            order = sorted(range(len(bin_poses)), key=lambda p: (pose_use[p], rng.random()))
+            candidates = [(p, dict(bin_random_poses=(bin_poses[p],), valid_spawn_regions=[regions[p]]))
+                          for p in order]
+        for candidate, (pose_index, kwargs) in enumerate(candidates):
+            try:
+                layout = layouts.generate_episode_layout(
+                    benchmark.episode_spec_from_json(row), episode_index=index,
+                    rng=random.Random(f"{SEED}:layout:{index}"),
+                    table_object_z=constants["TABLE_OBJECT_Z"], seed=SEED, generated_at=GENERATED_AT,
+                    robot_bounding_box=constants["SO101_BOUNDING_BOX"], placement_history=history, **kwargs,
+                )
+                break
+            except layouts.LayoutGenerationError:
+                if candidate == len(candidates) - 1:
+                    raise
         if pose_index is not None:
             layout["bin"]["pose_index"] = pose_index
             layout["placement"]["valid_spawn_region_index"] = pose_index
